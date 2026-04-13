@@ -32,7 +32,7 @@ public class SubsetFontGlyphTests
     }
 
     [Fact]
-    public void CharCodeAsGID_ProducesNonEmptyGlyph()
+    public void EmbeddedSubset_ProducesNonEmptyGlyph()
     {
         if (!File.Exists(FontPath)) { Console.Error.WriteLine("SKIP"); return; }
 
@@ -41,44 +41,40 @@ public class SubsetFontGlyphTests
 
         foreach (var (charCode, expected) in KnownGlyphs)
         {
-            // With isCidFont=true: charCode is used as direct GID
+            // EmbeddedSubset: tries Unicode → Symbol PUA → direct GID
             var bitmap = rasterizer.RasterizeGlyphWithCharCode(
-                "mem:test_subset", 24f, new Rune(expected), charCode, isCidFont: true);
+                "mem:test_subset", 24f, new Rune(expected), charCode, GlyphMapHint.EmbeddedSubset);
 
             Console.Error.WriteLine($"  cc={charCode} expected='{expected}': {bitmap.Width}x{bitmap.Height} bearingX={bitmap.BearingX} bearingY={bitmap.BearingY}");
-            Assert.True(bitmap.Width > 0, $"CharCode {charCode} ('{expected}') produced empty glyph with isCidFont=true");
+            Assert.True(bitmap.Width > 0, $"CharCode {charCode} ('{expected}') produced empty glyph with EmbeddedSubset");
         }
     }
 
     [Fact]
-    public void UnicodeOnly_ProducesDifferentGlyph()
+    public void EmbeddedSubset_VsAuto_CompareResults()
     {
         if (!File.Exists(FontPath)) { Console.Error.WriteLine("SKIP"); return; }
 
         using var rasterizer = new FreeTypeGlyphRasterizer();
         rasterizer.RegisterFontFromMemory("mem:test_subset", File.ReadAllBytes(FontPath));
 
-        // Without isCidFont: Unicode cmap is used, which may return wrong glyph
-        // Compare the bitmap from Unicode lookup vs charCode-as-GID
+        // Compare EmbeddedSubset (skips Mac Roman) vs Auto (tries everything including Mac Roman)
         var mismatchCount = 0;
         foreach (var (charCode, expected) in KnownGlyphs)
         {
-            var cidBitmap = rasterizer.RasterizeGlyphWithCharCode(
-                "mem:test_subset", 24f, new Rune(expected), charCode, isCidFont: true);
+            var embBitmap = rasterizer.RasterizeGlyphWithCharCode(
+                "mem:test_subset", 24f, new Rune(expected), charCode, GlyphMapHint.EmbeddedSubset);
 
-            var unicodeBitmap = rasterizer.RasterizeGlyphWithCharCode(
-                "mem:test_subset", 24f, new Rune(expected), charCode, isCidFont: false);
+            var autoBitmap = rasterizer.RasterizeGlyphWithCharCode(
+                "mem:test_subset", 24f, new Rune(expected), charCode, GlyphMapHint.Auto);
 
-            var sameSize = cidBitmap.Width == unicodeBitmap.Width && cidBitmap.Height == unicodeBitmap.Height;
-            var samePixels = sameSize && cidBitmap.Rgba.AsSpan().SequenceEqual(unicodeBitmap.Rgba.AsSpan());
+            var sameSize = embBitmap.Width == autoBitmap.Width && embBitmap.Height == autoBitmap.Height;
+            var samePixels = sameSize && embBitmap.Rgba.AsSpan().SequenceEqual(autoBitmap.Rgba.AsSpan());
 
             if (!samePixels) mismatchCount++;
-            Console.Error.WriteLine($"  cc={charCode} '{expected}': CID={cidBitmap.Width}x{cidBitmap.Height} Unicode={unicodeBitmap.Width}x{unicodeBitmap.Height} match={samePixels}");
+            Console.Error.WriteLine($"  cc={charCode} '{expected}': Emb={embBitmap.Width}x{embBitmap.Height} Auto={autoBitmap.Width}x{autoBitmap.Height} match={samePixels}");
         }
 
         Console.Error.WriteLine($"Mismatches: {mismatchCount}/{KnownGlyphs.Length}");
-        // With the Symbol charmap fix, both paths find the correct glyph
-        // via the PUA fallback — mismatches may be zero (which is fine)
-        Console.Error.WriteLine($"Both paths produce same glyph for all chars = {mismatchCount == 0}");
     }
 }
