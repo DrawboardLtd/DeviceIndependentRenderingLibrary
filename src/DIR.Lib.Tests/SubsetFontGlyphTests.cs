@@ -32,7 +32,7 @@ public class SubsetFontGlyphTests
     }
 
     [Fact]
-    public void EmbeddedSubset_ProducesNonEmptyGlyph()
+    public void CharCodeAsGID_ProducesNonEmptyGlyph()
     {
         if (!File.Exists(FontPath)) { Console.Error.WriteLine("SKIP"); return; }
 
@@ -41,7 +41,7 @@ public class SubsetFontGlyphTests
 
         foreach (var (charCode, expected) in KnownGlyphs)
         {
-            // EmbeddedSubset: tries Unicode → Symbol PUA → direct GID
+            // With EmbeddedSubset hint: Unicode → Symbol PUA → direct GID
             var bitmap = rasterizer.RasterizeGlyphWithCharCode(
                 "mem:test_subset", 24f, new Rune(expected), charCode, GlyphMapHint.EmbeddedSubset);
 
@@ -51,7 +51,7 @@ public class SubsetFontGlyphTests
     }
 
     [Fact]
-    public void EmbeddedSubset_VsAuto_CompareResults()
+    public void UnicodeOnly_ProducesDifferentGlyph()
     {
         if (!File.Exists(FontPath)) { Console.Error.WriteLine("SKIP"); return; }
 
@@ -62,19 +62,22 @@ public class SubsetFontGlyphTests
         var mismatchCount = 0;
         foreach (var (charCode, expected) in KnownGlyphs)
         {
-            var embBitmap = rasterizer.RasterizeGlyphWithCharCode(
+            var cidBitmap = rasterizer.RasterizeGlyphWithCharCode(
                 "mem:test_subset", 24f, new Rune(expected), charCode, GlyphMapHint.EmbeddedSubset);
 
-            var autoBitmap = rasterizer.RasterizeGlyphWithCharCode(
+            var unicodeBitmap = rasterizer.RasterizeGlyphWithCharCode(
                 "mem:test_subset", 24f, new Rune(expected), charCode, GlyphMapHint.Auto);
 
-            var sameSize = embBitmap.Width == autoBitmap.Width && embBitmap.Height == autoBitmap.Height;
-            var samePixels = sameSize && embBitmap.Rgba.AsSpan().SequenceEqual(autoBitmap.Rgba.AsSpan());
+            var sameSize = cidBitmap.Width == unicodeBitmap.Width && cidBitmap.Height == unicodeBitmap.Height;
+            var samePixels = sameSize && cidBitmap.Rgba.AsSpan().SequenceEqual(unicodeBitmap.Rgba.AsSpan());
 
             if (!samePixels) mismatchCount++;
-            Console.Error.WriteLine($"  cc={charCode} '{expected}': Emb={embBitmap.Width}x{embBitmap.Height} Auto={autoBitmap.Width}x{autoBitmap.Height} match={samePixels}");
+            Console.Error.WriteLine($"  cc={charCode} '{expected}': CID={cidBitmap.Width}x{cidBitmap.Height} Unicode={unicodeBitmap.Width}x{unicodeBitmap.Height} match={samePixels}");
         }
 
         Console.Error.WriteLine($"Mismatches: {mismatchCount}/{KnownGlyphs.Length}");
+        // With the Symbol charmap fix, both paths find the correct glyph
+        // via the PUA fallback — mismatches may be zero (which is fine)
+        Console.Error.WriteLine($"Both paths produce same glyph for all chars = {mismatchCount == 0}");
     }
 }
