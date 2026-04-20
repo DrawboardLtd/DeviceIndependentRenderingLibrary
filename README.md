@@ -6,18 +6,20 @@
 
 - **`PointInt`** — 2D integer point
 - **`RectInt`** — 2D integer rectangle (upper-left + lower-right)
-- **`RectF32`** — 2D float rectangle (x, y, width, height) for pixel-based layout
+- **`RectF32`** — 2D float rectangle (Vector2-backed) for pixel-based layout
 - **`RGBAColor32`** — 32-bit RGBA color with Lerp, WithAlpha, Luminance
 - **`TextAlign`** — Near/Center/Far alignment enum
-- **`Renderer<TSurface>`** — Abstract renderer: FillRectangle, DrawRectangle, FillEllipse, DrawText, MeasureText
+- **`Renderer<TSurface>`** — Abstract renderer: FillRectangle, DrawRectangle, DrawLine, FillEllipse, DrawEllipse, DrawText, MeasureText
 - **`GlyphBitmap`** — Raw RGBA glyph bitmap with bearing/advance info
-- **`FreeTypeGlyphRasterizer`** — FreeType2-based glyph rasterizer with COLRv1 color emoji support
+- **`SdfGlyphBitmap`** — Signed-distance-field glyph (for GPU sampling)
+- **`ManagedFontRasterizer`** — Pure-managed glyph rasterizer with COLRv1 color glyph and PDF subset font support. No native dependencies, AOT-compatible.
 
 ## Input Handling
 
 - **`InputKey`** — Platform-agnostic key codes (letters, digits, function keys, navigation, symbols)
 - **`InputModifier`** — Modifier flags (Shift, Ctrl, Alt)
 - **`IWidget`** — Shared interface with `HandleKeyDown` and `HandleMouseWheel` for both pixel and terminal widgets
+- **`InputEvent`** — KeyDown, TextInput, MouseDown/Up/Move, Scroll, Pinch/PinchEnd (touch gestures)
 
 Platform bridges (in downstream packages):
 - `SdlVulkan.Renderer` provides `SdlInputMapping` (SDL3 Scancode → InputKey)
@@ -33,7 +35,7 @@ Platform bridges (in downstream packages):
 
 ## Text Input
 
-- **`TextInputState`** — Single-line text input state machine with cursor, selection, undo
+- **`TextInputState`** — Single-line text input state machine with cursor, selection, undo, copy/paste
 - **`TextInputKey`** — Abstract key actions (Backspace, Delete, Left, Right, Home, End, Enter, Escape)
 - **`TextInputRenderer`** — Renders text input using any `Renderer<T>` (blinking cursor, selection highlight)
 - Callbacks: `OnCommit` (async), `OnCancel`, `OnTextChanged`, `OnKeyOverride`
@@ -69,8 +71,10 @@ if (tracker.ProcessCompletions(logger)) needsRedraw = true;
 
 ## Dependencies
 
-- [SharpAstro.FreeTypeBindings](https://www.nuget.org/packages/SharpAstro.FreeTypeBindings) — FreeType2 native bindings
+- [SharpAstro.Fonts](https://www.nuget.org/packages/SharpAstro.Fonts) — pure-managed OpenType loader/rasterizer (no native deps)
 - [Microsoft.Extensions.Logging.Abstractions](https://www.nuget.org/packages/Microsoft.Extensions.Logging.Abstractions) — ILogger interface for BackgroundTaskTracker
+
+Test project additionally uses [SharpAstro.FreeTypeBindings](https://www.nuget.org/packages/SharpAstro.FreeTypeBindings) as a ground-truth reference for hinting comparisons.
 
 ## License
 
