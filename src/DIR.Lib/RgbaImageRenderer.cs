@@ -418,6 +418,23 @@ public class RgbaImageRenderer : Renderer<RgbaImage>
         }
     }
 
+    /// <summary>
+    /// Draw a pre-rasterized <see cref="GlyphBitmap"/> at <paramref name="dstX"/>/
+    /// <paramref name="dstY"/> (top-left corner). Color glyphs (CBDT/COLR/SVG)
+    /// are blitted as-is; grayscale-alpha glyphs are tinted with
+    /// <paramref name="color"/>. Used by MathLayout primitives that compose
+    /// their own glyph bitmaps (stretchy delimiters from OT MATH variant /
+    /// assembly recipes) and need to paint them with the box's foreground.
+    /// </summary>
+    public void DrawGlyphBitmap(int dstX, int dstY, in GlyphBitmap glyph, RGBAColor32 color)
+    {
+        if (glyph.Rgba is null || glyph.Width == 0 || glyph.Height == 0) return;
+        if (glyph.IsColored)
+            Surface.BlitRgba(dstX, dstY, glyph.Rgba, glyph.Width, glyph.Height);
+        else
+            BlitGlyphTinted(dstX, dstY, glyph, color);
+    }
+
     public override (float Width, float Height) MeasureText(ReadOnlySpan<char> text, string fontFamily, float fontSize)
     {
         var width = 0f;
