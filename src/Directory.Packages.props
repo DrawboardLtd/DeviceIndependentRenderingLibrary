@@ -2,6 +2,10 @@
 
   <PropertyGroup>
     <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+    <!-- Required for SharpAstro.Fonts "1.4.*" floating pin (tracks CI cadence
+         on the upstream repo). Without this flag, NU1011 blocks floats under
+         Central Package Management. -->
+    <CentralPackageFloatingVersionsEnabled>true</CentralPackageFloatingVersionsEnabled>
   </PropertyGroup>
 
   <ItemGroup>
@@ -10,7 +14,7 @@
     <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.0" />
     <!-- 1.4 makes the OpenType cmap table optional so PDF Identity-H subset fonts
          (CID==GID; Unicode via /ToUnicode) load through ManagedFontRasterizer. -->
-    <PackageVersion Include="SharpAstro.Fonts" Version="1.4.211" />
+    <PackageVersion Include="SharpAstro.Fonts" Version="1.4.*" />
     <PackageVersion Include="SharpAstro.FreeTypeBindings" Version="3.2.14" />
     <PackageVersion Include="BenchmarkDotNet" Version="0.15.8" />
     <PackageVersion Include="Shouldly" Version="4.3.0" />
