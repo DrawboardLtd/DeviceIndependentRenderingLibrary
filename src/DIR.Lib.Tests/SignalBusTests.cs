@@ -118,11 +118,10 @@ public sealed class SignalBusTests
     {
         var bus = new SignalBus();
         var deliveredOnThread = -1;
-        var mainThread = Environment.CurrentManagedThreadId;
 
         bus.Subscribe<RequestRedrawSignal>(_ => deliveredOnThread = Environment.CurrentManagedThreadId);
 
-        // Post from a different thread
+        // Post from a different thread.
         var postTask = Task.Run(() => bus.Post(new RequestRedrawSignal()), TestContext.Current.CancellationToken);
         await postTask.WaitAsync(TestContext.Current.CancellationToken);
 
@@ -134,8 +133,6 @@ public sealed class SignalBusTests
         // actually means: "delivery happens on the thread that calls
         // ProcessPending, not on the thread that posted".
         var processingThread = Environment.CurrentManagedThreadId;
-
-        // Process on main thread
         bus.ProcessPending();
 
         deliveredOnThread.ShouldBe(processingThread);
@@ -170,5 +167,72 @@ public sealed class SignalBusTests
 
         received.ShouldNotBeNull();
         received!.Placeholder.ShouldBe("test-marker");
+    }
+
+    // Lock the "Subscribe is thread-safe" contract in so a future refactor
+    // can't quietly regress it. Spawns N threads that each subscribe to the
+    // same signal type, then drives one Post + ProcessPending and asserts
+    // every handler fired exactly once. With the original
+    // Dictionary<Type, List<...>> backing this would either lose handlers
+    // (lost write under contention) or throw on the foreach in
+    // ProcessPending (collection mutated during iteration); with the
+    // ConcurrentDictionary<Type, ImmutableArray<...>> backing every Add
+    // composes via AddOrUpdate's retry loop.
+    [Fact]
+    public async Task ConcurrentSubscribe_AllHandlersDelivered()
+    {
+        var bus = new SignalBus();
+        const int handlerCount = 64;
+        var fired = new int[handlerCount];
+
+        var subscribeTasks = new Task[handlerCount];
+        for (var i = 0; i < handlerCount; i++)
+        {
+            var idx = i;
+            subscribeTasks[i] = Task.Run(() => bus.Subscribe<RequestRedrawSignal>(_ =>
+            {
+                Interlocked.Increment(ref fired[idx]);
+            }), TestContext.Current.CancellationToken);
+        }
+        await Task.WhenAll(subscribeTasks).WaitAsync(TestContext.Current.CancellationToken);
+
+        bus.Post(new RequestRedrawSignal());
+        bus.ProcessPending();
+
+        for (var i = 0; i < handlerCount; i++)
+        {
+            fired[i].ShouldBe(1, customMessage: $"handler {i} did not fire exactly once");
+        }
+    }
+
+    // Subscribing mid-ProcessPending must not crash the iteration (the old
+    // Dictionary+List would throw "Collection was modified" if a handler
+    // happened to add a peer). With ImmutableArray snapshotting the late
+    // subscriber lands in a new array that the *next* ProcessPending sees,
+    // not the in-flight one.
+    [Fact]
+    public void SubscribeDuringDelivery_DoesNotDisturbInFlightIteration()
+    {
+        var bus = new SignalBus();
+        var lateFiredOnFirst = false;
+        var lateFiredOnSecond = false;
+
+        bus.Subscribe<RequestRedrawSignal>(_ =>
+        {
+            bus.Subscribe<RequestRedrawSignal>(_ =>
+            {
+                if (!lateFiredOnFirst) lateFiredOnFirst = true;
+                else lateFiredOnSecond = true;
+            });
+        });
+
+        bus.Post(new RequestRedrawSignal());
+        bus.ProcessPending();
+        lateFiredOnFirst.ShouldBeFalse("subscriber added mid-delivery must not fire on the in-flight signal");
+
+        bus.Post(new RequestRedrawSignal());
+        bus.ProcessPending();
+        lateFiredOnFirst.ShouldBeTrue("subscriber added during prior frame must fire on the next signal");
+        lateFiredOnSecond.ShouldBeFalse("a second-frame self-add must not fire on its own frame either");
     }
 }

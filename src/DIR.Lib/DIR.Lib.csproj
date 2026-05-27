@@ -8,8 +8,8 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <IsAotCompatible>true</IsAotCompatible>
     <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
-    <VersionPrefix>2.4.0</VersionPrefix>
-    <AssemblyVersion>1.0.0.0</AssemblyVersion>
+    <VersionPrefix>4.3.0</VersionPrefix>
+    <AssemblyVersion>4.3.0.0</AssemblyVersion>
     <PackageID>DIR.Lib</PackageID>
     <PackageLicenseFile>LICENSE</PackageLicenseFile>
     <PackageReadmeFile>README.md</PackageReadmeFile>
@@ -46,6 +46,59 @@
   </ItemGroup>
   <ItemGroup Condition="'$(UseLocalFontsLib)' != 'true'">
     <PackageReference Include="SharpAstro.Fonts" />
+  </ItemGroup>
+
+  <!--
+    DIR.Lib is codec-agnostic. The 4.0 release dropped its phantom dependencies
+    on SharpAstro.Tiff / .Exif / .Color.Icc — those were leftover declarations
+    from the Phase 1 codec extraction (commit 7190245 in the StbImageSharp repo)
+    that never had matching `using` directives in DIR.Lib source. RenderToRgba
+    returns an RgbaImage and callers (Console.Lib, tianwen, etc.) own the
+    choice of encoder. Consumers that need TIFF / Png / JPEG / ICC declare
+    those packages directly themselves.
+  -->
+
+  <!--
+    SharpAstro.LALR.CC drives the math-mode LaTeX grammar plus the markdown
+    inline + block grammars baked into DIR.Lib.Markdown. The Roslyn source
+    generator runs at build time on grammars/*.lalr.yaml and emits the
+    Latex / MarkdownInline / MarkdownBlock partial classes into this
+    assembly — no runtime parser construction, AOT-clean. Generated
+    namespace tracks csproj RootNamespace (defaults to `DIR.Lib`); the
+    hand-written AST records, visitors, and Mhchem state machine live in
+    the `DIR.Lib.Markdown` sub-namespace alongside.
+  -->
+  <PropertyGroup>
+    <UseLocalLalrCc Condition="'$(UseLocalLalrCc)' == '' AND Exists('..\..\..\LALR.CC\LALR.CC\LALR.CC.csproj')">true</UseLocalLalrCc>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(UseLocalLalrCc)' == 'true'">
+    <ProjectReference Include="..\..\..\LALR.CC\LALR.CC\LALR.CC.csproj" />
+    <ProjectReference Include="..\..\..\LALR.CC\LALR.CC.SourceGenerators\LALR.CC.SourceGenerators.csproj"
+                      OutputItemType="Analyzer"
+                      ReferenceOutputAssembly="false" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(UseLocalLalrCc)' != 'true'">
+    <PackageReference Include="SharpAstro.LALR.CC" />
+  </ItemGroup>
+
+  <!--
+    YamlDotNet is consumed only by the LALR.CC source generator (build-time)
+    to parse grammars/*.lalr.yaml. PrivateAssets="all" keeps it out of the
+    runtime closure and out of the published package; the Analyzer item
+    passes its netstandard2.0 DLL into the analyzer load context next to
+    the source generator. The generated parser classes have no YamlDotNet
+    references.
+  -->
+  <ItemGroup>
+    <PackageReference Include="YamlDotNet" GeneratePathProperty="true" PrivateAssets="all" />
+  </ItemGroup>
+  <ItemGroup>
+    <Analyzer Include="$(PkgYamlDotNet)\lib\netstandard2.0\YamlDotNet.dll" />
+  </ItemGroup>
+  <ItemGroup>
+    <AdditionalFiles Include="grammars\latex.lalr.yaml" Link="latex.lalr.yaml" />
+    <AdditionalFiles Include="grammars\markdown-inline.lalr.yaml" Link="markdown-inline.lalr.yaml" />
+    <AdditionalFiles Include="grammars\markdown-block.lalr.yaml" Link="markdown-block.lalr.yaml" />
   </ItemGroup>
 
   <ItemGroup>
