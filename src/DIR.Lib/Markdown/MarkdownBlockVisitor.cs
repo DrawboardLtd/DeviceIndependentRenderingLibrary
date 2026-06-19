@@ -87,25 +87,50 @@ public sealed class MarkdownBlockVisitor : MarkdownBlock.IVisitor<object>
     /// <summary>Walks the flat item list, accumulating runs of
     /// non-blank lines into block-sized chunks separated by blank
     /// items. Each chunk is classified by <see cref="ClassifyBlock"/>
-    /// into the appropriate <see cref="MdBlock"/> subtype.</summary>
+    /// into the appropriate <see cref="MdBlock"/> subtype.
+    /// <para>Fenced code blocks are the exception to the blank-line rule:
+    /// once a chunk opens with a ` ``` ` / ` ~~~ ` fence, blank lines are
+    /// part of the code body, not block separators, so accumulation
+    /// continues (blanks included) until the matching closing fence — per
+    /// CommonMark. Without this the fence is shredded at its first blank
+    /// line and the orphaned closing fence is mis-lexed as inline code.</para></summary>
     private IReadOnlyList<MdBlock> GroupIntoBlocks(IReadOnlyList<RawItem> items)
     {
         var blocks = new List<MdBlock>();
         var current = new List<string>();
+        string? fence = null;   // non-null while inside an open code fence
 
         void FlushCurrent()
         {
             if (current.Count > 0)
             {
-                blocks.Add(ClassifyBlock(current));
+                blocks.Add(ClassifyBlockSafe(current));
                 current = new List<string>();
             }
+            fence = null;
         }
 
         foreach (var item in items)
         {
-            if (item.IsBlank) FlushCurrent();
-            else current.Add(item.Line);
+            if (fence is not null)
+            {
+                // Inside a fence: a blank line is content, keep going until
+                // the closing fence. A blank RawItem carries no text, so
+                // re-materialise it as an empty body line.
+                current.Add(item.IsBlank ? string.Empty : item.Line);
+                if (!item.IsBlank && item.Line.TrimStart().StartsWith(fence))
+                    FlushCurrent();
+                continue;
+            }
+
+            if (item.IsBlank) { FlushCurrent(); continue; }
+
+            if (current.Count == 0)
+            {
+                var opener = FenceOpenRx.Match(item.Line);
+                if (opener.Success) fence = opener.Groups[1].Value;
+            }
+            current.Add(item.Line);
         }
         FlushCurrent();
 
@@ -117,19 +142,34 @@ public sealed class MarkdownBlockVisitor : MarkdownBlock.IVisitor<object>
     /// <summary>Same grouping logic <see cref="GroupIntoBlocks"/> uses
     /// but applied to a pre-tokenised list of strings (e.g. the
     /// continuation lines inside a list item). Splits at blank lines
-    /// and classifies each group via <see cref="ClassifyBlock"/>.</summary>
+    /// and classifies each group via <see cref="ClassifyBlock"/>, with
+    /// the same fence-aware exception (blank lines inside a ` ``` ` /
+    /// ` ~~~ ` fence stay part of the code body).</summary>
     private IReadOnlyList<MdBlock> ParseLineGroups(IReadOnlyList<string> lines)
     {
         var blocks = new List<MdBlock>();
         var current = new List<string>();
+        string? fence = null;
         void Flush()
         {
-            if (current.Count > 0) { blocks.Add(ClassifyBlock(current)); current = new List<string>(); }
+            if (current.Count > 0) { blocks.Add(ClassifyBlockSafe(current)); current = new List<string>(); }
+            fence = null;
         }
         foreach (var line in lines)
         {
-            if (string.IsNullOrWhiteSpace(line)) Flush();
-            else current.Add(line);
+            if (fence is not null)
+            {
+                current.Add(line);
+                if (line.TrimStart().StartsWith(fence)) Flush();
+                continue;
+            }
+            if (string.IsNullOrWhiteSpace(line)) { Flush(); continue; }
+            if (current.Count == 0)
+            {
+                var opener = FenceOpenRx.Match(line);
+                if (opener.Success) fence = opener.Groups[1].Value;
+            }
+            current.Add(line);
         }
         Flush();
         return blocks;
@@ -142,6 +182,22 @@ public sealed class MarkdownBlockVisitor : MarkdownBlock.IVisitor<object>
     private static readonly Regex FenceOpenRx = new(@"^(```|~~~)\s*([^\s]*)\s*$", RegexOptions.Compiled);
     private static readonly Regex UnorderedItemRx = new(@"^([-*+])\s+(.*)$", RegexOptions.Compiled);
     private static readonly Regex OrderedItemRx = new(@"^(\d+)\.\s+(.*)$", RegexOptions.Compiled);
+
+    /// <summary>Classifies a block, degrading to a raw-text paragraph on any
+    /// parser/lexer error instead of throwing. Blank lines are the grouping
+    /// sync points (Vim-style resync), so one malformed block can't abort the
+    /// whole document — the next block is classified from a clean state. This
+    /// matches the renderer's best-effort contract: show the source rather
+    /// than crash. A genuine classification regression still surfaces in tests
+    /// (the AST won't match the expected node type).</summary>
+    private MdBlock ClassifyBlockSafe(IReadOnlyList<string> lines)
+    {
+        try { return ClassifyBlock(lines); }
+        catch
+        {
+            return new MdParagraph(new MdInline[] { new MdLiteral(string.Join("\n", lines)) });
+        }
+    }
 
     private MdBlock ClassifyBlock(IReadOnlyList<string> lines)
     {

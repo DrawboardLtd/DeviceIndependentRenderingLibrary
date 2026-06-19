@@ -122,6 +122,45 @@ public sealed class MarkdownBlockSpikeTests
         blocks[0].ShouldBeOfType<MdCodeFence>().Lang.ShouldBeNull();
     }
 
+    [Fact]
+    public void CodeFence_WithBlankLines_StaysOneBlock()
+    {
+        // Blank lines inside a fence are code body, not block separators
+        // (CommonMark). Regression: the grouper used to split here, which
+        // both shredded the block and orphaned the closing fence into a
+        // paragraph the inline lexer rejected.
+        var blocks = _visitor.Parse("```csharp\nvar a = 1;\n\nvar b = 2;\n```");
+        blocks.Count.ShouldBe(1);
+        var fence = blocks[0].ShouldBeOfType<MdCodeFence>();
+        fence.Lang.ShouldBe("csharp");
+        fence.Lines.ShouldBe(new[] { "var a = 1;", "", "var b = 2;" });
+    }
+
+    [Fact]
+    public void CodeFence_Unterminated_RunsToEnd()
+    {
+        // An unterminated fence captures the rest of the input as body
+        // rather than spilling later lines into mis-parsed blocks.
+        var blocks = _visitor.Parse("```\ncode\n\nmore code");
+        blocks.Count.ShouldBe(1);
+        blocks[0].ShouldBeOfType<MdCodeFence>().Lines.ShouldBe(new[] { "code", "", "more code" });
+    }
+
+    [Fact]
+    public void MalformedBlock_DegradesToRaw_AndResyncs()
+    {
+        // A block the inline lexer can't handle (here a stray closing fence
+        // glued onto a text line, which the inline grammar rejects) must not
+        // abort the document: it degrades to raw text, and the blank-line sync
+        // point lets the next block parse normally.
+        var blocks = _visitor.Parse("some text;\n```\n\nafter");
+        blocks.Count.ShouldBe(2);
+        blocks[0].ShouldBeOfType<MdParagraph>()
+            .Content.OfType<MdLiteral>().Single().Text.ShouldBe("some text;\n```");
+        blocks[1].ShouldBeOfType<MdParagraph>()
+            .Content.OfType<MdLiteral>().Single().Text.ShouldBe("after");
+    }
+
     // ── Lists ────────────────────────────────────────────────────────
 
     [Fact]

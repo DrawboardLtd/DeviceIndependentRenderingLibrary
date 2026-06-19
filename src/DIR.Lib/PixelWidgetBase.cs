@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Collections.Immutable;
 using DIR.Lib;
 
 namespace DIR.Lib
@@ -247,6 +248,72 @@ namespace DIR.Lib
             }
         }
 
+        // --- Declarative layout (LayoutNode tree -> arrange -> paint + auto-bind clicks) ---
+
+        /// <summary>
+        /// Arranges a declarative <see cref="LayoutNode"/> tree into <paramref name="bounds"/> using this
+        /// widget's renderer as the text-width oracle. Returns the flat pre-order arranged tree (also handy
+        /// for inspection / custom hit-testing).
+        /// </summary>
+        protected ImmutableArray<ArrangedNode<float>> ArrangeLayout(LayoutNode root, RectF32 bounds, string fontPath, float dpiScale = 1f)
+        {
+            var ctx = new PixelMeasureContext<TSurface>(Renderer, fontPath, dpiScale);
+            return LayoutEngine.Arrange(root, new Rect<float>(bounds.X, bounds.Y, bounds.Width, bounds.Height), ctx);
+        }
+
+        /// <summary>
+        /// Paints an already-arranged tree: each node's <see cref="LayoutNode.Background"/> fills first
+        /// (parent-before-children emission = correct z-order), then leaf content draws, and any
+        /// <see cref="LayoutContent.Hit"/> is bound to the node's arranged rect via
+        /// <see cref="RegisterClickable"/> -- so draw-position and hit-region cannot drift.
+        /// <paramref name="drawFill"/> handles <see cref="LayoutContent.Fill"/> escape-hatch leaves
+        /// (charts, sky map, custom widgets).
+        /// </summary>
+        protected void PaintLayout(ImmutableArray<ArrangedNode<float>> arranged, string fontPath, float dpiScale = 1f,
+            Action<LayoutContent.Fill, RectF32>? drawFill = null)
+        {
+            foreach (var (node, bounds) in arranged)
+            {
+                if (node.Background is { } bg)
+                {
+                    FillRect(bounds.X, bounds.Y, bounds.Width, bounds.Height, bg);
+                }
+
+                // Auto-bind the click region to the arranged rect. Any node can be a hit target -- a whole
+                // slot row or panel, not just a leaf -- and inner nodes register later so they win the hit.
+                if (node.Hit is { } hit)
+                {
+                    RegisterClickable(bounds.X, bounds.Y, bounds.Width, bounds.Height, hit, node.OnClick);
+                }
+
+                if (node is LayoutNode.Leaf leaf)
+                {
+                    switch (leaf.Content)
+                    {
+                        case LayoutContent.Text text:
+                            DrawText(text.Value.AsSpan(), fontPath, bounds.X, bounds.Y, bounds.Width, bounds.Height,
+                                text.FontSize * dpiScale, text.Color, text.HAlign, text.VAlign);
+                            break;
+                        case LayoutContent.Box box when box.Color.Alpha > 0:
+                            FillRect(bounds.X, bounds.Y, bounds.Width, bounds.Height, box.Color);
+                            break;
+                        case LayoutContent.Fill fill:
+                            drawFill?.Invoke(fill, new RectF32(bounds.X, bounds.Y, bounds.Width, bounds.Height));
+                            break;
+                    }
+                }
+            }
+        }
+
+        /// <summary>Convenience: <see cref="ArrangeLayout"/> + <see cref="PaintLayout"/> in one call.</summary>
+        protected ImmutableArray<ArrangedNode<float>> RenderLayout(LayoutNode root, RectF32 bounds, string fontPath,
+            float dpiScale = 1f, Action<LayoutContent.Fill, RectF32>? drawFill = null)
+        {
+            var arranged = ArrangeLayout(root, bounds, fontPath, dpiScale);
+            PaintLayout(arranged, fontPath, dpiScale, drawFill);
+            return arranged;
+        }
+
         // --- Drawing helpers ---
 
         protected void FillRect(float x, float y, float w, float h, RGBAColor32 color)
@@ -318,6 +385,41 @@ namespace DIR.Lib
             Renderer.DrawText(text, fontPath, fontSize, color,
                 new RectInt(new PointInt((int)(x + w), (int)(y + h)), new PointInt((int)x, (int)y)),
                 horizAlign, vertAlign);
+        }
+
+        /// <summary>
+        /// Fills a horizontal text bar with <paramref name="bgColor"/> and draws a single line of
+        /// <paramref name="text"/> inside it.  The text rect is inset by <paramref name="horizontalPadding"/>
+        /// on each side; vertical alignment defaults to <see cref="TextAlign.Center"/> so the text is
+        /// centred within the bar height without a manual y-nudge.
+        /// </summary>
+        /// <param name="text">The text to render.</param>
+        /// <param name="fontPath">Path to the font file; no-op when null or empty.</param>
+        /// <param name="x">Left edge of the bar, in pixels.</param>
+        /// <param name="y">Top edge of the bar, in pixels.</param>
+        /// <param name="w">Width of the bar, in pixels.</param>
+        /// <param name="h">Height of the bar, in pixels.</param>
+        /// <param name="fontSize">Font size in points/pixels.</param>
+        /// <param name="bgColor">Background fill color.</param>
+        /// <param name="textColor">Text color.</param>
+        /// <param name="horizontalPadding">Pixels inset from left and right edges before drawing text (default 8).</param>
+        /// <param name="alignX">Horizontal text alignment within the inset rect (default <see cref="TextAlign.Near"/>).</param>
+        /// <param name="alignY">Vertical text alignment within the bar height (default <see cref="TextAlign.Center"/>).</param>
+        protected void RenderTextBar(
+            ReadOnlySpan<char> text,
+            string fontPath,
+            float x, float y, float w, float h,
+            float fontSize,
+            RGBAColor32 bgColor,
+            RGBAColor32 textColor,
+            float horizontalPadding = 8f,
+            TextAlign alignX = TextAlign.Near,
+            TextAlign alignY = TextAlign.Center)
+        {
+            FillRect(x, y, w, h, bgColor);
+            DrawText(text, fontPath,
+                x + horizontalPadding, y, w - horizontalPadding * 2f, h,
+                fontSize, textColor, alignX, alignY);
         }
     }
 }
