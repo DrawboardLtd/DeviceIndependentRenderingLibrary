@@ -7,7 +7,13 @@ on:
     branches: [ main ]
 
 env:
-  VERSION_PREFIX: 6.3.${{ github.run_number }}
+  # 6.4 - MTSDF rasterization path (RasterizeGlyphMtsdf) + glyph-identity resolver
+  #       (ResolveGlyphIdentity) and Type1-by-name MTSDF; drops the stb PNG port
+  #       (SharpAstro.Fonts 1.5 / Png 3.4).
+  # 6.7 - DIR.Lib.Shaping ITextShaper adapter with full UAX #9 bidi.
+  # 6.8 - rebuild against SharpAstro.Fonts.Shaping 1.5.551; + SignalDirectory source
+  #       generator (DIR.Lib.SourceGenerators) + SignalJson binder.
+  VERSION_PREFIX: 6.8.${{ github.run_number }}
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release

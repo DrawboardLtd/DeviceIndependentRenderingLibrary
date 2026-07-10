@@ -2,19 +2,25 @@
 
   <PropertyGroup>
     <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
-    <!-- Required for SharpAstro.Fonts "1.4.*" floating pin (tracks CI cadence
-         on the upstream repo). Without this flag, NU1011 blocks floats under
-         Central Package Management. -->
+    <!-- Allow floating versions (e.g. "2.30.*") for sibling-tracked codec packages
+         so DIR.Lib stays current with whatever StbImage repo publishes. -->
     <CentralPackageFloatingVersionsEnabled>true</CentralPackageFloatingVersionsEnabled>
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- Roslyn API for the DIR.Lib.SourceGenerators analyzer (build-time only; PrivateAssets=all in
+         the SG csproj keeps it out of the runtime/package closure). -->
+    <PackageVersion Include="Microsoft.CodeAnalysis.CSharp" Version="4.13.0" />
     <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.3.0" />
     <PackageVersion Include="Microsoft.SourceLink.GitHub" Version="10.0.201" />
     <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.0" />
-    <!-- 1.4 makes the OpenType cmap table optional so PDF Identity-H subset fonts
-         (CID==GID; Unicode via /ToUnicode) load through ManagedFontRasterizer. -->
-    <PackageVersion Include="SharpAstro.Fonts" Version="1.4.*" />
+    <!-- Tracks Fonts.Lib repo CI cadence. 1.5.x decodes CBDT colour-bitmap glyph
+         PNGs via SharpAstro.Png instead of the stb_image port, so pulling it drops
+         the transitive SharpAstro.StbImage dependency from downstream consumers. -->
+    <PackageVersion Include="SharpAstro.Fonts" Version="1.5.*" />
+    <!-- The pure-managed shaping engine, consumed by the DIR.Lib.Shaping satellite (the
+         ITextShaper adapter). Same Fonts.Lib CI cadence as SharpAstro.Fonts. -->
+    <PackageVersion Include="SharpAstro.Fonts.Shaping" Version="1.5.*" />
     <!-- LALR.CC drives the markdown + LaTeX grammars baked into the
          DIR.Lib.Markdown subsystem. Source generator runs build-time;
          the runtime LALR.CC assembly is referenced for the Parser /
@@ -27,7 +33,7 @@
     <!-- DIR.Lib 4.0 dropped its codec dependencies; the test project still
          renders artifacts as PNG for visual baselines, so SharpAstro.Png
          stays here for the test-only reference. -->
-    <PackageVersion Include="SharpAstro.Png" Version="3.0.*" />
+    <PackageVersion Include="SharpAstro.Png" Version="3.4.*" />
     <PackageVersion Include="BenchmarkDotNet" Version="0.15.8" />
     <PackageVersion Include="Shouldly" Version="4.3.0" />
     <PackageVersion Include="xunit.runner.visualstudio" Version="3.1.5" />

@@ -8,8 +8,8 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <IsAotCompatible>true</IsAotCompatible>
     <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
-    <VersionPrefix>6.3.0</VersionPrefix>
-    <AssemblyVersion>6.3.0.0</AssemblyVersion>
+    <VersionPrefix>6.8.0</VersionPrefix>
+    <AssemblyVersion>6.4.0.0</AssemblyVersion>
     <PackageID>DIR.Lib</PackageID>
     <PackageLicenseFile>LICENSE</PackageLicenseFile>
     <PackageReadmeFile>README.md</PackageReadmeFile>
@@ -106,6 +106,27 @@
       <PrivateAssets>all</PrivateAssets>
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
     </PackageReference>
+  </ItemGroup>
+
+  <!--
+    DIR.Lib.SourceGenerators emits a SignalDirectory (name->factory map over the assembly's *Signal
+    types) for a DIR.Lib.SignalBus consumer's live UI inspector, with no runtime reflection. It is
+    packed into analyzers/dotnet/cs so a `<PackageReference Include="DIR.Lib" />` consumer gets it
+    automatically; the generator self-gates on the DEBUG symbol + SignalBus presence, so it is inert
+    for DIR.Lib itself (no *Signal types) and for Release builds. Mirrors how the LALR.CC package ships
+    its own generator. ReferenceOutputAssembly=false: no runtime dependency on the generator assembly.
+  -->
+  <ItemGroup>
+    <ProjectReference Include="..\DIR.Lib.SourceGenerators\DIR.Lib.SourceGenerators.csproj"
+                      OutputItemType="Analyzer"
+                      ReferenceOutputAssembly="false"
+                      PrivateAssets="all" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="..\DIR.Lib.SourceGenerators\bin\$(Configuration)\netstandard2.0\DIR.Lib.SourceGenerators.dll"
+          Pack="true"
+          PackagePath="analyzers\dotnet\cs"
+          Visible="false" />
   </ItemGroup>
 
 </Project>
