@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics.CodeAnalysis;
 using System.Text;
 using SharpAstro.Fonts;
 using FontsHint = SharpAstro.Fonts.Tables.Cmap.GlyphMapHint;
@@ -553,6 +554,129 @@ public sealed class ManagedFontRasterizer : IDisposable
         return RenderSdf(font, gid, fontSize, spread);
     }
 
+    /// <summary>
+    /// Rasterize a glyph as a multi-channel signed distance field (MTSDF) by
+    /// Unicode codepoint. Corners stay sharp at any scale; the A channel is the
+    /// same true-distance field <see cref="RasterizeGlyphSdf"/> produces.
+    /// </summary>
+    public MtsdfGlyphBitmap RasterizeGlyphMtsdf(string fontPath, float fontSize, Rune codepoint, float spread = 4f)
+    {
+        if (_type1Fonts.TryGetValue(fontPath, out var t1))
+            return RenderType1Mtsdf(t1, ResolveType1Name(fontPath, t1, (uint)codepoint.Value), fontSize, spread);
+        var font = GetOrLoad(fontPath);
+        var gid = font.GetGlyphId((uint)codepoint.Value);
+        if (gid == 0) return default;
+        return RenderMtsdf(font, gid, fontSize, spread);
+    }
+
+    /// <summary>
+    /// MTSDF variant of <see cref="RasterizeGlyphSdfWithCharCode"/> — PDF char-code
+    /// + cmap lookup hint for CID and embedded-subset fonts.
+    /// </summary>
+    public MtsdfGlyphBitmap RasterizeGlyphMtsdfWithCharCode(string fontPath, float fontSize,
+        Rune codepoint, uint charCode, GlyphMapHint hint = GlyphMapHint.Auto, float spread = 4f)
+    {
+        if (_type1Fonts.TryGetValue(fontPath, out var t1))
+            return RenderType1Mtsdf(t1, ResolveType1Name(fontPath, t1, charCode), fontSize, spread);
+        var font = GetOrLoad(fontPath);
+        var gid = font.GetGlyphId((uint)codepoint.Value, charCode, (FontsHint)hint);
+        if (gid == 0) return default;
+        return RenderMtsdf(font, gid, fontSize, spread);
+    }
+
+    /// <summary>
+    /// MTSDF variant of <see cref="RasterizeGlyphByGid"/> — rasterize directly by
+    /// glyph id, bypassing cmap lookup. (Not available for Type1 fonts, which are
+    /// addressed by glyph name, not id.)
+    /// </summary>
+    public MtsdfGlyphBitmap RasterizeGlyphMtsdfByGid(string fontPath, float fontSize, uint gid, float spread = 4f)
+    {
+        if (gid == 0) return default;
+        var font = GetOrLoad(fontPath);
+        return RenderMtsdf(font, gid, fontSize, spread);
+    }
+
+    /// <summary>
+    /// Resolve a (Unicode codepoint, PDF char-code, cmap hint) request to a stable glyph
+    /// identity for atlas caching — the exact identity step that <see cref="RasterizeGlyph"/>,
+    /// <see cref="RasterizeGlyphWithCharCode"/>, and the MTSDF variants perform internally,
+    /// surfaced so a caller can key an atlas by identity and then rasterize by GID
+    /// (<see cref="RasterizeGlyphMtsdfByGid"/> / <see cref="RasterizeGlyphByGid"/>) or, for
+    /// Type1/PFB fonts, by glyph name (<see cref="RasterizeGlyphMtsdfByType1Name"/> /
+    /// <see cref="RasterizeGlyphByType1Name"/>).
+    ///
+    /// <para>Same inputs → same <see cref="GetGlyphId(uint,uint,GlyphMapHint)"/> / Type1-name
+    /// lookup → same glyph as the rasterize methods produce: this moves <em>where</em> resolution
+    /// happens (to the cache-key boundary), not the resolution itself.</para>
+    /// </summary>
+    public GlyphIdentity ResolveGlyphIdentity(string fontPath, Rune codepoint, int charCode, GlyphMapHint hint)
+    {
+        // Type1/PFB: identity is a PostScript glyph NAME — the PDF /Differences override wins,
+        // else the font's built-in encoding. Mirrors the Type1 branch of the rasterize methods.
+        if (_type1Fonts.TryGetValue(fontPath, out var t1))
+        {
+            var name = ResolveType1Name(fontPath, t1, charCode >= 0 ? (uint)charCode : (uint)codepoint.Value);
+            return new GlyphIdentity(0, name);
+        }
+
+        // OpenType: an embedded "mem:" subset font may not be registered yet on a very early draw
+        // (registration races the first glyph use). GetOrLoad would throw; treat that as an
+        // unresolved miss so a synchronous draw-path caller degrades to a blank this frame and
+        // re-resolves once the font lands — rather than throwing on the render thread. A genuinely
+        // unloadable file font still surfaces its load error (rare, and only once at load time).
+        OpenTypeFont font;
+        try { font = GetOrLoad(fontPath); }
+        catch (InvalidOperationException) { return default; }
+
+        // The SAME GetGlyphId call the rasterize methods make: charCode-aware for CID/subset fonts
+        // when a PDF char code is supplied, plain Unicode cmap otherwise. GlyphMapHint casts to the
+        // Fonts enum (shared value layout — see RasterizeGlyphWithCharCode).
+        var gid = charCode >= 0
+            ? font.GetGlyphId((uint)codepoint.Value, (uint)charCode, (FontsHint)hint)
+            : font.GetGlyphId((uint)codepoint.Value);
+        return new GlyphIdentity(gid, null);
+    }
+
+    /// <summary>
+    /// Kerning between two glyph ids, in pixels at <paramref name="fontSize"/>. Wraps
+    /// <see cref="OpenTypeFont.GetKerning"/> (GPOS pair adjustment, else legacy <c>kern</c>) and
+    /// scales its FUnit result by <c>fontSize / UnitsPerEm</c>. Used by <see cref="AdvanceShaper"/>'s
+    /// opt-in kerning path — the only place a shaper contributes an advance adjustment on top of the
+    /// renderer's cache advance. Returns 0 for Type1/PFB fonts (no numeric glyph ids, no gid-keyed
+    /// kerning), an unregistered <c>mem:</c> font, or any pair the font has no kerning for.
+    /// </summary>
+    public float GetKerningPx(string fontPath, float fontSize, uint leftGid, uint rightGid)
+    {
+        if (_type1Fonts.ContainsKey(fontPath)) return 0f;
+        OpenTypeFont font;
+        try { font = GetOrLoad(fontPath); }
+        catch (InvalidOperationException) { return 0f; }
+        var fu = font.GetKerning(leftGid, rightGid);
+        return fu == 0 ? 0f : fu * fontSize / font.UnitsPerEm;
+    }
+
+    /// <summary>
+    /// MTSDF variant that rasterizes a Type1/PFB glyph directly by PostScript glyph name — the
+    /// Type1 counterpart of <see cref="RasterizeGlyphMtsdfByGid"/> (Type1 fonts have no numeric
+    /// glyph ids). Returns an empty bitmap for a null/unknown name or a non-Type1 font.
+    /// </summary>
+    public MtsdfGlyphBitmap RasterizeGlyphMtsdfByType1Name(string fontPath, float fontSize, string? glyphName, float spread = 4f)
+    {
+        if (glyphName is null || !_type1Fonts.TryGetValue(fontPath, out var t1)) return default;
+        return RenderType1Mtsdf(t1, glyphName, fontSize, spread);
+    }
+
+    /// <summary>
+    /// Color/grayscale variant that rasterizes a Type1/PFB glyph by PostScript glyph name — the
+    /// Type1 counterpart of <see cref="RasterizeGlyphByGid"/> for the bitmap atlas path. Returns
+    /// an empty bitmap for a null/unknown name or a non-Type1 font.
+    /// </summary>
+    public GlyphBitmap RasterizeGlyphByType1Name(string fontPath, float fontSize, string? glyphName)
+    {
+        if (glyphName is null || !_type1Fonts.TryGetValue(fontPath, out var t1)) return default;
+        return RenderType1(t1, glyphName, fontSize);
+    }
+
     public void Dispose()
     {
         // Managed fonts don't own native resources — clearing the cache is
@@ -561,6 +685,24 @@ public sealed class ManagedFontRasterizer : IDisposable
     }
 
     // ---- Internals ---------------------------------------------------------
+
+    /// <summary>
+    /// The parsed OpenType face for <paramref name="fontPath"/>, loading and caching it if needed.
+    /// This is the seam a text shaper uses to read the font's GSUB/GPOS/GDEF tables — the same face
+    /// the rasterize methods draw from, so a shaper's substituted glyph ids stay consistent with
+    /// what gets rendered. Returns <c>false</c> (and <paramref name="font"/> <c>null</c>) for
+    /// Type1/PFB fonts, which are not SFNT and cannot be shaped, and for memory fonts not yet
+    /// registered — callers fall back to unshaped per-rune layout in those cases.
+    /// </summary>
+    public bool TryGetOpenTypeFont(string fontPath, [NotNullWhen(true)] out OpenTypeFont? font)
+    {
+        font = null;
+        if (_type1Fonts.ContainsKey(fontPath)) return false;      // Type1 has no OpenType face
+        if (_fonts.TryGetValue(fontPath, out font)) return true;  // already loaded
+        if (fontPath.StartsWith("mem:", StringComparison.Ordinal)) return false; // not registered yet
+        font = _fonts.GetOrAdd(fontPath, OpenTypeFont.LoadFromFile(fontPath));
+        return true;
+    }
 
     private OpenTypeFont GetOrLoad(string fontPath)
     {
@@ -622,6 +764,18 @@ public sealed class ManagedFontRasterizer : IDisposable
             sdf.Left, sdf.Top, advanceX, spread);
     }
 
+    private static MtsdfGlyphBitmap RenderMtsdf(OpenTypeFont font, uint gid, float pixelsPerEm, float spread)
+    {
+        var mtsdf = font.RenderMtsdf(gid, pixelsPerEm, spread);
+        if (mtsdf.IsEmpty) return default;
+
+        var advanceX = font.Hmtx is not null
+            ? font.Hmtx.GetAdvanceWidth(gid) * pixelsPerEm / font.UnitsPerEm
+            : 0f;
+        return new MtsdfGlyphBitmap(mtsdf.Rgba, mtsdf.Width, mtsdf.Height,
+            mtsdf.Left, mtsdf.Top, advanceX, spread);
+    }
+
     // ---- Type1 (PFB) glyph rendering -------------------------------------
 
     /// <summary>
@@ -681,5 +835,19 @@ public sealed class ManagedFontRasterizer : IDisposable
             pixelsPerEm, font.UnitsPerEm, spread);
         if (sdf.Width == 0 || sdf.Height == 0) return default;
         return new SdfGlyphBitmap(sdf.Alpha, sdf.Width, sdf.Height, sdf.Left, sdf.Top, AdvanceX: 0f, spread);
+    }
+
+    /// <summary>
+    /// Rasterize a Type1 glyph (by name) to an MTSDF, driving the sink-based
+    /// generator directly from the charstring interpreter — the Type1 analogue of
+    /// <see cref="RenderMtsdf"/>.
+    /// </summary>
+    private static MtsdfGlyphBitmap RenderType1Mtsdf(T1.Type1Font font, string? glyphName, float pixelsPerEm, float spread)
+    {
+        if (glyphName is null || !font.HasGlyph(glyphName)) return default;
+        var mtsdf = Rast.MsdfRasterizer.RasterizeAuto(sink => font.DrawGlyph(glyphName, sink),
+            pixelsPerEm, font.UnitsPerEm, spread);
+        if (mtsdf.Width == 0 || mtsdf.Height == 0) return default;
+        return new MtsdfGlyphBitmap(mtsdf.Rgba, mtsdf.Width, mtsdf.Height, mtsdf.Left, mtsdf.Top, AdvanceX: 0f, spread);
     }
 }
