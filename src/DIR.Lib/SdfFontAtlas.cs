@@ -57,6 +57,16 @@ public sealed class SdfFontAtlas : IDisposable
     /// renderer hands an <see cref="ITextShaper"/> so shaping keys off the same font state.
     /// Not owned: never disposed by the atlas.</summary>
     public ManagedFontRasterizer Rasterizer => _rasterizer;
+
+    // The raster size THIS atlas bakes glyphs at. Defaults to the SdfRasterSize const (64px) so
+    // existing single-tier callers are unchanged; a tiered host runs a second atlas at a larger
+    // raster (e.g. 256px) for glyphs drawn large on screen, where the 64px field undersamples thin
+    // strokes. The rasterizer already takes the size from the glyph key, so this is the only field
+    // that has to become per-instance for tiering. See GetGlyphScale / ScreenPxHalfBand.
+    private readonly float _rasterSize;
+    /// <summary>The size (px) this atlas rasterizes glyphs at — the GPU scales the quad from here.</summary>
+    public float RasterSize => _rasterSize;
+
     private readonly Dictionary<GlyphKey, GlyphInfo> _glyphs = new();
     private readonly HashSet<GlyphKey> _unflushedGlyphs = new();
 
@@ -222,13 +232,15 @@ public sealed class SdfFontAtlas : IDisposable
         ISdfAtlasBackend? backend = null,
         int initialPageDim = DefaultInitialAtlasDim,
         SdfGlyphDiskCache? diskCache = null,
-        bool synchronousRasterize = false)
+        bool synchronousRasterize = false,
+        float rasterSize = SdfRasterSize)
     {
         _rasterizer = rasterizer;
         _backend = backend;
         _framesInFlight = framesInFlight;
         _diskCache = diskCache;
         _synchronousRasterize = synchronousRasterize;
+        _rasterSize = rasterSize;
         // Page dimension = the requested size, clamped to the device limit and rounded DOWN to a
         // power of two (so DecodePage's (int)(V*MaxPages) recovers the page index exactly).
         // Pages are square _pageDim. The atlas never grows the page; it appends new pages instead,
@@ -328,7 +340,7 @@ public sealed class SdfFontAtlas : IDisposable
             for (; i < load.Entries.Count && budget > 0 && _frameStagedBytes < MaxUploadBytesPerFrame; i++)
             {
                 var e = load.Entries[i];
-                var key = new GlyphKey(load.Font, SdfRasterSize, e.Gid, e.Name);
+                var key = new GlyphKey(load.Font, _rasterSize, e.Gid, e.Name);
                 if (_glyphs.ContainsKey(key)) continue;
                 InsertRasterized(key, e.Bitmap);
                 budget--;
@@ -359,7 +371,7 @@ public sealed class SdfFontAtlas : IDisposable
     /// <summary>
     /// Returns the scale factor between the requested fontSize and the SDF raster size.
     /// </summary>
-    public static float GetGlyphScale(float requestedFontSize) => requestedFontSize / SdfRasterSize;
+    public float GetGlyphScale(float requestedFontSize) => requestedFontSize / _rasterSize;
 
     /// <summary>
     /// Analytic half-width of the SDF smoothstep band, in field units, equal to half a screen
@@ -369,7 +381,7 @@ public sealed class SdfFontAtlas : IDisposable
     /// derivative jumps at channel-switch seams (see the SDF fragment shader comment in the
     /// backend). Clamped so tiny text can't smear the band across the whole field range.
     /// </summary>
-    public static float ScreenPxHalfBand(float fontSize) =>
+    public float ScreenPxHalfBand(float fontSize) =>
         Math.Clamp(0.5f / (GetGlyphScale(fontSize) * 2f * SdfSpread), 1e-3f, 0.25f);
 
     public GlyphInfo GetGlyph(string fontPath, float fontSize, Rune character,
@@ -399,7 +411,7 @@ public sealed class SdfFontAtlas : IDisposable
         bool skipUnflushed = false, bool rasterizeOnMiss = true)
     {
         EnsureFontLoadedFromDisk(fontPath);
-        var key = new GlyphKey(fontPath, SdfRasterSize, gid, type1Name);
+        var key = new GlyphKey(fontPath, _rasterSize, gid, type1Name);
         return GetGlyphByKey(key, isWhitespace: false, skipUnflushed, rasterizeOnMiss);
     }
 
@@ -455,9 +467,9 @@ public sealed class SdfFontAtlas : IDisposable
     private GlyphKey MakeKey(string fontPath, Rune character, int charCode, GlyphMapHint hint)
     {
         if (Rune.IsWhiteSpace(character))
-            return new GlyphKey(fontPath, SdfRasterSize, WhitespaceGid, null);
+            return new GlyphKey(fontPath, _rasterSize, WhitespaceGid, null);
         var id = _rasterizer.ResolveGlyphIdentity(fontPath, character, charCode, hint);
-        return new GlyphKey(fontPath, SdfRasterSize, id.Gid, id.Type1Name);
+        return new GlyphKey(fontPath, _rasterSize, id.Gid, id.Type1Name);
     }
 
     // Rasterize a glyph to MTSDF by its resolved identity: Type1 by glyph name, otherwise by GID.
@@ -609,7 +621,7 @@ public sealed class SdfFontAtlas : IDisposable
     {
         if (key.Gid == WhitespaceGid)
         {
-            var refGlyph = GetGlyph(key.Font, SdfRasterSize, new Rune('n'));
+            var refGlyph = GetGlyph(key.Font, _rasterSize, new Rune('n'));
             var info = new GlyphInfo(0, 0, 0, 0, 0, 0, refGlyph.AdvanceX, 0, 0, SdfSpread);
             _glyphs[key] = info;
             return info;
@@ -812,7 +824,7 @@ public sealed class SdfFontAtlas : IDisposable
         // need GetGlyph reentry, so warm them synchronously — there are only a handful per font.
         foreach (var (font, ch, charCode, hint) in keys)
         {
-            if (Rune.IsWhiteSpace(ch)) GetGlyph(font, SdfRasterSize, ch, charCode: charCode, hint: hint);
+            if (Rune.IsWhiteSpace(ch)) GetGlyph(font, _rasterSize, ch, charCode: charCode, hint: hint);
         }
     }
 
@@ -845,7 +857,7 @@ public sealed class SdfFontAtlas : IDisposable
         var toRasterize = new List<GlyphKey>();
         foreach (var (font, gid, name) in keys)
         {
-            var atlasKey = new GlyphKey(font, SdfRasterSize, gid, name);
+            var atlasKey = new GlyphKey(font, _rasterSize, gid, name);
             if (_glyphs.ContainsKey(atlasKey)) continue;
             if (!_rasterizeInFlight.TryAdd(atlasKey, 0)) continue;
             toRasterize.Add(atlasKey);
