@@ -13,7 +13,13 @@ env:
   # 6.7 - DIR.Lib.Shaping ITextShaper adapter with full UAX #9 bidi.
   # 6.8 - rebuild against SharpAstro.Fonts.Shaping 1.5.551; + SignalDirectory source
   #       generator (DIR.Lib.SourceGenerators) + SignalJson binder.
-  VERSION_PREFIX: 6.8.${{ github.run_number }}
+  # 6.9 - memoize ResolveGlyphIdentity (session-stable identity cache) +
+  #       SharpAstro.Fonts 1.6 (bare-CFF CIDFontType0 loading).
+  # 6.11 - hoist the backend-neutral SDF atlas core into DIR.Lib: SdfFontAtlas owns
+  #        keying / packing / LRU / budgets / disk cache / async rasterize, GPU backends
+  #        implement ISdfAtlasBackend; SdfGlyphDiskCache moved here from SdlVulkan.Renderer
+  #        (.sdfg FormatVersion 6, + read-only mode for single-threaded hosts); AtlasDiag.
+  VERSION_PREFIX: 6.11.${{ github.run_number }}
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
