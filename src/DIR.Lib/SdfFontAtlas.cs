@@ -60,7 +60,7 @@ public sealed class SdfFontAtlas : IDisposable
 
     // The raster size THIS atlas bakes glyphs at. Defaults to the SdfRasterSize const (64px) so
     // existing single-tier callers are unchanged; a tiered host runs a second atlas at a larger
-    // raster (e.g. 256px) for glyphs drawn large on screen, where the 64px field undersamples thin
+    // raster (e.g. 128px) for glyphs drawn large on screen, where the 64px field undersamples thin
     // strokes. The rasterizer already takes the size from the glyph key, so this is the only field
     // that has to become per-instance for tiering. See GetGlyphScale / ScreenPxHalfBand.
     private readonly float _rasterSize;
