@@ -67,6 +67,24 @@ public sealed class SdfFontAtlas : IDisposable
     /// <summary>The size (px) this atlas rasterizes glyphs at — the GPU scales the quad from here.</summary>
     public float RasterSize => _rasterSize;
 
+    // Per-instance page cap (defaults to the MaxPages const; power of two for DecodePage exactness).
+    // A fallback-backed tier (large text) runs with a small cap + refuseWhenSaturated: at the cap
+    // with every page hot it REFUSES inserts (sentinel entry → the renderer draws its base-tier
+    // fallback) instead of the evict-all wipe. A capped tier must never thrash: on docs whose
+    // per-frame working set exceeds the cap (dense CJK at high zoom — measured: 2,285 glyph
+    // identities ≈ 47 pages at 128px vs a 16-page cap), evict-all would wipe + refill EVERY frame —
+    // sustained allocation/upload churn on the exact path that wedges Adreno drivers.
+    private readonly int _maxPages;
+    private readonly bool _refuseWhenSaturated;
+    // Set by InsertRasterized's refusal branch for the CURRENT insert; the drains read it to stop
+    // retrying (a refused glyph is sentineled, a refused disk-load tail is dropped). Render-thread only.
+    private bool _lastInsertSaturated;
+    private bool _saturationLogged;
+    // Refusal sentinel: a Width==0 entry whose negative Spread marks "refused at saturation" as
+    // opposed to "genuinely blank". Purged when a page frees up (PurgeRefusalSentinels), so the
+    // glyphs re-attempt the tier instead of staying base-tier-soft for the whole session.
+    private static readonly GlyphInfo RefusedSentinel = new(0, 0, 0, 0, 0, 0, 0, 0, 0, -1f);
+
     private readonly Dictionary<GlyphKey, GlyphInfo> _glyphs = new();
     private readonly HashSet<GlyphKey> _unflushedGlyphs = new();
 
@@ -216,14 +234,14 @@ public sealed class SdfFontAtlas : IDisposable
     }
 
     /// <summary>Recover which page a glyph lives on and its page-local V range from the virtual V
-    /// encoded at insert time (V is normalized over the MaxPages-tall virtual stack). Exact while
-    /// <see cref="PageDimension"/> and <see cref="MaxPages"/> are powers of two. U is already page-local.</summary>
+    /// encoded at insert time (V is normalized over the instance's max-pages-tall virtual stack).
+    /// Exact while <see cref="PageDimension"/> and the page cap are powers of two. U is already page-local.</summary>
     public void DecodePage(in GlyphInfo g, out int page, out float localV0, out float localV1)
     {
-        var vy = g.V0 * MaxPages;
+        var vy = g.V0 * _maxPages;
         page = (int)vy;
         localV0 = vy - page;
-        localV1 = g.V1 * MaxPages - page;
+        localV1 = g.V1 * _maxPages - page;
     }
 
     public SdfFontAtlas(ManagedFontRasterizer rasterizer,
@@ -233,7 +251,9 @@ public sealed class SdfFontAtlas : IDisposable
         int initialPageDim = DefaultInitialAtlasDim,
         SdfGlyphDiskCache? diskCache = null,
         bool synchronousRasterize = false,
-        float rasterSize = SdfRasterSize)
+        float rasterSize = SdfRasterSize,
+        int maxPages = MaxPages,
+        bool refuseWhenSaturated = false)
     {
         _rasterizer = rasterizer;
         _backend = backend;
@@ -241,6 +261,10 @@ public sealed class SdfFontAtlas : IDisposable
         _diskCache = diskCache;
         _synchronousRasterize = synchronousRasterize;
         _rasterSize = rasterSize;
+        // Power of two, rounded DOWN (DecodePage's (int)(V*_maxPages) must recover the page index
+        // exactly), clamped to a sane range — the V-encoding's virtual stack is _maxPages*_pageDim.
+        _maxPages = 1 << System.Numerics.BitOperations.Log2((uint)Math.Clamp(maxPages, 1, 64));
+        _refuseWhenSaturated = refuseWhenSaturated;
         // Page dimension = the requested size, clamped to the device limit and rounded DOWN to a
         // power of two (so DecodePage's (int)(V*MaxPages) recovers the page index exactly).
         // Pages are square _pageDim. The atlas never grows the page; it appends new pages instead,
@@ -310,10 +334,12 @@ public sealed class SdfFontAtlas : IDisposable
             var info = InsertRasterized(r.Key, r.Bitmap);
             if (info.Width > 0)
                 _diskCache?.AppendGlyph(r.Key.Font, r.Key.Gid, r.Key.Name, in r.Bitmap);
-            else if (!_needsEviction)
+            else if (!_needsEviction && !_glyphs.ContainsKey(r.Key))
                 // Genuinely blank glyph (empty SDF — InsertRasterized doesn't record those). Cache a
                 // zero sentinel so the draw path / prewarm don't re-queue it every frame — otherwise
                 // _rasterizeInFlight never settles and IsDirty pins the loop in a redraw busy-spin.
+                // (The ContainsKey guard keeps a saturation RefusedSentinel — written by the refusal
+                // branch itself — from being overwritten with the permanent blank flavour.)
                 _glyphs[r.Key] = default;
             inserted++;
             // Page cap hit (InsertRasterized set _needsEviction): stop; BeginFrame evicts next frame
@@ -344,6 +370,16 @@ public sealed class SdfFontAtlas : IDisposable
                 if (_glyphs.ContainsKey(key)) continue;
                 InsertRasterized(key, e.Bitmap);
                 budget--;
+                if (_lastInsertSaturated)
+                {
+                    // Refusal-mode saturation: same policy as atlas-full below — drop this font's
+                    // remaining bulk-loaded glyphs (re-enqueueing them would spin the tail forever;
+                    // the ones actually drawn fault in on demand once pressure drops).
+                    atlasFull = true;
+                    i++;
+                    AtlasDiag.Log("sdf.diskload", $"{load.Font}: saturated at entry {i}/{load.Entries.Count} — rest on demand");
+                    break;
+                }
                 if (_needsEviction)
                 {
                     // Atlas filled and nothing cold could be recycled. Do NOT EvictAll to cram in the
@@ -643,6 +679,7 @@ public sealed class SdfFontAtlas : IDisposable
     /// </summary>
     private GlyphInfo InsertRasterized(GlyphKey key, MtsdfGlyphBitmap bitmap)
     {
+        _lastInsertSaturated = false;
         var glyphWidth = bitmap.Width;
         var glyphHeight = bitmap.Height;
 
@@ -668,7 +705,7 @@ public sealed class SdfFontAtlas : IDisposable
         // survives only as the all-pages-hot fallback (working set > MaxPages in a single frame).
         if (page.CursorY + glyphHeight > _pageDim)
         {
-            if (_pages.Count < MaxPages)
+            if (_pages.Count < _maxPages)
             {
                 page = AllocateNewPage();   // sets _activePageIdx
                 pageIdx = _activePageIdx;
@@ -677,13 +714,31 @@ public sealed class SdfFontAtlas : IDisposable
             {
                 page = _pages[pageIdx];     // cursor reset + _activePageIdx set by TryEvictLruPage
             }
+            else if (_refuseWhenSaturated)
+            {
+                // Fallback-backed tier at its cap with every page hot: refuse the insert. The key is
+                // sentineled (below) so lookups HIT (Width==0 → the renderer draws its base-tier
+                // fallback) instead of re-queuing a rasterize every frame, and the drains stop
+                // retrying via _lastInsertSaturated. Never evict-all here: a working set larger than
+                // the cap would wipe + refill the atlas EVERY frame — sustained allocation/upload
+                // churn on the exact path that wedges Adreno drivers. Sentinels purge when a page
+                // frees up (see TryEvictLruPage), so the tier re-engages once pressure drops.
+                if (!_saturationLogged)
+                {
+                    _saturationLogged = true;
+                    AtlasDiag.Log("sdf.pagecap", $"saturated at {_maxPages} pages glyphs={_glyphs.Count} — refusing inserts (base-tier fallback)");
+                }
+                _lastInsertSaturated = true;
+                _glyphs[key] = RefusedSentinel;
+                return default;
+            }
             else
             {
                 // Every page was touched within the last framesInFlight frames — nothing safe to
                 // recycle. Caller treats Width=0 as not-yet-available and retries after the fallback
                 // EvictAll runs next BeginFrame.
                 if (!_needsEviction)
-                    AtlasDiag.Log("sdf.pagecap", $"all {MaxPages} pages hot glyphs={_glyphs.Count} — evict-all fallback");
+                    AtlasDiag.Log("sdf.pagecap", $"all {_maxPages} pages hot glyphs={_glyphs.Count} — evict-all fallback");
                 _needsEviction = true;
                 return default;
             }
@@ -707,8 +762,8 @@ public sealed class SdfFontAtlas : IDisposable
         _frameStagedBytes += rowBytes * glyphHeight; // drives the per-frame byte budget + breadcrumb
 
         // U is page-local (every page shares the same width). V is the VIRTUAL y over the
-        // MaxPages-tall stack so the page index is recoverable from V alone (see DecodePage).
-        var virtDenom = (float)(MaxPages * _pageDim);
+        // max-pages-tall stack so the page index is recoverable from V alone (see DecodePage).
+        var virtDenom = (float)(_maxPages * _pageDim);
         var glyphInfo = new GlyphInfo(
             U0: page.CursorX / (float)_pageDim,
             V0: (pageIdx * _pageDim + page.CursorY) / virtDenom,
@@ -765,7 +820,23 @@ public sealed class SdfFontAtlas : IDisposable
         page.CursorX = 0; page.CursorY = 0; page.RowHeight = 0;
         page.LastUsedFrame = _frameTick;
         _activePageIdx = pageIdx;
+        PurgeRefusalSentinels();
         return true;
+    }
+
+    // A page just freed up — drop the saturation refusal sentinels (Spread < 0; they belong to no
+    // page) so those glyphs re-attempt the tier instead of drawing base-tier-soft all session.
+    // Only runs on page-recycle events, never per frame; EvictAll clears the whole dict anyway.
+    private void PurgeRefusalSentinels()
+    {
+        if (!_saturationLogged) return; // no refusals since the last purge — skip the dict scan
+        _saturationLogged = false;
+        List<GlyphKey>? refused = null;
+        foreach (var kv in _glyphs)
+            if (kv.Value.Spread < 0f) (refused ??= new List<GlyphKey>()).Add(kv.Key);
+        if (refused is null) return;
+        foreach (var k in refused) _glyphs.Remove(k);
+        AtlasDiag.Log("sdf.pagecap", $"purged {refused.Count} refusal sentinel(s) after page recycle");
     }
 
     /// <summary>
@@ -907,6 +978,7 @@ public sealed class SdfFontAtlas : IDisposable
     {
         AtlasDiag.Log("sdf.evict", $"wiping {_glyphs.Count} glyphs across {_pages.Count} page(s)");
         _glyphs.Clear();
+        _saturationLogged = false; // refusal sentinels went with the dict — re-arm the episode log
         // Drop pending async rasterization too. A background task still running may enqueue a stale
         // result afterwards — harmless: DrainPendingRasterized re-checks _glyphs and the key isn't
         // claimed anymore, so at worst the glyph is re-rasterized once. Re-requested on next draw.
