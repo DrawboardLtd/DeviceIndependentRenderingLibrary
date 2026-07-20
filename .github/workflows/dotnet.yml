@@ -19,7 +19,12 @@ env:
   #        keying / packing / LRU / budgets / disk cache / async rasterize, GPU backends
   #        implement ISdfAtlasBackend; SdfGlyphDiskCache moved here from SdlVulkan.Renderer
   #        (.sdfg FormatVersion 6, + read-only mode for single-threaded hosts); AtlasDiag.
-  VERSION_PREFIX: 6.13.${{ github.run_number }}
+  # 6.13 - selectable-text channel (DrawSelectableText + SelectableTextRegion) + menu
+  #        font-cap for narrow surfaces; + per-instance SdfFontAtlas raster size / page
+  #        cap / saturation refusal for tiered (large-text) atlases.
+  # 6.14 - responsive layout primitives: clamped Star sizing, collapse-below-minimum,
+  #        and a Wrap flow container in DIR.Lib.Layout.
+  VERSION_PREFIX: 6.14.${{ github.run_number }}
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
