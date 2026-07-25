@@ -26,6 +26,12 @@ namespace DIR.Lib
     }
 
     /// <summary>
+    /// Chrome colours for <see cref="PixelWidgetBase{TSurface}.DrawTrackSlider"/>: the unfilled track
+    /// bar background and the draggable handle marker. The per-slider accent fill is passed separately.
+    /// </summary>
+    public readonly record struct TrackSliderChrome(RGBAColor32 TrackBackground, RGBAColor32 Handle);
+
+    /// <summary>
     /// Base class for pixel-coordinate widgets. Provides the clickable region system
     /// (RegisterClickable / HitTest / HitTestAndDispatch) and common drawing helpers.
     /// Generic over <typeparamref name="TSurface"/> so it works with any <see cref="Renderer{TSurface}"/>.
@@ -64,6 +70,43 @@ namespace DIR.Lib
         public long FrameCount { get; set; }
 
         /// <summary>
+        /// The window's DPI scale (device pixels per design unit), owned per widget instance -- a widget
+        /// belongs to exactly one window/renderer, so the host sets this at startup and on resize (SDL
+        /// <c>DisplayScale</c>, web <c>devicePixelRatio</c>; a terminal stays at 1). Layout helpers
+        /// (<see cref="RenderLayout"/> / <see cref="ArrangeLayout"/> / <see cref="PaintLayout"/>) and
+        /// pixel controls (<see cref="DrawTrackSlider(float,float,float,float,float,RGBAColor32,RectF32,HitResult,TrackSliderChrome,float?)"/>)
+        /// default to it when their <c>dpiScale</c> argument is omitted, and input handlers can read it
+        /// directly (input events carry no DPI). Pass an explicit value only to override -- e.g.
+        /// <c>dpiScale: 1f</c> for a tree whose sizes are already device pixels.
+        /// Virtual so a composite chrome widget can override the setter to propagate the new scale to the
+        /// child widgets it hosts (one set-point at startup/resize instead of per-frame pushes).
+        /// </summary>
+        public virtual float DpiScale { get; set; } = 1f;
+
+        /// <summary>
+        /// The window's primary text font (an absolute path or a family name the
+        /// <see cref="Renderer{TSurface}"/> resolves), owned per widget instance like <see cref="DpiScale"/> --
+        /// a widget belongs to exactly one window, so the host resolves the font once and sets this at startup
+        /// (and again if the font changes). The layout helpers
+        /// (<see cref="RenderLayout"/> / <see cref="ArrangeLayout"/> / <see cref="PaintLayout"/>) default to it
+        /// when their <c>fontPath</c> argument is omitted; the lower-level draw helpers (<see cref="DrawText"/>,
+        /// <see cref="RenderButton"/>, ...) still take an explicit font so a caller can draw a run in a
+        /// different face (e.g. the emoji font). Empty = unresolved: the text helpers no-op on an empty font,
+        /// so an unconfigured widget (headless test, pre-resolve frame) draws no text rather than throwing.
+        /// Virtual so a composite chrome widget can override the setter to push the font to the child widgets
+        /// it hosts (one set-point at startup instead of per-frame pushes).
+        /// </summary>
+        public virtual string FontPath { get; set; } = string.Empty;
+
+        /// <summary>
+        /// Optional emoji/symbol fallback font for glyphs the primary <see cref="FontPath"/> lacks (colour
+        /// emoji, weather/planet symbols). Null = none (callers fall back to <see cref="FontPath"/>). Owned and
+        /// propagated exactly like <see cref="FontPath"/>. DIR.Lib's own helpers do not consume it -- it rides
+        /// here so a consumer's widgets share one owner for the whole per-window font set.
+        /// </summary>
+        public virtual string? EmojiFontPath { get; set; }
+
+        /// <summary>
         /// Clears clickable regions (and the inspector layout capture, if enabled). Call at the start
         /// of each Render pass.
         /// </summary>
@@ -88,6 +131,80 @@ namespace DIR.Lib
             TextInputRenderer.Render(Renderer, state, x, y, width, height, fontPath, fontSize, FrameCount);
             RegisterClickable(x, y, width, height, new HitResult.TextInputHit(state));
         }
+
+        /// <summary>
+        /// Arranged-rect overload of
+        /// <see cref="RenderTextInput(TextInputState,int,int,int,int,string,float)"/> for layout-driven
+        /// callers that hold a float <see cref="RectF32"/> (a Fill leaf's arranged bounds) rather than
+        /// integer pixel positions. Rounds to whole pixels once here -- the text-input renderer is
+        /// integer-grid (RectInt) internally -- so call sites stop repeating the four-way (int) cast.
+        /// </summary>
+        protected void RenderTextInput(TextInputState state, RectF32 rect, string fontPath, float fontSize) =>
+            RenderTextInput(state,
+                (int)MathF.Round(rect.X), (int)MathF.Round(rect.Y),
+                (int)MathF.Round(rect.Width), (int)MathF.Round(rect.Height),
+                fontPath, fontSize);
+
+        // -------------------------------------------------------------------------------------------------
+        // TrackSlider -- the one horizontal press/drag/release track (WB / wavelet / scrub / ...).
+        //
+        // A horizontal track (unfilled bar + played/value fill + a draggable handle) plus a cursor-X ->
+        // fraction mapping against a captured hit-band rect. Generic: the track + handle colours arrive as a
+        // TrackSliderChrome, the accent fill + fraction + geometry + hit payload per call, and dpiScale scales
+        // the bar/handle thickness (the only DPI-dependent bit). Consumers pass their own chrome so no widget
+        // re-triplicates the bar/fill/handle/clamp math or the drag arithmetic.
+        // -------------------------------------------------------------------------------------------------
+
+        /// <summary>
+        /// Draws one horizontal track slider and registers its drag hit-band. <paramref name="frac"/> is the
+        /// normalised fill/handle position in [0, 1]. <paramref name="barCenterY"/> is the vertical centre of
+        /// the thin track bar; the draggable handle is a <paramref name="handleH"/>-tall marker at
+        /// <paramref name="handleY"/>. <paramref name="hitBand"/> is the full press/drag region (its X/Width
+        /// drive the cursor-X -> value mapping in <see cref="TrackFrac"/>; the caller also stores it in the
+        /// slider's track-rect field for that drag). <paramref name="chrome"/> supplies the unfilled-track +
+        /// handle colours; <paramref name="fillColor"/> is the per-slider accent; <paramref name="dpiScale"/>
+        /// scales the bar/handle thickness.
+        /// </summary>
+        protected void DrawTrackSlider(float trackX, float trackW, float barCenterY, float handleY,
+            float handleH, float frac, RGBAColor32 fillColor, RectF32 hitBand, HitResult hit,
+            TrackSliderChrome chrome, float? dpiScale = null)
+        {
+            var scale = dpiScale ?? DpiScale;
+            var barH = MathF.Max(4f, 6f * scale);
+            var handleW = MathF.Max(4f, 6f * scale);
+
+            var barY = barCenterY - barH / 2f;
+            FillRect(trackX, barY, trackW, barH, chrome.TrackBackground);
+            FillRect(trackX, barY, trackW * frac, barH, fillColor);
+
+            // Handle marker; guard the clamp's upper bound for a sliver-thin track (trackW < handleW would
+            // make Math.Clamp's max < min and throw -- the minimize-to-sliver crash).
+            var handleMax = MathF.Max(trackX, trackX + trackW - handleW);
+            var handleX = Math.Clamp(trackX + trackW * frac - handleW / 2f, trackX, handleMax);
+            FillRect(handleX, handleY, handleW, handleH, chrome.Handle);
+
+            RegisterClickable(hitBand.X, hitBand.Y, hitBand.Width, hitBand.Height, hit);
+        }
+
+        /// <summary>
+        /// Convenience overload: the thin track bar is centred vertically within the handle band
+        /// [<paramref name="handleY"/>, handleY + <paramref name="handleH"/>] -- the common case where the
+        /// bar runs through the middle of the handle (so the caller passes the handle band once, not the
+        /// handle band AND a separate bar centre). Use the <c>barCenterY</c> overload only when the bar and
+        /// handle occupy different vertical bands, e.g. a scrub bar centred on a taller strip while the
+        /// handle spans a shorter content row.
+        /// </summary>
+        protected void DrawTrackSlider(float trackX, float trackW, float handleY, float handleH, float frac,
+            RGBAColor32 fillColor, RectF32 hitBand, HitResult hit, TrackSliderChrome chrome, float? dpiScale = null) =>
+            DrawTrackSlider(trackX, trackW, handleY + handleH / 2f, handleY, handleH, frac,
+                fillColor, hitBand, hit, chrome, dpiScale);
+
+        /// <summary>
+        /// Maps a cursor X onto a fraction in [0, 1] across <paramref name="track"/> (the captured hit-band).
+        /// The single drag-math primitive behind every track slider's Update* handler.
+        /// </summary>
+        protected static float TrackFrac(RectF32 track, float px)
+            => track.Width <= 0f ? 0f : Math.Clamp((px - track.X) / track.Width, 0f, 1f);
 
         /// <summary>
         /// Renders a button and registers the clickable region with an optional direct handler.
@@ -205,15 +322,19 @@ namespace DIR.Lib
             var rowH = fontSize * 1.8f;
             var padding = fontSize * 0.5f;
             var totalItems = dropdown.Items.Length + (dropdown.HasCustomEntry ? 1 : 0);
-            var dropdownH = totalItems * rowH;
-            if (maxHeight > 0f && dropdownH > maxHeight)
-            {
-                dropdownH = maxHeight;
-            }
 
             var x = dropdown.AnchorX;
             var y = dropdown.AnchorY;
             var w = dropdown.AnchorWidth;
+
+            // Clamp the menu to the space between its anchor and the bottom of the surface (or an explicit
+            // maxHeight, whichever is smaller) so a long list scrolls within view instead of running off the
+            // bottom edge -- the correctness fix that makes the scroll engage with no consumer change. A menu
+            // that already fits is unchanged: dropdownH stays totalItems * rowH, so MaxOffset is 0, no
+            // scrollbar draws, and every row renders exactly as before.
+            var available = MathF.Max(rowH, viewportHeight - y);
+            var clamp = maxHeight > 0f ? MathF.Min(maxHeight, available) : available;
+            var dropdownH = MathF.Min(totalItems * rowH, clamp);
 
             // Full-screen backdrop — closes dropdown on click-outside
             RegisterClickable(0, 0, viewportWidth, viewportHeight, new HitResult.ButtonHit("DropdownBackdrop"),
@@ -224,63 +345,60 @@ namespace DIR.Lib
             // Background
             FillRect(x, y, w, dropdownH, bgColor);
 
-            // Items
-            var itemY = y;
-            // +0.5px epsilon on the fit guard: when the items exactly fill dropdownH (= totalItems * rowH,
-            // the unclamped case), the accumulated `itemY` (y + rowH + rowH + ...) can exceed `y + dropdownH`
-            // (= y + N*rowH, computed by multiplication) by a sub-pixel float-rounding error, which would
-            // silently clip the LAST item -- it bit the 3-entry Live Session mode dropdown ("Planetary" drew
-            // no text). The epsilon is well under a row, so a genuinely overflowing item (maxHeight-clamped)
-            // is still excluded.
-            for (var i = 0; i < dropdown.Items.Length && itemY + rowH <= y + dropdownH + 0.5f; i++)
+            // The menu body is a scroll viewport of `totalItems` atoms, each `rowH` tall. A menu that fits
+            // (maxHeight unset, or few enough rows) resolves to MaxOffset 0 -- no scrollbar, full-width
+            // rows, offset 0 -- so the common case is byte-identical to the pre-scroll behaviour (the old
+            // "+0.5px fit epsilon" that kept an exact-fit last row now lives in ListScrollController's
+            // VisibleAtoms). A menu clamped by maxHeight scrolls its window instead of silently dropping the
+            // rows past the fold: keyboard Up/Down scrolls via DropdownMenuState.HandleKeyDown->EnsureVisible,
+            // a wheel forwarded to HandleScrollInput scrolls too, and the scrollbar draws as the indicator.
+            var scroll = dropdown.Scroll;
+            scroll.SetExtent(new RectF32(x, y, w, dropdownH), rowH, totalItems, DpiScale);
+
+            // Slightly dimmed, blue-shifted text for the "Custom..." entry (the last atom when present).
+            var customColor = new RGBAColor32(
+                (byte)((textColor.Red * 3 + 2) / 4),
+                (byte)((textColor.Green * 3 + 2) / 4),
+                (byte)Math.Min(255, textColor.Blue + 40),
+                textColor.Alpha);
+
+            foreach (var (index, rect) in scroll.VisibleRows())
             {
-                if (i == dropdown.HighlightIndex)
+                var isCustom = dropdown.HasCustomEntry && index == dropdown.Items.Length;
+
+                if (index == dropdown.HighlightIndex)
                 {
-                    FillRect(x, itemY, w, rowH, highlightColor);
+                    FillRect(rect.X, rect.Y, rect.Width, rowH, highlightColor);
                 }
 
-                DrawText(dropdown.Items[i].AsSpan(), fontPath,
-                    x + padding, itemY, w - padding * 2f, rowH,
-                    fontSize, textColor, TextAlign.Near, TextAlign.Center);
+                var label = isCustom ? dropdown.CustomEntryLabel : dropdown.Items[index];
+                DrawText(label.AsSpan(), fontPath,
+                    rect.X + padding, rect.Y, rect.Width - padding * 2f, rowH,
+                    fontSize, isCustom ? customColor : textColor, TextAlign.Near, TextAlign.Center);
 
-                var capturedI = i;
-                var capturedItem = dropdown.Items[i];
-                RegisterClickable(x, itemY, w, rowH, new HitResult.ListItemHit("Dropdown", i),
-                    _ =>
-                    {
-                        dropdown.OnSelect?.Invoke(capturedI, capturedItem);
-                        dropdown.Close();
-                    });
-
-                itemY += rowH;
-            }
-
-            // "Custom..." entry
-            if (dropdown.HasCustomEntry && itemY + rowH <= y + dropdownH)
-            {
-                var customIdx = dropdown.Items.Length;
-                if (customIdx == dropdown.HighlightIndex)
+                var capturedIndex = index;
+                if (isCustom)
                 {
-                    FillRect(x, itemY, w, rowH, highlightColor);
+                    RegisterClickable(rect.X, rect.Y, rect.Width, rowH, new HitResult.ListItemHit("Dropdown", capturedIndex),
+                        _ =>
+                        {
+                            dropdown.OnCustom?.Invoke();
+                            dropdown.Close();
+                        });
                 }
-
-                // Slightly dimmed, blue-shifted text for the "Custom..." entry
-                var customColor = new RGBAColor32(
-                    (byte)((textColor.Red * 3 + 2) / 4),
-                    (byte)((textColor.Green * 3 + 2) / 4),
-                    (byte)Math.Min(255, textColor.Blue + 40),
-                    textColor.Alpha);
-                DrawText(dropdown.CustomEntryLabel.AsSpan(), fontPath,
-                    x + padding, itemY, w - padding * 2f, rowH,
-                    fontSize, customColor, TextAlign.Near, TextAlign.Center);
-
-                RegisterClickable(x, itemY, w, rowH, new HitResult.ListItemHit("Dropdown", customIdx),
-                    _ =>
-                    {
-                        dropdown.OnCustom?.Invoke();
-                        dropdown.Close();
-                    });
+                else
+                {
+                    var capturedItem = dropdown.Items[index];
+                    RegisterClickable(rect.X, rect.Y, rect.Width, rowH, new HitResult.ListItemHit("Dropdown", capturedIndex),
+                        _ =>
+                        {
+                            dropdown.OnSelect?.Invoke(capturedIndex, capturedItem);
+                            dropdown.Close();
+                        });
+                }
             }
+
+            scroll.DrawScrollBar(FillRect);
         }
 
         // --- Declarative layout (Layout.Node tree -> arrange -> paint + auto-bind clicks) ---
@@ -288,11 +406,14 @@ namespace DIR.Lib
         /// <summary>
         /// Arranges a declarative <see cref="Layout.Node"/> tree into <paramref name="bounds"/> using this
         /// widget's renderer as the text-width oracle. Returns the flat pre-order arranged tree (also handy
-        /// for inspection / custom hit-testing).
+        /// for inspection / custom hit-testing). <paramref name="fontPath"/> defaults to the widget's
+        /// <see cref="FontPath"/> and <paramref name="dpiScale"/> to its <see cref="DpiScale"/>; pass an
+        /// explicit value only to override (e.g. <c>dpiScale: 1f</c> for a tree whose sizes are already
+        /// device pixels).
         /// </summary>
-        protected ImmutableArray<Layout.ArrangedNode<float>> ArrangeLayout(Layout.Node root, RectF32 bounds, string fontPath, float dpiScale = 1f)
+        protected ImmutableArray<Layout.ArrangedNode<float>> ArrangeLayout(Layout.Node root, RectF32 bounds, string? fontPath = null, float? dpiScale = null)
         {
-            var ctx = new PixelMeasureContext<TSurface>(Renderer, fontPath, dpiScale);
+            var ctx = new PixelMeasureContext<TSurface>(Renderer, fontPath ?? FontPath, dpiScale ?? DpiScale);
             return Layout.Engine.Arrange(root, new Rect<float>(bounds.X, bounds.Y, bounds.Width, bounds.Height), ctx);
         }
 
@@ -304,9 +425,11 @@ namespace DIR.Lib
         /// <paramref name="drawFill"/> handles <see cref="Layout.Content.Fill"/> escape-hatch leaves
         /// (charts, sky map, custom widgets).
         /// </summary>
-        protected void PaintLayout(ImmutableArray<Layout.ArrangedNode<float>> arranged, string fontPath, float dpiScale = 1f,
+        protected void PaintLayout(ImmutableArray<Layout.ArrangedNode<float>> arranged, string? fontPath = null, float? dpiScale = null,
             Action<Layout.Content.Fill, RectF32>? drawFill = null)
         {
+            var fp = fontPath ?? FontPath;
+            var scale = dpiScale ?? DpiScale;
             foreach (var (node, bounds) in arranged)
             {
                 if (node.Background is { } bg)
@@ -326,8 +449,8 @@ namespace DIR.Lib
                     switch (leaf.Content)
                     {
                         case Layout.Content.Text text:
-                            DrawText(text.Value.AsSpan(), fontPath, bounds.X, bounds.Y, bounds.Width, bounds.Height,
-                                text.FontSize * dpiScale, text.Color, text.HAlign, text.VAlign);
+                            DrawText(text.Value.AsSpan(), fp, bounds.X, bounds.Y, bounds.Width, bounds.Height,
+                                text.FontSize * scale, text.Color, text.HAlign, text.VAlign);
                             break;
                         case Layout.Content.Box box when box.Color.Alpha > 0:
                             FillRect(bounds.X, bounds.Y, bounds.Width, bounds.Height, box.Color);
@@ -348,12 +471,18 @@ namespace DIR.Lib
             }
         }
 
-        /// <summary>Convenience: <see cref="ArrangeLayout"/> + <see cref="PaintLayout"/> in one call.</summary>
-        protected ImmutableArray<Layout.ArrangedNode<float>> RenderLayout(Layout.Node root, RectF32 bounds, string fontPath,
-            float dpiScale = 1f, Action<Layout.Content.Fill, RectF32>? drawFill = null)
+        /// <summary>
+        /// Convenience: <see cref="ArrangeLayout"/> + <see cref="PaintLayout"/> in one call.
+        /// <paramref name="fontPath"/> defaults to the widget's <see cref="FontPath"/> and
+        /// <paramref name="dpiScale"/> to its <see cref="DpiScale"/>.
+        /// </summary>
+        protected ImmutableArray<Layout.ArrangedNode<float>> RenderLayout(Layout.Node root, RectF32 bounds, string? fontPath = null,
+            float? dpiScale = null, Action<Layout.Content.Fill, RectF32>? drawFill = null)
         {
-            var arranged = ArrangeLayout(root, bounds, fontPath, dpiScale);
-            PaintLayout(arranged, fontPath, dpiScale, drawFill);
+            var fp = fontPath ?? FontPath;
+            var scale = dpiScale ?? DpiScale;
+            var arranged = ArrangeLayout(root, bounds, fp, scale);
+            PaintLayout(arranged, fp, scale, drawFill);
             return arranged;
         }
 
@@ -448,9 +577,15 @@ namespace DIR.Lib
         /// use for high-churn scene labels (sky-map star/constellation names reflow every pan frame); those
         /// stay on <see cref="DrawText"/> so they never spill into the host's DOM/selection layer.
         /// </para>
+        /// <para>
+        /// Pass <paramref name="href"/> to mark the run as a hyperlink (see
+        /// <see cref="SelectableTextRegion.Href"/>): a DOM host renders a real <c>&lt;a href&gt;</c>; the
+        /// raster path is unchanged (no navigation model), so links are a web-only progressive enhancement.
+        /// </para>
         /// </summary>
         protected void DrawSelectableText(string text, string fontPath, float x, float y, float w, float h,
-            float fontSize, RGBAColor32 color, TextAlign horizAlign = TextAlign.Near, TextAlign vertAlign = TextAlign.Center)
+            float fontSize, RGBAColor32 color, TextAlign horizAlign = TextAlign.Near, TextAlign vertAlign = TextAlign.Center,
+            string? href = null)
         {
             if (string.IsNullOrEmpty(fontPath) || string.IsNullOrEmpty(text)) return;
             if (!Renderer.HostRendersSelectableText)
@@ -458,7 +593,7 @@ namespace DIR.Lib
                 DrawText(text.AsSpan(), fontPath, x, y, w, h, fontSize, color, horizAlign, vertAlign);
             }
             _selectableText.Add(new SelectableTextRegion(
-                x, y, w, h, text, fontPath, fontSize, color, horizAlign, vertAlign));
+                x, y, w, h, text, fontPath, fontSize, color, horizAlign, vertAlign, href));
         }
 
         /// <summary>

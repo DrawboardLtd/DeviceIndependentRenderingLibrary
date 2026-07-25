@@ -21,7 +21,40 @@ public class LayoutPainterTests
             return GetRegisteredRegions();
         }
 
+        /// <summary>Renders WITHOUT a dpiScale argument, so the widget's <see cref="PixelWidgetBase{T}.DpiScale"/> applies.</summary>
+        public ClickableRegion[] RenderDefaultDpi(Layout.Node root, RectF32 bounds)
+        {
+            BeginFrame();
+            RenderLayout(root, bounds, fontPath: string.Empty);
+            return GetRegisteredRegions();
+        }
+
+        /// <summary>Renders WITHOUT a fontPath argument, so the widget's <see cref="PixelWidgetBase{T}.FontPath"/> applies.</summary>
+        public void RenderDefaultFont(Layout.Node root, RectF32 bounds)
+        {
+            BeginFrame();
+            RenderLayout(root, bounds);
+        }
+
+        /// <summary>Renders with an explicit fontPath, which must override the widget's <see cref="PixelWidgetBase{T}.FontPath"/>.</summary>
+        public void RenderWithFont(Layout.Node root, RectF32 bounds, string fontPath)
+        {
+            BeginFrame();
+            RenderLayout(root, bounds, fontPath: fontPath);
+        }
+
         public HitResult? DispatchAt(float x, float y) => HitTestAndDispatch(x, y);
+    }
+
+    /// <summary>Captures the font family each <see cref="DrawText"/> resolves to (draw is skipped, so no
+    /// real font file is needed) -- proves the layout painter fed through the widget-owned FontPath.</summary>
+    private sealed class FontSpyRenderer(uint width, uint height) : RgbaImageRenderer(width, height)
+    {
+        public string? LastTextFont { get; private set; }
+
+        public override void DrawText(ReadOnlySpan<char> text, string fontFamily, float fontSize, RGBAColor32 fontColor,
+            in RectInt layout, TextAlign horizAlignment = TextAlign.Center, TextAlign vertAlignment = TextAlign.Near)
+            => LastTextFont = fontFamily;
     }
 
     private static Layout.Node.Leaf HitRow(string action, float height, Action<InputModifier>? onClick = null) =>
@@ -76,6 +109,62 @@ public class LayoutPainterTests
 
         widget.DispatchAt(50, 50); // below the row -> no hit
         clicks.ShouldBe(1);
+    }
+
+    [Fact]
+    public void RenderLayout_OmittedDpiScale_UsesWidgetDpiScaleProperty()
+    {
+        using var renderer = new RgbaImageRenderer(200, 200);
+        var widget = new TestWidget(renderer) { DpiScale = 2f };
+
+        // A design-unit Fixed(10) row must arrange to 20 device px when the widget-owned
+        // DpiScale (2) applies -- no dpiScale argument at the call site.
+        var row = HitRow("A", 10);
+        var regions = widget.RenderDefaultDpi(new Layout.Node.Stack([row]), new RectF32(0, 0, 200, 200));
+
+        var ra = regions.First(r => r.Result is HitResult.ButtonHit { Action: "A" });
+        ra.Height.ShouldBe(20f);
+    }
+
+    [Fact]
+    public void RenderLayout_ExplicitDpiScale_OverridesWidgetProperty()
+    {
+        using var renderer = new RgbaImageRenderer(200, 200);
+        var widget = new TestWidget(renderer) { DpiScale = 2f };
+
+        // The device-px escape hatch: an explicit dpiScale: 1f wins over the property, so a tree
+        // holding already-scaled pixel sizes is not scaled twice.
+        var row = HitRow("A", 10);
+        var regions = widget.Render(new Layout.Node.Stack([row]), new RectF32(0, 0, 200, 200));
+
+        var ra = regions.First(r => r.Result is HitResult.ButtonHit { Action: "A" });
+        ra.Height.ShouldBe(10f);
+    }
+
+    [Fact]
+    public void RenderLayout_OmittedFontPath_UsesWidgetFontPathProperty()
+    {
+        using var renderer = new FontSpyRenderer(200, 200);
+        var widget = new TestWidget(renderer) { FontPath = "widget-font" };
+
+        // A Text leaf with no fontPath argument must paint through the widget-owned FontPath -- the
+        // font analogue of the DpiScale-property test above.
+        var text = Layout.Builder.Text("Hi").RowH(10);
+        widget.RenderDefaultFont(new Layout.Node.Stack([text]), new RectF32(0, 0, 200, 200));
+
+        renderer.LastTextFont.ShouldBe("widget-font");
+    }
+
+    [Fact]
+    public void RenderLayout_ExplicitFontPath_OverridesWidgetProperty()
+    {
+        using var renderer = new FontSpyRenderer(200, 200);
+        var widget = new TestWidget(renderer) { FontPath = "widget-font" };
+
+        // An explicit fontPath wins over the property (the override escape hatch, e.g. an emoji run).
+        widget.RenderWithFont(new Layout.Node.Stack([Layout.Builder.Text("Hi").RowH(10)]), new RectF32(0, 0, 200, 200), "call-font");
+
+        renderer.LastTextFont.ShouldBe("call-font");
     }
 
     [Fact]
