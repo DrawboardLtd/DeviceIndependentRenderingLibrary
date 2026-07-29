@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Immutable;
 using System.Numerics;
 
@@ -36,6 +36,19 @@ public abstract partial record Node
     /// parent-before-children, a container's background lands under its content (panels, rows, headers).</summary>
     public RGBAColor32? Background { get; init; }
 
+    /// <summary>Corner radius in design units for this node's <see cref="Background"/> (and a
+    /// <see cref="Content.Box"/> leaf's own fill). 0 (default) is a square corner and paints exactly as
+    /// before, so this is inert until asked for.
+    /// <para>
+    /// Purely a <b>chrome</b> property: arrange does not know about it, so a rounded node occupies and
+    /// insets precisely the rect a square one would. Each surface honours it as far as it can -- a pixel
+    /// painter through <c>Renderer.FillRoundedRectangle</c>, a cell painter by drawing arc corners
+    /// (U+256D..U+2570) since a character grid cannot round by fractions of a cell. A surface that cannot
+    /// express it at all just fills square, which is why this is a hint rather than a guarantee.
+    /// </para>
+    /// Set via <see cref="Radius"/>.</summary>
+    public float CornerRadius { get; init; }
+
     /// <summary>Optional click region bound to this node's arranged rect (draw == hit by construction).
     /// Lives on the node, not the content, so a whole container (a slot row, a panel) is clickable -- not
     /// just leaves. Inner nodes registered later win the hit (top-most), so a button inside a clickable row
@@ -60,7 +73,23 @@ public abstract partial record Node
     public sealed record Dock(ImmutableArray<DockChild> Docked, Node Fill) : Node;
 
     /// <summary>A uniform N-column grid; cells fill row-major. Column widths split evenly, rows size to the tallest Auto cell.</summary>
-    public sealed record Grid(int Columns, ImmutableArray<Node> Cells, float RowGap = 0f, float ColumnGap = 0f) : Node;
+    /// <param name="AutoRows">
+    /// When <see langword="false"/> (the default) the grid divides its rect evenly: every row gets an equal
+    /// share of the height, so cells stretch to fill and a row cannot be taller than its neighbours.
+    /// <para>
+    /// When <see langword="true"/> each row instead takes the height its OWN tallest cell needs, and the
+    /// grid's intrinsic height is the sum of those rows. That is what makes cards "push" the rows: adding
+    /// one adds height rather than shrinking every existing row, and an Auto-height grid inside a stack
+    /// reports exactly the height its content needs, so a trailing spacer can absorb the slack. Columns are
+    /// still an even split -- only the cross axis becomes content-driven.
+    /// </para>
+    /// </param>
+    public sealed record Grid(
+        int Columns,
+        ImmutableArray<Node> Cells,
+        float RowGap = 0f,
+        float ColumnGap = 0f,
+        bool AutoRows = false) : Node;
 
     /// <summary>Children flow along <paramref name="Axis"/> and wrap into a new line when the next child
     /// would overflow the available extent -- the flexbox <c>wrap</c> for toolbars / chip rows on narrow

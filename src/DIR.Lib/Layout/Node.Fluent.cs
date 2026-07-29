@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 
 namespace DIR.Lib.Layout;
 
@@ -64,6 +64,12 @@ public abstract partial record Node
     /// <summary>Paint a background across this node's whole arranged rect (under its children).</summary>
     public Node Bg(RGBAColor32 color) => this with { Background = color };
 
+    /// <summary>Round the corners of this node's <see cref="Bg"/> (and a <see cref="Content.Box"/> leaf's
+    /// own fill) by <paramref name="designUnits"/>. Chrome only -- arrange is unchanged, so a rounded node
+    /// occupies exactly the rect a square one would. See <see cref="CornerRadius"/> for how each surface
+    /// approximates it.</summary>
+    public Node Radius(float designUnits) => this with { CornerRadius = designUnits };
+
     /// <summary>Inset this node's children by <paramref name="designUnits"/> of inner padding.</summary>
     public Node Pad(float designUnits) => this with { Padding = designUnits };
 
@@ -91,4 +97,12 @@ public abstract partial record Node
 
     /// <summary>Set the row/column gaps on a <see cref="Grid"/>; no-op on any other node.</summary>
     public Node WithGaps(float rowGap, float columnGap) => this is Grid g ? g with { RowGap = rowGap, ColumnGap = columnGap } : this;
+
+    /// <summary>
+    /// Size a <see cref="Grid"/>'s rows to their own content instead of splitting the height evenly; no-op on
+    /// any other node. Named With* like the gap setters, and because a bare AutoRows would shadow the
+    /// record property it sets. See <see cref="Grid.AutoRows"/> -- this is what makes cells push rows rather than
+    /// every row shrinking as cells are added.
+    /// </summary>
+    public Node WithAutoRows(bool autoRows = true) => this is Grid g ? g with { AutoRows = autoRows } : this;
 }
