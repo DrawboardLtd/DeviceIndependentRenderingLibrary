@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Immutable;
 using System.Numerics;
 using DIR.Lib;
@@ -22,6 +22,18 @@ public class LayoutEngineTests
         public float Scale = 1f;
         public Layout.Size<float> MeasureText(ReadOnlySpan<char> text, float fontSize) => new(text.Length * CharWidth, LineHeight);
         public float ToSurface(float designUnits) => designUnits * Scale;
+    }
+
+    /// <summary>
+    /// A cell surface whose unit is NOT square: a tree authored in pixel-ish design units, mapped onto
+    /// 8x16 cells. This is the case one isotropic scalar cannot express.
+    /// </summary>
+    private sealed class AnisotropicCellCtx : Layout.IMeasureContext<int>
+    {
+        public Layout.Size<int> MeasureText(ReadOnlySpan<char> text, float fontSize) => new(text.Length, 1);
+        public int ToSurface(float designUnits) => (int)MathF.Round(designUnits);
+        public int ToSurfaceX(float designUnits) => (int)MathF.Round(designUnits / 8f);
+        public int ToSurfaceY(float designUnits) => (int)MathF.Round(designUnits / 16f);
     }
 
     private sealed class CellCtx : Layout.IMeasureContext<int>
@@ -262,6 +274,145 @@ public class LayoutEngineTests
         RectOf(arranged, cells[1]).ShouldBe(new Rect<float>(50, 0, 50, 50));
         RectOf(arranged, cells[2]).ShouldBe(new Rect<float>(0, 50, 50, 50));
         RectOf(arranged, cells[3]).ShouldBe(new Rect<float>(50, 50, 50, 50));
+    }
+
+    [Fact]
+    public void Grid_AutoRows_GivesEachRowItsOwnContentHeight()
+    {
+        // Row 0 holds a 30-unit cell, row 1 a 10-unit cell. Evenly split they would both be 50; with
+        // AutoRows each row is exactly as tall as its own tallest cell, and row 1 starts right below row 0
+        // instead of halfway down.
+        var cells = new Layout.Node[]
+        {
+            Layout.Builder.Spacer().HFixed(30f),
+            Layout.Builder.Spacer().HFixed(30f),
+            Layout.Builder.Spacer().HFixed(10f),
+            Layout.Builder.Spacer().HFixed(10f),
+        };
+        var grid = new Layout.Node.Grid(2, [.. cells], AutoRows: true);
+
+        var arranged = Layout.Engine.Arrange(grid, new Rect<float>(0, 0, 100, 100), new PixelCtx());
+
+        RectOf(arranged, cells[0]).ShouldBe(new Rect<float>(0, 0, 50, 30));
+        RectOf(arranged, cells[1]).ShouldBe(new Rect<float>(50, 0, 50, 30));
+        RectOf(arranged, cells[2]).ShouldBe(new Rect<float>(0, 30, 50, 10));
+        RectOf(arranged, cells[3]).ShouldBe(new Rect<float>(50, 30, 50, 10));
+    }
+
+    [Fact]
+    public void Grid_AutoRows_AddingACellAddsHeightRatherThanShrinkingTheOthers()
+    {
+        // The point of the mode: a card pushes a new row instead of every existing row getting shorter.
+        static Layout.Node Cell() => Layout.Builder.Spacer().HFixed(20f);
+
+        var twoCells = new Layout.Node[] { Cell(), Cell() };
+        var threeCells = new Layout.Node[] { Cell(), Cell(), Cell() };
+
+        var oneRow = Layout.Engine.Arrange(
+            new Layout.Node.Grid(2, [.. twoCells], AutoRows: true), new Rect<float>(0, 0, 100, 100), new PixelCtx());
+        var twoRows = Layout.Engine.Arrange(
+            new Layout.Node.Grid(2, [.. threeCells], AutoRows: true), new Rect<float>(0, 0, 100, 100), new PixelCtx());
+
+        RectOf(oneRow, twoCells[0]).Height.ShouldBe(20f);
+        RectOf(twoRows, threeCells[0]).Height.ShouldBe(20f, 0.001f);
+        RectOf(twoRows, threeCells[2]).Y.ShouldBe(20f, 0.001f);
+    }
+
+    [Fact]
+    public void Grid_AutoRows_IntrinsicHeightIsTheSumOfItsRowsSoASpacerCanTakeTheSlack()
+    {
+        // An Auto-height AutoRows grid in a stack must report exactly its content height, or the trailing
+        // spacer has nothing to absorb and the grid silently fills the container.
+        var cells = new Layout.Node[]
+        {
+            Layout.Builder.Spacer().HFixed(20f),
+            Layout.Builder.Spacer().HFixed(20f),
+            Layout.Builder.Spacer().HFixed(20f),
+        };
+        var grid = new Layout.Node.Grid(2, [.. cells], RowGap: 4f, AutoRows: true);
+        var slack = Layout.Builder.Spacer().HStar();
+        var stack = Layout.Builder.VStack(grid, slack);
+
+        var arranged = Layout.Engine.Arrange(stack, new Rect<float>(0, 0, 100, 100), new PixelCtx());
+
+        // Two rows of 20 plus one 4-unit row gap.
+        RectOf(arranged, grid).Height.ShouldBe(44f, 0.001f);
+        RectOf(arranged, slack).Y.ShouldBe(44f, 0.001f);
+        RectOf(arranged, slack).Height.ShouldBe(56f, 0.001f);
+    }
+
+    [Fact]
+    public void Grid_WithoutAutoRows_StillSplitsEvenly()
+    {
+        // The default must be untouched: every existing consumer relies on an even tile.
+        var cells = new Layout.Node[]
+        {
+            Layout.Builder.Spacer().HFixed(30f),
+            Layout.Builder.Spacer().HFixed(10f),
+        };
+        var grid = new Layout.Node.Grid(1, [.. cells]);
+
+        var arranged = Layout.Engine.Arrange(grid, new Rect<float>(0, 0, 100, 100), new PixelCtx());
+
+        RectOf(arranged, cells[0]).Height.ShouldBe(50f);
+        RectOf(arranged, cells[1]).Height.ShouldBe(50f);
+    }
+
+    // --- anisotropic surface units ---
+
+    [Fact]
+    public void AnAnisotropicSurfaceResolvesWidthAndHeightThroughDifferentScales()
+    {
+        // The whole point: one design-unit number means a different count of surface units across than down
+        // when the surface unit is not square. A 250x132 card is 31x8 cells at 8x16, not 250x132 of either.
+        // Nested, because Arrange places the ROOT at the bounds it is given -- a node's own sizing only
+        // resolves against a parent.
+        var card = Layout.Builder.Spacer().WFixed(250f).HFixed(132f);
+        var arranged = Layout.Engine.Arrange(
+            Layout.Builder.VStack(card), new Rect<int>(0, 0, 200, 60), new AnisotropicCellCtx());
+
+        var rect = RectOf(arranged, card);
+        rect.Width.ShouldBe(31);  // 250 / 8
+        rect.Height.ShouldBe(8);  // 132 / 16
+
+        // And the intrinsic measure agrees, since both go through the same per-axis mapping.
+        var measured = Layout.Engine.Measure(card, new Layout.Size<int>(200, 60), new AnisotropicCellCtx());
+        measured.Width.ShouldBe(31);
+        measured.Height.ShouldBe(8);
+    }
+
+    [Fact]
+    public void PaddingAndGapsAlsoResolvePerAxis()
+    {
+        // Padding is a single scalar and a Stack gap runs along one axis only, so both have to pick a scale.
+        // 16 units of padding is 2 cells across and 1 down; a vertical stack's 16-unit gap is 1 row.
+        var first = Layout.Builder.Spacer().HFixed(16f);
+        var second = Layout.Builder.Spacer().HFixed(16f);
+        var stack = Layout.Builder.VStack(first, second).WithGap(16f).Pad(16f);
+
+        var arranged = Layout.Engine.Arrange(stack, new Rect<int>(0, 0, 100, 40), new AnisotropicCellCtx());
+
+        RectOf(arranged, first).X.ShouldBe(2);   // 16 / 8 columns of padding
+        RectOf(arranged, first).Y.ShouldBe(1);   // 16 / 16 rows of padding
+        RectOf(arranged, first).Height.ShouldBe(1);
+        RectOf(arranged, second).Y.ShouldBe(3);  // first row (1) + gap (1) + padding (1)
+    }
+
+    [Fact]
+    public void AnIsotropicContextIsUnaffectedByTheAxisSplit()
+    {
+        // Every existing context implements only ToSurface; the axis-aware pair default to it, so the
+        // resolved geometry has to be exactly what it was before the split.
+        var child = Layout.Builder.Spacer().WFixed(30f).HFixed(20f);
+        var stack = Layout.Builder.VStack(child).Pad(5f);
+
+        var arranged = Layout.Engine.Arrange(stack, new Rect<float>(0, 0, 100, 100), new PixelCtx { Scale = 2f });
+
+        var rect = RectOf(arranged, child);
+        rect.Width.ShouldBe(60f);   // 30 x 2 on both axes
+        rect.Height.ShouldBe(40f);
+        rect.X.ShouldBe(10f);       // 5 x 2 padding, same across and down
+        rect.Y.ShouldBe(10f);
     }
 
     // --- overlay (z-order) ---
@@ -678,5 +829,51 @@ public class LayoutEngineTests
         wrap.Gap.ShouldBe(4f);
         wrap.LineGap.ShouldBe(2f);
         wrap.Children.Length.ShouldBe(2);
+    }
+
+    /// <summary>
+    /// Sizing one axis of a Stack child says nothing about the other, and a <see cref="Layout.Content.Fill"/>
+    /// leaf's intrinsic extent is its declared minimum -- zero by default. So a child given only a WIDTH
+    /// inside an HStack arranges one cell tall at most, paints nothing, and reports no error.
+    /// <para>
+    /// This emptied five TianWen TUI tabs at once (Equipment, Session, Planner, Guider, Live Session): each
+    /// wrote <c>Fill(key).WFixed(n)</c> in an HStack whose own <see cref="Layout.Node.Stretch"/> made the
+    /// STACK full-height, which reads correct right up until you notice the children are not.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void AStackChildSizedOnOneAxisOnlyKeepsItsIntrinsicExtentOnTheOther()
+    {
+        var widthOnly = Layout.Builder.Fill(key: "a").WFixed(24);
+        var column = Layout.Builder.Fill(key: "b").ColW(24);
+        var row = Layout.Builder.HStack(widthOnly, column).Stretch();
+
+        var arranged = Layout.Engine.Arrange(row, new Rect<int>(0, 0, 120, 40), new CellCtx());
+
+        RectOf(arranged, widthOnly).Height.ShouldBe(0, "WFixed leaves the cross axis on Auto");
+        RectOf(arranged, column).Height.ShouldBe(40, "ColW is Width=Fixed + Height=Star");
+
+        // Both are 24 wide, so the difference is invisible in the dimension the author was thinking about.
+        RectOf(arranged, widthOnly).Width.ShouldBe(24);
+        RectOf(arranged, column).Width.ShouldBe(24);
+    }
+
+    /// <summary>
+    /// The same trap exists on the other axis -- and this is why it is so rarely hit there. Everyone reaches
+    /// for <see cref="Layout.Node.RowH"/> in a VStack, which sets the cross axis to Star for them, whereas
+    /// the HStack counterpart <see cref="Layout.Node.ColW"/> is easy not to know about: <c>WFixed</c> reads
+    /// like the obvious way to give a column a width.
+    /// </summary>
+    [Fact]
+    public void RowHIsWhyTheVerticalCaseAlmostNeverBites()
+    {
+        var heightOnly = Layout.Builder.Fill(key: "a").HFixed(1);
+        var fullRow = Layout.Builder.Fill(key: "b").RowH(1);
+        var column = Layout.Builder.VStack(heightOnly, fullRow).Stretch();
+
+        var arranged = Layout.Engine.Arrange(column, new Rect<int>(0, 0, 120, 40), new CellCtx());
+
+        RectOf(arranged, heightOnly).Width.ShouldBe(0, "HFixed leaves the cross axis on Auto");
+        RectOf(arranged, fullRow).Width.ShouldBe(120, "RowH is Width=Star + Height=Fixed");
     }
 }

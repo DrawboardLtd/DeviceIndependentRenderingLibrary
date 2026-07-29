@@ -34,7 +34,24 @@ env:
   #        into the projection. Additive, defaults to Identity (byte-identical until a consumer sets it).
   # 6.18 - SearchInteraction<TResult> base for text-search controls.
   # 6.19 - overflow-scrolling dropdown menus + declarative Layout.Progress bar.
-  VERSION_PREFIX: 6.19.${{ github.run_number }}
+  # 6.20 - Renderer.FillRoundedRectangle as a base-renderer virtual (the default decomposes into
+  #        non-overlapping scanline spans, so a translucent colour cannot double-blend at the
+  #        corners); a zero radius is exactly FillRectangle. BEHAVIOUR CHANGE alongside it:
+  #        RgbaImage.FillRect applied the FIRST pixel's opaque-destination verdict to the whole SIMD
+  #        vector, leaving alpha 192 where the scalar tail correctly wrote 255. Translucent-over-opaque
+  #        now yields 255; RGB is bit-identical. RGBA goldens of that shape need re-recording.
+  # 6.21 - Layout.Node.CornerRadius + the .Radius(designUnits) fluent. Chrome only: arrange never sees
+  #        it, so a rounded node occupies and insets exactly the rect a square one would.
+  # 6.22 - grid rows can size to their own content; text resolves emoji runs to the emoji font per run.
+  # 7.0 - BREAKING: DeviceTransform is now ContentTransform (the type and the Renderer property), and
+  #       design units resolve PER AXIS, so a surface unit need not be square.
+  # 7.1 - the debug inspector's surface-agnostic half is hoisted here (Diagnostics/DebugInspectorCore),
+  #       so a host keeps only its surface verbs instead of a private transport too.
+  # 7.2 - the inspector answers discovery, and says what kind of surface it is (SurfaceKind).
+  # 7.3 - the inspector core can express a FRAME-SPANNING command: IDebugInspectorOperation (Exclusive /
+  #       Timeout / Advance) + IDebugInspectorSteppedHost, so `batch` and `wait` become core verbs and a
+  #       host with frame-spanning verbs no longer needs to keep a private scheduler.
+  VERSION_PREFIX: 7.3.${{ github.run_number }}
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
