@@ -51,7 +51,14 @@ env:
   # 7.3 - the inspector core can express a FRAME-SPANNING command: IDebugInspectorOperation (Exclusive /
   #       Timeout / Advance) + IDebugInspectorSteppedHost, so `batch` and `wait` become core verbs and a
   #       host with frame-spanning verbs no longer needs to keep a private scheduler.
-  VERSION_PREFIX: 7.3.${{ github.run_number }}
+  # 7.4 - a CELL-authored tree arranges on a pixel surface: PixelMeasureContext gains per-axis scales plus a
+  #       CellAuthored factory, the mirror of Console.Lib's CellMeasureContext.PixelAuthored, so a tree
+  #       authored in either unit convention arranges on either surface. fontSize rides the VERTICAL scale,
+  #       because an em is a height. Alongside it, PixelWidgetBase's Arrange/Paint/RenderLayout gain overloads
+  #       taking the CONTEXT itself, so the painter reads FontPath/FontScale/radius from the same object the
+  #       measure pass used instead of a hand-threaded scalar. The scalar overloads delegate to the context
+  #       ones with an isotropic context, so existing callers paint byte-identically. ADDITIVE.
+  VERSION_PREFIX: 7.4.${{ github.run_number }}
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
