@@ -58,7 +58,17 @@ env:
   #       taking the CONTEXT itself, so the painter reads FontPath/FontScale/radius from the same object the
   #       measure pass used instead of a hand-threaded scalar. The scalar overloads delegate to the context
   #       ones with an isotropic context, so existing callers paint byte-identically. ADDITIVE.
-  VERSION_PREFIX: 7.4.${{ github.run_number }}
+  # 7.5 - fonts are found by the family they declare, and every face of a collection is reachable.
+  #       FontResolver indexes each installed face's own 'name' table (SharpAstro.Fonts 1.7), so a face whose
+  #       file name isn't its family resolves (Segoe UI Symbol lives in seguisym.ttf) and so does one with no
+  #       file name at all (anything past face 0 of a .ttc). FontFaceId is the id those return — a plain path
+  #       for a single-face font, path#index for a collection — honoured by ManagedFontRasterizer and the
+  #       fallback resolver. FontFallbackResolver gains TryResolveFont/CanRender (it could not previously
+  #       report "nothing covers this"), role-based construction (FromRoles: primary/symbol/emoji/scripts),
+  #       and an allocation-free span run split. PixelWidgetBase.FontFallback + PixelMeasureContext.Fallback
+  #       carry it into the declarative layout, so a text leaf splits per run instead of drawing whole in one
+  #       font. FIX: the all-ASCII shortcut is now gated on the primary actually covering ASCII. ADDITIVE.
+  VERSION_PREFIX: 7.5.${{ github.run_number }}
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
