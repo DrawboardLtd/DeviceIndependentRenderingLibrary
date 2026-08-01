@@ -1,0 +1,23 @@
+<Project>
+
+  <!-- Chains to the consumer's props rather than shadowing it. Neither this repo nor its sibling
+       fork used to define one, so as nested submodules their projects inherited the VIEWER's
+       Directory.Build.props; MSBuild stops at the first file it finds walking up, so a plain
+       <Project> here would silently cut that inheritance and change settings only when built
+       through the consumer. GetPathOfFileAbove finds the parent when nested, returns empty
+       standalone. Captured into a property first because nested quotes inside a Condition
+       attribute do not parse (MSB4092). -->
+  <PropertyGroup>
+    <ParentBuildProps>$([MSBuild]::GetPathOfFileAbove('Directory.Build.props', '$(MSBuildThisFileDirectory)../'))</ParentBuildProps>
+  </PropertyGroup>
+  <Import Project="$(ParentBuildProps)" Condition="Exists('$(ParentBuildProps)')" />
+
+  <PropertyGroup>
+    <!-- THE version for every package in this repo. CI stamps one -p:Version across all of them, so
+         a per-csproj prefix only ever served local builds and drifted unnoticed: DIR.Lib.Shaping sat at 6.8.0 while DIR.Lib was 7.5.0,
+         which would have shipped a feature as a patch. Keep in step with VERSION_PREFIX in
+         .github/workflows/dotnet.yml. Conditional so CI's -p:Version wins. -->
+    <VersionPrefix Condition="'$(VersionPrefix)' == ''">7.6.0</VersionPrefix>
+  </PropertyGroup>
+
+</Project>
