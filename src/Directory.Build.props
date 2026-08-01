@@ -13,11 +13,20 @@
   <Import Project="$(ParentBuildProps)" Condition="Exists('$(ParentBuildProps)')" />
 
   <PropertyGroup>
-    <!-- THE version for every package in this repo. CI stamps one -p:Version across all of them, so
-         a per-csproj prefix only ever served local builds and drifted unnoticed: DIR.Lib.Shaping sat at 6.8.0 while DIR.Lib was 7.5.0,
-         which would have shipped a feature as a patch. Keep in step with VERSION_PREFIX in
-         .github/workflows/dotnet.yml. Conditional so CI's -p:Version wins. -->
-    <VersionPrefix Condition="'$(VersionPrefix)' == ''">7.6.0</VersionPrefix>
+    <!-- THE version for every package in this repo, and the only place it is written. CI stamps one
+         -p:Version across all of them, so a per-csproj prefix only ever served local builds and
+         drifted unnoticed: DIR.Lib.Shaping sat at 6.8.0 while DIR.Lib was 7.5.0, which would have
+         shipped a feature as a patch.
+         The workflow READS this back (dotnet msbuild -getProperty:VersionMajorMinor) rather than
+         restating it, so a release bump is this one line and CI cannot disagree with the packages it
+         builds. Add the matching changelog entry above VERSION_PREFIX's resolve step in
+         .github/workflows/dotnet.yml — that comment block is the chain's de-facto release notes, and
+         it stays in the yml because several entries contain a double hyphen, which XML forbids inside
+         a comment. -->
+    <VersionMajorMinor>7.6</VersionMajorMinor>
+    <!-- Local builds get Major.Minor.0; CI passes -p:Version=Major.Minor.<run><attempt>+<sha>, and the
+         condition lets it win. -->
+    <VersionPrefix Condition="'$(VersionPrefix)' == ''">$(VersionMajorMinor).0</VersionPrefix>
   </PropertyGroup>
 
 </Project>
