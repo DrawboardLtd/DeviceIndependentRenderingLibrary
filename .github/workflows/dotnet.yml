@@ -68,7 +68,15 @@ env:
   #       and an allocation-free span run split. PixelWidgetBase.FontFallback + PixelMeasureContext.Fallback
   #       carry it into the declarative layout, so a text leaf splits per run instead of drawing whole in one
   #       font. FIX: the all-ASCII shortcut is now gated on the primary actually covering ASCII. ADDITIVE.
-  VERSION_PREFIX: 7.5.${{ github.run_number }}
+  # 7.6 - the SDF atlas core and its GPU backend can no longer drift apart. Core pages and backend pages are
+  #       correlated by index alone, and AllocateNewPage appended to the core list BEFORE the backend was
+  #       asked to allocate — so a backend that failed mid-hook (descriptor pool or device memory exhausted)
+  #       left the core permanently one page longer, mis-addressing every later page. The core append now
+  #       rolls back when the hook throws, restoring the append cursor and counters. FIX: Dispose no longer
+  #       propagates a backend teardown failure — it runs on the GPU-error recovery path, where throwing
+  #       replaced the error that started the recovery with a bare IndexOutOfRange and killed the process
+  #       with the remaining pages still allocated. ADDITIVE.
+  VERSION_PREFIX: 7.6.${{ github.run_number }}
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
