@@ -348,8 +348,9 @@ public sealed class SdfFontAtlasTests : IDisposable
         var pages = atlas.PageCount;
 
         // Dispose runs on the GPU-error recovery path. Throwing out of it replaces the error that
-        // started the recovery and kills the process mid-teardown — viewer issue #121, where an
-        // ArgumentOutOfRangeException from this loop was the whole of the reported stack.
+        // started the recovery and kills the process mid-teardown. Observed downstream as an
+        // ArgumentOutOfRangeException from this loop being the whole of the reported stack, with
+        // the actual device error nowhere in it.
         Should.NotThrow(() => atlas.Dispose());
 
         // Page 0 is the one that threw; every other page must still have been handed back.
