@@ -71,6 +71,7 @@ Layout.Builder.HStack(
   SDF quad), a cell painter via arc corners `╭ ╮ ╰ ╯`, since a character grid cannot round by fractions of a
   cell. A radius of `0` takes the plain `FillRectangle` path, so untouched trees paint byte-identically.
 - **Consumer convention** — alias `using Layout = DIR.Lib.Layout;` (a `global using`, or a csproj `<Using Include="DIR.Lib.Layout" Alias="Layout" />`) and write the qualified `Layout.Node` / `Layout.Builder`. Do **not** `using DIR.Lib.Layout;` directly — it drops the collision-prone barewords (`Node`, `Content`, `Size<T>`) into scope. (A plain `using DIR.Lib;` does not surface the nested `Layout` namespace; a using-directive imports types, not nested namespaces.) A consumer that already owns a `Layout` type must rename it.
+
 ## Text Input
 
 - **`TextInputState`** — single-line text input state machine with cursor, selection, undo
@@ -81,6 +82,13 @@ Layout.Builder.HStack(
 
 - **`SignalBus`** — thread-safe typed event bus. `Post<T>()` is thread-safe, `ProcessPending()` runs on the render thread.
 - Built-in signals: `ActivateTextInputSignal`, `DeactivateTextInputSignal`, `RequestExitSignal`, `RequestRedrawSignal`
+- **`SignalDirectory` (source-generated)** — the package ships a Roslyn source generator that emits
+  `SignalDirectory.BuildFactories(SignalBus bus, …overrides)`, a `name → Action<JsonElement>` map over **every
+  `*Signal` type in the consuming assembly**, with **no runtime reflection**. Each factory constructs its
+  signal from a JSON payload via the reflection-free `SignalJson` scalar binders (camelCase key = parameter
+  name; missing field → the parameter's declared default) and posts it to the bus. Lets a live UI inspector
+  / test harness list and post any bus signal by name. Gated on the `DEBUG` symbol (nothing generated in
+  Release) and on `SignalBus` being referenced; signals with a required non-scalar parameter are skipped.
 - **`BackgroundTaskTracker`** — collects background tasks, checks completions per frame, logs errors via `ILogger`. Call `ProcessCompletions()` each frame, `DrainAsync()` at shutdown.
 
 ## Math Layout (`DIR.Lib.MathLayout`)
