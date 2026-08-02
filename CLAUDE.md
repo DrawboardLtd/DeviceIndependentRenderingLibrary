@@ -11,8 +11,8 @@ When syncing from upstream: copy code changes but skip nuget publish CI jobs, an
 ## Build & Test Commands
 
 ```bash
-# Build
-dotnet build src/DIR.Lib.sln
+# Build (the solution lives at the repo root, not under src/)
+dotnet build DIR.Lib.sln
 
 # Run all tests
 dotnet test src/DIR.Lib.Tests
