@@ -81,6 +81,16 @@ env:
   #       propagates a backend teardown failure — it runs on the GPU-error recovery path, where throwing
   #       replaced the error that started the recovery with a bare IndexOutOfRange and killed the process
   #       with the remaining pages still allocated. ADDITIVE.
+  # 7.9 - a PDF font's own /Encoding now decides which glyph a char code selects. The registered
+  #       encoding map (base encoding + /Differences) was consulted for Type1 fonts only; every other
+  #       embedded font went straight to cmap/char-code strategies, so a name-keyed CFF with no cmap
+  #       and no built-in encoding bottomed out at charCode-as-GID and drew an unrelated glyph.
+  #       ResolveGlyphIdentity and the three charCode-taking rasterize entry points now try the
+  #       encoding's named glyph first, via SharpAstro.Fonts 1.8's GetGlyphIdByName. TrueType faces
+  #       return 0 from the name route and fall through unchanged; an unknown name falls through
+  #       rather than blanking the glyph. RegisterType1Encoding is renamed RegisterPdfEncoding (the
+  #       map applies to any embedded simple font) with the old name kept as an [Obsolete] forwarder.
+  #       Requires SharpAstro.Fonts 1.8. ADDITIVE.
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
