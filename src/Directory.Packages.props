@@ -18,12 +18,17 @@
          PNGs via SharpAstro.Png instead of the stb_image port, so pulling it drops
          the transitive SharpAstro.StbImage dependency from downstream consumers.
          1.7 adds FontFaceReader and OpenTypeFont.Name/.Os2, which the declared-family
-         resolver and the symbol-role fallback both read. -->
-    <PackageVersion Include="SharpAstro.Fonts" Version="1.9.*" />
+         resolver and the symbol-role fallback both read.
+         1.10 fixes three compounding TrueType hint-interpreter defects and RTL mark
+         attachment. 1.11 makes an embedded subset whose only cmap is Mac Roman (1,0)
+         select through it rather than guessing the char code is the glyph id — what
+         macOS Quartz emits, and what rendered Korean body text as wrong glyphs while
+         dropping commas, list markers and page numbers entirely. -->
+    <PackageVersion Include="SharpAstro.Fonts" Version="1.11.*" />
     <!-- The pure-managed shaping engine, consumed by the DIR.Lib.Shaping satellite (the
          ITextShaper adapter). Same Fonts.Lib CI cadence as SharpAstro.Fonts — one
          -p:Version covers the whole repo, so the two always ship the same number. -->
-    <PackageVersion Include="SharpAstro.Fonts.Shaping" Version="1.9.*" />
+    <PackageVersion Include="SharpAstro.Fonts.Shaping" Version="1.11.*" />
     <!-- LALR.CC drives the markdown + LaTeX grammars baked into the
          DIR.Lib.Markdown subsystem. Source generator runs build-time;
          the runtime LALR.CC assembly is referenced for the Parser /

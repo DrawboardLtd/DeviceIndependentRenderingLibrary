@@ -125,6 +125,18 @@ env:
   #        and has to read as recessed into it with focus lifting it halfway back; and the caret
   #        takes the accent rather than the text colour, since on a palette with one hue to spend a
   #        caret in the text colour is invisible against the text beside it.
+  # 7.13 - No API change: rebuild against SharpAstro.Fonts / .Shaping 1.11, skipping the 1.10 pin
+  #        the repo never took. Glyph RENDERING moves, in three places, all wrong-to-right.
+  #        1.11: an embedded PDF subset whose only cmap subtable is Mac Roman (1,0) now selects
+  #        through it instead of falling back to using the char code as a glyph index. That shape
+  #        is what macOS Quartz writes, and the guess failed two ways at once — inside a large
+  #        subset it picked an unrelated glyph, so Korean body text rendered as correctly-shaped
+  #        nonsense in codepoint-sorted order, while a 2-20 glyph Latin subset indexed off the end
+  #        and rendered nothing, dropping commas, list markers and page numbers.
+  #        1.10: three compounding TrueType hint-interpreter defects (a twilight zone that reported
+  #        zero points forever, an ALIGNRP guard that returned without popping its operands, and
+  #        'cvt ' read unsigned when FWORD is signed), plus GPOS mark attachment propagating the
+  #        RTL way in RTL runs. Hinted TrueType faces and Arabic with marks both change.
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
