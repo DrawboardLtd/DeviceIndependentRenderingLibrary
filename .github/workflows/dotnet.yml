@@ -137,6 +137,22 @@ env:
   #        zero points forever, an ALIGNRP guard that returned without popping its operands, and
   #        'cvt ' read unsigned when FWORD is signed), plus GPOS mark attachment propagating the
   #        RTL way in RTL runs. Hinted TrueType faces and Arabic with marks both change.
+  # 7.14 - A glyph the SDF atlas can never rasterize is given up on after three attempts and recorded
+  #        blank, instead of being retried forever. A failed rasterization released its in-flight claim
+  #        so a later frame could retry, which is right for the one failure that heals itself: an
+  #        embedded "mem:" subset font losing the race with its own registration. But nothing counted
+  #        the attempts, and the caller re-offers the whole visible glyph set every frame, so a glyph
+  #        that could NEVER rasterize was re-claimed indefinitely and _rasterizeInFlight never emptied
+  #        -- which pins IsDirty true. Any permanent font failure therefore presented as "the render
+  #        never settles", with nothing on screen or in the log naming a font: in the PDF viewer it
+  #        arrived as an offscreen golden-image diff and cost a day in the render pipeline. Past the
+  #        bound the glyph draws as nothing, the atlas reports clean, and one line per FONT (not per
+  #        glyph -- a font that never registers fails hundreds) names the glyph, the attempt count, and
+  #        whether the font is registered by the time we gave up. Counters reset on evict-all, so a
+  #        font registered later still gets a fresh bound. Also adds
+  #        ManagedFontRasterizer.IsFontRegistered, the predicate every rasterize entry point already
+  #        failed on implicitly -- a background caller can state it in its own diagnostics rather than
+  #        quote a stale exception message. Synced from upstream DIR.Lib 7.13.
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
