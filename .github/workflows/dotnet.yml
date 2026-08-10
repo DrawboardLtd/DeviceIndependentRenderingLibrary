@@ -125,6 +125,16 @@ env:
   #        and has to read as recessed into it with focus lifting it halfway back; and the caret
   #        takes the accent rather than the text colour, since on a palette with one hue to spend a
   #        caret in the text colour is invisible against the text beside it.
+  #        ALSO IN 7.12, and missing from these notes until 7.15 was written -- a BEHAVIOUR CHANGE
+  #        that shipped unannounced, recorded here late rather than left unrecorded: a whitespace
+  #        codepoint's advance now comes from the font's own hmtx table instead of being borrowed
+  #        from the 'n' glyph. An ink-free outline threw its advance away, and measurement fell back
+  #        to 'n'. In DejaVu Sans a space is 651/2048 em and 'n' is 1303/2048, so every measured
+  #        space was 1.99x too wide. Any layout whose width depends on spaces therefore MOVES on
+  #        7.12: narrower, by nearly half a space per space. Specifically, a column padded with
+  #        spaces that lined up only because a space measured like a digit stops lining up, and the
+  #        fix downstream is to pad with U+2007 FIGURE SPACE, which a font defines to advance like a
+  #        digit, rather than to widen a tolerance around a premise that was never true.
   # 7.13 - No API change: rebuild against SharpAstro.Fonts / .Shaping 1.11, skipping the 1.10 pin
   #        the repo never took. Glyph RENDERING moves, in three places, all wrong-to-right.
   #        1.11: an embedded PDF subset whose only cmap subtable is Mac Roman (1,0) now selects
@@ -153,6 +163,32 @@ env:
   #        ManagedFontRasterizer.IsFontRegistered, the predicate every rasterize entry point already
   #        failed on implicitly -- a background caller can state it in its own diagnostics rather than
   #        quote a stale exception message. Synced from upstream DIR.Lib 7.13.
+  # 7.15 - BEHAVIOUR CHANGE, and a fix no consumer could work around. TextFit.ShrinkToWidth returned a
+  #        size it had never measured, so a run fitted with TextTrim.Shrink could be drawn PAST the rect
+  #        it was just fitted to. It refined by ratio -- size *= maxWidth / measured, up to four passes
+  #        -- then returned the last estimate unverified, on the premise its own remarks stated out
+  #        loud: "advance widths scale linearly with the size, so one division lands on the answer".
+  #        They scale linearly in the IDEAL advance. A rasterizer quantizes the size to whole pixels
+  #        before measuring, so measured width is a STEP function of the requested size and every
+  #        estimate inside one step measures identically. The ratio then reapplies the same factor
+  #        every pass and converges to a fixed point still ABOVE the budget. Now, once the ratio stops
+  #        making progress the search steps down WHOLE sizes -- the grid the rasterizer actually has,
+  #        so each step is the next distinct width available rather than another estimate inside the
+  #        same one -- and returns the first size MEASURED to fit, which is now a guarantee the remarks
+  #        can state. minFontSize stays the only value allowed to overflow: a run that cannot fit even
+  #        at the floor should overflow where a reader can see it rather than shrink away to nothing.
+  #        The fast path (it already fits) is untouched, so the common case does not pay for this.
+  #        What MOVES, and for whom: a run fitted with Shrink that used to sit a fraction of a pixel
+  #        over its rect now takes the next whole size down, so a golden image containing shrunk text
+  #        differs by one size step. TextTrim.Shrink is OPT-IN and the default is End, so a consumer
+  #        that never asks for it renders byte-identically -- which is why this is a minor and not a
+  #        major. The PDF viewer is such a consumer: it names neither ShrinkToWidth nor TextTrim.Shrink
+  #        anywhere, so nothing it draws moves.
+  #        Also makes the tests able to see this class of bug at all. The stub renderer they measured
+  #        with was CONTINUOUS (length * fontSize * 0.5), so no plateau existed and the bug was
+  #        unreachable by construction; a quantizing oracle now sweeps budgets and asserts the
+  #        INVARIANT -- what comes back fits -- instead of one arithmetic answer.
+  #        Synced from upstream DIR.Lib 7.14.
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
