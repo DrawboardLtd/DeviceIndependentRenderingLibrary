@@ -189,6 +189,14 @@ env:
   #        unreachable by construction; a quantizing oracle now sweeps budgets and asserts the
   #        INVARIANT -- what comes back fits -- instead of one arithmetic answer.
   #        Synced from upstream DIR.Lib 7.14.
+  # 7.16 - Additive, synced from upstream DIR.Lib 7.15. TabBar can draw a "+" after the last tab, the
+  #        way a terminal or a browser does: ShowNewTabButton, NewTabActive, NewTabHovered, and
+  #        HitNewTabButton to report the click. A consumer that sets nothing is unchanged. It belongs in
+  #        the bar because the bar owns the tab widths and published no edge to place the button against,
+  #        so a host had to either duplicate that arithmetic or park the button at the strip's far end,
+  #        where it reads as a toolbar rather than as the next slot. HandleMouseDown returns null over
+  #        the button rather than inventing a tab index, so a host that forgets HitNewTabButton swallows
+  #        the click instead of activating tab 0. The viewer's dashboard is the first consumer.
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
