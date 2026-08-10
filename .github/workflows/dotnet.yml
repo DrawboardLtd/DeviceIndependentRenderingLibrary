@@ -197,6 +197,16 @@ env:
   #        where it reads as a toolbar rather than as the next slot. HandleMouseDown returns null over
   #        the button rather than inventing a tab index, so a host that forgets HitNewTabButton swallows
   #        the click instead of activating tab 0. The viewer's dashboard is the first consumer.
+  # 7.17 - Additive, synced from upstream DIR.Lib 7.16. TabBar.Pointer hands the bar the mouse position
+  #        and it hovers itself from there: the tab under the pointer takes the active plate and label,
+  #        and the close mark inside that tab gets a plate of its own. NewTabHovered still works and now
+  #        ORs with it; a consumer that leaves Pointer null renders exactly as before. A position rather
+  #        than a hovered index, because the bar owns the tab widths, so a host supplying an index would
+  #        be hit-testing the PREVIOUS frame's geometry, which lags on the frame a tab opens, closes or
+  #        is dragged past a still pointer. Hover reuses ActiveBackground rather than adding a palette
+  #        role: it previews what clicking gives you, UiPalette names no hover surface, and blending one
+  #        would paint a colour the theme never chose. The close plate is Separator, the one role that
+  #        reads against both the panel and the header surface.
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
