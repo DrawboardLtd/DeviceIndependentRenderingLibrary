@@ -8,6 +8,8 @@ This repo is a **private fork** of an upstream repo of the same name (`DIR.Lib`)
 
 When syncing from upstream: copy code changes but skip nuget publish CI jobs, and do not overwrite LICENSE, README title, or `RepositoryUrl` in `DIR.Lib.csproj`.
 
+**`git fetch sharpastro` before you measure, and again before you push.** The histories are disjoint, so ancestry counts and `git cherry` both lie here — measure with a content diff (`git diff origin/main sharpastro/main --stat` plus a `git ls-tree` file-set comparison), against a just-fetched remote. A fetch from the start of the session is already stale, and porting something upstream landed meanwhile yields a PR that conflicts while adding nothing.
+
 Also drop upstream's `WebGl.Renderer` README material — the platform-bridges bullet and the "browser (WebGL2 / Blazor WebAssembly)" surface in the intro. That package is not forked here and nothing in this repo hosts a browser surface (`DebugInspectorCore` reserves the `"webgl"` surface name for one, should it ever exist), so documenting it would describe reach the fork does not ship, and the bullet points at an external consuming app. Everything else from upstream's README is fair game — the `SignalDirectory` section, for instance, documents `src/DIR.Lib.SourceGenerators`, which the fork does ship.
 
 ## Build & Test Commands
