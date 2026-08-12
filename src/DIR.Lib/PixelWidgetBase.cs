@@ -179,6 +179,272 @@ namespace DIR.Lib
         // -------------------------------------------------------------------------------------------------
 
         /// <summary>
+        /// Draws a <see cref="Layout.IconKind"/> into <paramref name="rect"/> out of rectangles, which is the
+        /// whole point of naming an icon rather than spelling it: nothing has to carry the codepoint, so a
+        /// machine missing a symbol face cannot turn the icon into a .notdef box. Sized off the rect's short
+        /// side, so it scales with whatever the engine arranged and takes no DPI argument.
+        /// <para>
+        /// <b>Every kind inks the FULL square it is given</b>, so a row of different marks at one declared
+        /// size comes out one height. That is not free -- each drawing is tuned to reach its bounding box --
+        /// and it is the property that makes the set usable as a family: before it, the same declared size
+        /// produced ink spanning 63% (a half-disc) to 100% (the grid) of it, a 1.6x spread that no amount of
+        /// centring can hide. A new kind owes the same, and the LayoutIconTests measure it.
+        /// <para>
+        /// A kind with no drawing here paints nothing rather than throwing -- a blank button is visible on
+        /// the first frame, which is the right way for a forgotten kind to announce itself.
+        /// </para>
+        /// </summary>
+        protected void DrawLayoutIcon(Layout.IconKind kind, RectF32 rect, RGBAColor32 ink)
+        {
+            var side = MathF.Min(rect.Width, rect.Height);
+            if (side <= 0f)
+            {
+                return;
+            }
+
+            // 5.4 units across the icon: two 2.2-unit cells plus the 1-unit gutter between them. The bars
+            // below reuse the same unit, so the two icons read as one family at any size.
+            var unit = MathF.Max(1f, side / 5.4f);
+
+            switch (kind)
+            {
+                case Layout.IconKind.Grid:
+                    var cell = unit * 2.2f;
+                    var quad = cell * 2f + unit;
+                    var ox = rect.X + (rect.Width - quad) / 2f;
+                    var oy = rect.Y + (rect.Height - quad) / 2f;
+                    for (var r = 0; r < 2; r++)
+                    {
+                        for (var c = 0; c < 2; c++)
+                        {
+                            FillRect(ox + c * (cell + unit), oy + r * (cell + unit), cell, cell, ink);
+                        }
+                    }
+
+                    break;
+
+                case Layout.IconKind.Auto:
+                    // Four corner brackets from rectangles, then the A from three strokes. Constructed
+                    // rather than spelled for the same reason as the others -- but note the A itself would
+                    // have been safe as text, since the .notdef risk is about symbol faces and this is ASCII.
+                    var arm = unit * 1.6f;
+                    // Weighted to match the theme marks, which are filled shapes and so read heavier at the
+                    // same nominal size. A hairline bracket beside a solid crescent makes the six look like
+                    // two families sharing a header rather than one set.
+                    var pen = MathF.Max(1.2f, unit * 0.58f);
+                    // Flush to the edges: Size is the mark's BOUNDING BOX, so the brackets reach it.
+                    const float inset = 0f;
+                    var l = rect.X + inset;
+                    var t = rect.Y + inset;
+                    var r2 = rect.X + rect.Width - inset;
+                    var b = rect.Y + rect.Height - inset;
+                    foreach (var (cx, cy, sx, sy) in new[]
+                    {
+                        (l, t, 1f, 1f), (r2, t, -1f, 1f), (l, b, 1f, -1f), (r2, b, -1f, -1f),
+                    })
+                    {
+                        // Each corner is one horizontal arm and one vertical arm, mirrored by (sx, sy).
+                        FillRect(sx > 0 ? cx : cx - arm, sy > 0 ? cy : cy - pen, arm, pen, ink);
+                        FillRect(sx > 0 ? cx : cx - pen, sy > 0 ? cy : cy - arm, pen, arm, ink);
+                    }
+
+                    var aw = unit * 1.9f;
+                    var ah = unit * 2.4f;
+                    var acx = rect.X + rect.Width / 2f;
+                    var acy = rect.Y + rect.Height / 2f;
+                    var stroke = (int)MathF.Round(MathF.Max(1f, unit * 0.58f));
+                    DrawLine(acx - aw / 2f, acy + ah / 2f, acx, acy - ah / 2f, ink, stroke);
+                    DrawLine(acx + aw / 2f, acy + ah / 2f, acx, acy - ah / 2f, ink, stroke);
+                    DrawLine(acx - aw * 0.3f, acy + ah * 0.16f, acx + aw * 0.3f, acy + ah * 0.16f, ink, stroke);
+                    break;
+
+                case Layout.IconKind.List:
+                    var barW = unit * 5.2f;
+                    // Three bars and two gaps span the full side, keeping the old 0.6-to-1 bar:gap ratio:
+                    // 3(0.6g) + 2g = 3.8g = side.
+                    var listGap = side / 3.8f;
+                    var barH = MathF.Max(1.5f, listGap * 0.6f);
+                    var bars = barH * 3f + listGap * 2f;
+                    var bx = rect.X + (rect.Width - barW) / 2f;
+                    var by = rect.Y + (rect.Height - bars) / 2f;
+                    for (var i = 0; i < 3; i++)
+                    {
+                        FillRect(bx, by + i * (barH + listGap), barW, barH, ink);
+                    }
+
+                    break;
+
+                case Layout.IconKind.ThemeLight:
+                    // A disc with eight rays. The GAP between disc and rays is what makes this a sun rather
+                    // than a fuzzy dot, so it is a proportion with a floor rather than a proportion alone: at
+                    // 13 px a flat fraction left under 2 px of gap and the rays closed on the disc.
+                    var sunR = side * 0.17f;
+                    DiscSpans(rect, sunR, ink);
+                    var rayPen = (int)MathF.Max(1f, side * 0.075f);
+                    var rayInner = sunR + MathF.Max(1.5f, side * 0.085f);
+                    // A stroke is centred on its endpoint, so stopping half a pen short puts its outer edge
+                    // exactly on the bounding box.
+                    var rayOuter = (side - rayPen) / 2f;
+                    var scx = rect.X + rect.Width / 2f;
+                    var scy = rect.Y + rect.Height / 2f;
+                    for (var i = 0; i < 8; i++)
+                    {
+                        var (sin, cos) = MathF.SinCos(i * MathF.PI / 4f);
+                        DrawLine(scx + cos * rayInner, scy + sin * rayInner,
+                            scx + cos * rayOuter, scy + sin * rayOuter, ink, rayPen);
+                    }
+
+                    break;
+
+                case Layout.IconKind.ThemeDark:
+                    // A crescent: the outer disc MINUS an offset one. Built from the spans the subtraction
+                    // leaves rather than by over-painting the offset disc in the button's background, which is
+                    // how a renderer with no path subtraction usually fakes it. That trick needs to know the
+                    // ground, so it breaks over a gradient, an image, or a transparent node -- and this
+                    // painter is handed ink and a rect, nothing else. Scanline spans need no ground at all.
+                    CrescentSpans(rect, side * 0.5f, side * 0.44f, ink);
+                    break;
+
+                case Layout.IconKind.ThemeSystem:
+                    // Half filled, half outlined: the conventional "follow the system" / contrast mark. The
+                    // outlined half is what makes it read as a divided disc rather than as a half-moon, which
+                    // is the distinction that matters when ThemeDark sits next to it.
+                    var sysR = side * 0.5f;
+                    DiscSpans(rect, sysR, ink, leftHalfOnly: true);
+                    RingSpans(rect, sysR, MathF.Max(1f, side * 0.075f), ink, rightHalfOnly: true);
+                    break;
+            }
+        }
+
+        /// <summary>
+        /// Fills a disc as horizontal spans, one per device row, so a curve costs no path support and no
+        /// per-pixel plotting. <paramref name="leftHalfOnly"/> keeps the spans left of centre.
+        /// </summary>
+        private void DiscSpans(RectF32 rect, float r, RGBAColor32 ink, bool leftHalfOnly = false)
+        {
+            var cx = rect.X + rect.Width / 2f;
+            var cy = rect.Y + rect.Height / 2f;
+            var rows = (int)MathF.Ceiling(r * 2f);
+            for (var i = 0; i < rows; i++)
+            {
+                var y = cy - r + i;
+                var dy = y + 0.5f - cy;
+                var half = r * r - dy * dy;
+                if (half <= 0f)
+                {
+                    continue;
+                }
+
+                half = MathF.Sqrt(half);
+                var x0 = cx - half;
+                var x1 = leftHalfOnly ? cx : cx + half;
+                if (x1 > x0)
+                {
+                    FillRect(x0, y, x1 - x0, 1f, ink);
+                }
+            }
+        }
+
+        /// <summary>Outlines a disc as spans: the same scan, keeping only <paramref name="pen"/> at each end.</summary>
+        private void RingSpans(RectF32 rect, float r, float pen, RGBAColor32 ink, bool rightHalfOnly = false)
+        {
+            var cx = rect.X + rect.Width / 2f;
+            var cy = rect.Y + rect.Height / 2f;
+            var rows = (int)MathF.Ceiling(r * 2f);
+            for (var i = 0; i < rows; i++)
+            {
+                var y = cy - r + i;
+                var dy = y + 0.5f - cy;
+                var outer = r * r - dy * dy;
+                if (outer <= 0f)
+                {
+                    continue;
+                }
+
+                outer = MathF.Sqrt(outer);
+                var inner = (r - pen) * (r - pen) - dy * dy;
+                if (inner <= 0f)
+                {
+                    // Past the ring's shoulders the row is solid, which is what closes the top and bottom.
+                    var x0 = rightHalfOnly ? cx : cx - outer;
+                    if (cx + outer > x0)
+                    {
+                        FillRect(x0, y, cx + outer - x0, 1f, ink);
+                    }
+
+                    continue;
+                }
+
+                inner = MathF.Sqrt(inner);
+                if (!rightHalfOnly)
+                {
+                    FillRect(cx - outer, y, outer - inner, 1f, ink);
+                }
+
+                FillRect(cx + inner, y, outer - inner, 1f, ink);
+            }
+        }
+
+        /// <summary>
+        /// Fills the crescent left by subtracting a disc of <paramref name="biteR"/>, offset up and to the
+        /// right, from one of <paramref name="r"/> -- as the spans of the outer disc that the inner one does
+        /// not cover.
+        /// </summary>
+        private void CrescentSpans(RectF32 rect, float r, float biteR, RGBAColor32 ink)
+        {
+            var cx = rect.X + rect.Width / 2f;
+            var cy = rect.Y + rect.Height / 2f;
+            // Offset toward the upper right, so the crescent opens that way and its horns point down-left --
+            // the orientation nearly every "dark mode" mark uses.
+            var bx = cx + r * 0.52f;
+            var by = cy - r * 0.34f;
+
+            var rows = (int)MathF.Ceiling(r * 2f);
+            for (var i = 0; i < rows; i++)
+            {
+                var y = cy - r + i;
+                var dy = y + 0.5f - cy;
+                var outer = r * r - dy * dy;
+                if (outer <= 0f)
+                {
+                    continue;
+                }
+
+                outer = MathF.Sqrt(outer);
+                float x0 = cx - outer, x1 = cx + outer;
+
+                var bdy = y + 0.5f - by;
+                var bite = biteR * biteR - bdy * bdy;
+                if (bite > 0f)
+                {
+                    bite = MathF.Sqrt(bite);
+                    float b0 = bx - bite, b1 = bx + bite;
+
+                    // The bite covers this row's right end (it is offset right), so the visible part is
+                    // whatever lies left of it. A row swallowed whole contributes nothing.
+                    if (b0 <= x0 && b1 >= x1)
+                    {
+                        continue;
+                    }
+
+                    if (b0 > x0 && b0 < x1)
+                    {
+                        x1 = b0;
+                    }
+                    else if (b1 > x0 && b1 < x1)
+                    {
+                        x0 = b1;
+                    }
+                }
+
+                if (x1 > x0)
+                {
+                    FillRect(x0, y, x1 - x0, 1f, ink);
+                }
+            }
+        }
+
+        /// <summary>
         /// Draws one horizontal track slider and registers its drag hit-band. <paramref name="frac"/> is the
         /// normalised fill/handle position in [0, 1]. <paramref name="barCenterY"/> is the vertical centre of
         /// the thin track bar; the draggable handle is a <paramref name="handleH"/>-tall marker at
@@ -596,6 +862,24 @@ namespace DIR.Lib
                             break;
                         case Layout.Content.Box box when box.Color.Alpha > 0:
                             FillRect(bounds.X, bounds.Y, bounds.Width, bounds.Height, box.Color, radius);
+                            break;
+                        case Layout.Content.Icon icon:
+                            // Draw at the size the icon DECLARES, centred, rather than filling whatever rect
+                            // it was arranged into. Size was previously consulted only at measure time, which
+                            // made it meaningless the moment a node carried explicit sizing -- and every real
+                            // one does, since an icon lives in a button. The visible symptom was a mark
+                            // beside a text run: a 13-unit icon in a 20-unit cell painted at 20, so it stood
+                            // 38% taller than the word's cap height and read as misaligned even though both
+                            // were centred on the same row. The rect still CLAMPS it, so a collapsed cell
+                            // shrinks the mark rather than overflowing.
+                            var iconSide = MathF.Min(
+                                MathF.Min(bounds.Width, bounds.Height), ctx.ToSurface(icon.Size));
+                            DrawLayoutIcon(icon.Kind,
+                                new RectF32(
+                                    bounds.X + (bounds.Width - iconSide) / 2f,
+                                    bounds.Y + (bounds.Height - iconSide) / 2f,
+                                    iconSide, iconSide),
+                                icon.Color);
                             break;
                         case Layout.Content.Fill fill:
                             drawFill?.Invoke(fill, new RectF32(bounds.X, bounds.Y, bounds.Width, bounds.Height));

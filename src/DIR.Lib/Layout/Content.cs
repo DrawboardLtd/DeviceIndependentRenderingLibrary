@@ -43,6 +43,31 @@ public abstract record Content
     }
 
     /// <summary>
+    /// A small pictogram named by MEANING, so that each surface can draw it the way that surface actually
+    /// can: the pixel painter constructs it from rectangles, a cell painter picks a block-element glyph.
+    /// <para>
+    /// A <see cref="Text"/> run carrying a symbol character looks simpler and is the wrong tool, because the
+    /// two surfaces fail in opposite directions. On a pixel surface the glyph has to exist in the bound
+    /// font, and a missing one arrives as .notdef -- an empty box exactly where the icon should be -- which
+    /// is why apps that care draw these from rectangles instead. On a cell surface rectangles are not
+    /// available at all, but the box-drawing and block-element ranges are precisely what a terminal font is
+    /// relied on to carry. Naming the meaning rather than the drawing lets both be right at once.
+    /// </para>
+    /// </summary>
+    /// <param name="Size">
+    /// The mark's size in design units. This is both the intrinsic (Auto) size AND the size it is DRAWN at,
+    /// centred in whatever rect it is arranged into and clamped by it -- so an icon in a taller button stays
+    /// the size it asked for instead of growing to fill the button. That matters most beside a text run,
+    /// where a mark scaled to its cell rather than to its declared size overshoots the word's cap height and
+    /// reads as vertically misaligned even when the two are centred on the same row.
+    /// </param>
+    public sealed record Icon(IconKind Kind, float Size = 14f) : Content
+    {
+        /// <summary>Ink colour (default white), the same convention as <see cref="Text.Color"/>.</summary>
+        public RGBAColor32 Color { get; init; } = new(0xff, 0xff, 0xff, 0xff);
+    }
+
+    /// <summary>
     /// An app-drawn escape hatch (chart, sky map, custom widget, text input). Carries only a minimum intrinsic
     /// size in design units; pair with <c>Star</c> sizing to fill available space. The painter draws it via an
     /// app <c>drawFill</c> callback, which receives this instance back -- so when one tree contains several
@@ -50,4 +75,45 @@ public abstract record Content
     /// own draw closure (e.g. <c>map[fill.Key]?.Invoke(rect)</c>) without a central switch.
     /// </summary>
     public sealed record Fill(float MinWidth = 0f, float MinHeight = 0f, string? Key = null) : Content;
+}
+
+/// <summary>
+/// The pictograms a <see cref="Content.Icon"/> can name. Deliberately a CLOSED and tiny set: every kind
+/// costs a drawing in the pixel painter AND a glyph choice in every cell painter, so a kind earns its place
+/// by having a consumer on both. A one-off pictogram belongs in a <see cref="Content.Fill"/> the app draws
+/// itself, which is what that escape hatch is for.
+/// </summary>
+public enum IconKind
+{
+    /// <summary>A 2x2 of squares: "lay these out as a grid of tiles".</summary>
+    Grid,
+
+    /// <summary>Three stacked bars: "lay these out as a list of rows".</summary>
+    List,
+
+    /// <summary>
+    /// An <c>A</c> inside viewfinder corner brackets: "decide this for me". The camera convention for an
+    /// automatic mode, which is where a reader most likely met it (every body prints some version of it), and
+    /// it composes from the two things that are always safe: brackets are rectangles, and <c>A</c> is ASCII.
+    /// The other common rendering wraps the A in cyclic arrows, which a ring cannot say legibly at icon size.
+    /// </summary>
+    Auto,
+
+    /// <summary>
+    /// A disc half filled and half outlined: "follow whatever the desktop is set to".
+    /// <para>
+    /// The three theme marks are one family and earn their place together: an app with a light/dark setting
+    /// needs all three or none, and both surfaces can say each one. The divided disc is the long-standing
+    /// contrast mark, and the outlined half is load-bearing rather than decoration -- a bare half-disc reads
+    /// as a moon, which is the one neighbour it must not be confused with.
+    /// </para>
+    /// </summary>
+    ThemeSystem,
+
+    /// <summary>A rayed disc: "light, whatever the desktop says". The sun, drawn with the rays clear of the
+    /// disc so the two read as separate marks rather than one soft blob at icon size.</summary>
+    ThemeLight,
+
+    /// <summary>A crescent: "dark, whatever the desktop says".</summary>
+    ThemeDark,
 }

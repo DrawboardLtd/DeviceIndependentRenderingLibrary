@@ -548,6 +548,7 @@ public static class Engine
         {
             Content.Text text => ctx.MeasureText(text.Value.AsSpan(), text.FontSize),
             Content.Box box => new Size<T>(ctx.ToSurfaceX(box.Width), ctx.ToSurfaceY(box.Height)),
+            Content.Icon icon => new Size<T>(ctx.ToSurfaceX(icon.Size), ctx.ToSurfaceY(icon.Size)),
             Content.Fill fill => new Size<T>(ctx.ToSurfaceX(fill.MinWidth), ctx.ToSurfaceY(fill.MinHeight)),
             _ => Size<T>.Zero,
         };
