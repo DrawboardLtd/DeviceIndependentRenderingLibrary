@@ -227,6 +227,12 @@ env:
   #            over the whole picture, and the headless render then disagrees with the app about what
   #            was drawn. Clear still replaces rather than blends, and the direct-Pixels glyph blit
   #            respects it too -- that one was the last thing painting outside a clip.
+  # 7.19 - Synced from upstream DIR.Lib 7.26. Renderer.DrawTriangles: a triangle list, x/y pairs, three
+  #        vertices per triangle. Anything not made of rectangles, ellipses and text IS one -- an
+  #        arrowhead, a chevron, a chart's filled area -- and a widget that cannot say so reaches past
+  #        the abstraction to whichever backend can, which is enough on its own to pin a UI layer to one
+  #        renderer. The default is a scanline fill in terms of FillRectangle, so every backend has it;
+  #        a GPU renderer overrides it with one draw call.
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
