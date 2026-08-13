@@ -233,6 +233,15 @@ env:
   #        the abstraction to whichever backend can, which is enough on its own to pin a UI layer to one
   #        renderer. The default is a scanline fill in terms of FillRectangle, so every backend has it;
   #        a GPU renderer overrides it with one draw call.
+  # 7.20 - Synced from upstream DIR.Lib 7.27. PushClip/PopClip nest: a push inside a push draws in the
+  #        INTERSECTION, and a pop restores the enclosing clip rather than the whole surface, so a child
+  #        states its own bounds and cannot escape its parent's. Single-level read as a simplification
+  #        and was not one -- a panel clipping to its bounds and then per row had to intersect the two by
+  #        hand and re-push its OWN rect to get back, and "pop" degenerated into "reset", which works
+  #        only while every backend sets the region absolutely. An unmatched pop now throws. BREAKING for
+  #        backends: PushClip/PopClip are no longer virtual; a clipping backend overrides ApplyClip(rect)
+  #        and ClearClip() instead, since the stack lives in the base. Renderer.ClipDepth reports the
+  #        nesting, and RectInt gains Normalized() + Intersect().
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
