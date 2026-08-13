@@ -207,6 +207,26 @@ env:
   #        role: it previews what clicking gives you, UiPalette names no hover surface, and blending one
   #        would paint a colour the theme never chose. The close plate is Separator, the one role that
   #        reads against both the panel and the header surface.
+  # 7.18 - Six rounds, five of which shipped under 7.17 without saying so; this entry covers them.
+  #        Synced from upstream DIR.Lib 7.18 through 7.25, all additive:
+  #          * Content.Icon -- a NAMED mark leaf (check, chevron, caret, theme marks, ...) drawn from
+  #            rectangles at the size it declares, so a tree states a mark instead of a drawFill hook.
+  #          * CrossAlign on a Stack: align-items, stated on the CONTAINER. Without it a fixed-height
+  #            child in a taller bar hugs the top and centring means a spacer sandwich at the call site.
+  #          * The cursor as a property of a clickable region (CursorKind, RegisterCursor,
+  #            HitTestCursor, HitResult.ChromeHit) -- so a host stops maintaining a geometry predicate
+  #            that every new overlay silently invalidates. TextInputColors became a per-call parameter
+  #            at the same time, since pushing a static around a draw is not a thing a caller should do.
+  #          * IconKind.CaretUp / CaretDown, and Content.Text.WidthSample: a readout reserves the room
+  #            its widest reading needs, so the text beside it stops shuffling as the number changes.
+  #          * Padding per axis (PaddingY, .Pad(across, down), .PadX) -- a fixed-height bar has room
+  #            either side of a label and none above or below.
+  #          * Clipping the software renderer honours, and PixelWidgetBase.PushClip(x, y, w, h) /
+  #            PopClip so a widget can state one. RgbaImageRenderer ignored the clip, which the base
+  #            permits and a widget TEST does not: a control that trims content to its bounds paints
+  #            over the whole picture, and the headless render then disagrees with the app about what
+  #            was drawn. Clear still replaces rather than blends, and the direct-Pixels glyph blit
+  #            respects it too -- that one was the last thing painting outside a clip.
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
