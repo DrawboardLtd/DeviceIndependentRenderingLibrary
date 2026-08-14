@@ -287,6 +287,10 @@ env:
   #        hand-thread ONE TextInputFocus through the constructor of each, or they each believe they hold
   #        the keyboard. That failure is silent: two carets blink, one is dead, Tab cycles the wrong list,
   #        and nothing throws.
+  #        WindowUiSettings.CaretRect moves there too, for the same reason: there is one caret, and held
+  #        per widget a host had to know WHICH widget painted the focused field in order to ask the right
+  #        one -- a question with no stable answer, since the field holding the keyboard moves between
+  #        them. PixelWidgetBase.CaretRect still answers, now by forwarding.
   #        The practical payoff for this consumer: TextInputInteraction.HandleKey becomes reachable from
   #        the viewer's single key entry point, so the rules it owns -- the IME composing guard above all
   #        -- stop being restated per input control, which is where they get forgotten.
