@@ -294,6 +294,13 @@ env:
   #        The practical payoff for this consumer: TextInputInteraction.HandleKey becomes reachable from
   #        the viewer's single key entry point, so the rules it owns -- the IME composing guard above all
   #        -- stop being restated per input control, which is where they get forgotten.
+  # 7.24 - Synced from upstream DIR.Lib 7.31. TabBar.Font / .Pad / .Border become public, joining
+  #        .Height. Additive. They are what a host needs when it has to draw a tab somewhere the bar
+  #        does not -- the viewer's torn-out tab, carried as its own small window, paints itself as a
+  #        tab and the bar is not what paints it. Copied instead they drift: the viewer had two literals
+  #        and a comment naming the constants they came from. Exposed SCALED like Height, because a
+  #        copier working from the base constants applies a scale of its own and nothing makes that the
+  #        same number as TabBar.Scale.
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
