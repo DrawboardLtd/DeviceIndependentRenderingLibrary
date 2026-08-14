@@ -252,6 +252,34 @@ env:
   #        platform side effects, leaving the app taking no input while the IME stayed up), and
   #        TextInputInteraction moves in from a consumer's UI project so Tab cycling and commit dispatch
   #        are testable without a GUI. TextInputRenderer no-ops without a font, like the text helpers.
+  # 7.22 - Synced from upstream DIR.Lib 7.29. Non-Latin text input, and per-window values stop being
+  #        copied per widget. BREAKING in three places.
+  #        * IME composition. TextInputState carries the in-progress preedit (Composition /
+  #          CompositionCursor / CompositionLength / IsComposing); TextInputRenderer draws it inline,
+  #          underlined, and RETURNS the caret rect so a host can answer SDL_SetTextInputArea. A field
+  #          handling only committed text cannot accept CJK at all: with an IME every keystroke before the
+  #          commit is composition and nothing else arrives. TextInputInteraction swallows Enter/Escape/
+  #          Backspace while composing, since those belong to the candidate list, not the field.
+  #        * A field draws through the FALLBACK CHAIN. The layout painter splits TEXT LEAVES into coverage
+  #          runs, but a field's content is not a leaf, so TextInputRenderer takes the resolver and measures
+  #          the caret through the same chain. Without it a field holding correct CJK renders blank -- the
+  #          characters are there and the face has no glyphs. FontResolver.ResolveSystemScriptFonts()
+  #          resolves the platform's CJK/Indic faces, portable Noto names appended on EVERY platform.
+  #        * WindowUiSettings: DPI scale, fonts and the fallback chain live once per WINDOW and are SHARED
+  #          by reference (PixelWidgetBase.ShareUiContext), instead of each widget holding a copy kept in
+  #          agreement by an overridden setter naming every child. The properties still exist and still
+  #          forward, so a consumer setting them keeps compiling; what changes is that a composite shares
+  #          the object once instead of pushing each value to each child. IPixelWidget gains Ui.
+  #        * DropdownMenuState is generic over what an entry MEANS (DropdownItem<T>), so selecting hands
+  #          back the entry rather than an index the caller maps through a switch that has to agree with
+  #          the label order. Entries carry IsEnabled + Tooltip: a disabled row greys, states its reason ON
+  #          the row, is skipped by the arrows, and swallows its click instead of falling through to the
+  #          backdrop (which would close the menu, making it behave like a working row). RenderDropdownMenu
+  #          is generic to match; the viewer has no dropdown, so this one is inert here.
+  #        * An open overlay claims the keyboard by BEING PAINTED (WindowUiSettings.KeyboardClaimant +
+  #          IKeyboardClaimant), and the host asks once, instead of every widget owning an overlay adding a
+  #          routing case to its own input switch. Paint order is z-order, so the topmost claims last and
+  #          wins; a claimant no longer displayed declines, so a stale claim needs no clearing.
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
