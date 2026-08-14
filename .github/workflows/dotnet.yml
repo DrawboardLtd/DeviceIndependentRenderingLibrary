@@ -242,6 +242,16 @@ env:
   #        backends: PushClip/PopClip are no longer virtual; a clipping backend overrides ApplyClip(rect)
   #        and ClearClip() instead, since the stack lives in the base. Renderer.ClipDepth reports the
   #        nesting, and RectInt gains Normalized() + Intersect().
+  # 7.21 - Synced from upstream DIR.Lib 7.28. Layout.Builder.TextInput(state, fontSize) declares an
+  #        editable field: the painter draws it, registers the TextInputHit over the arranged rect and
+  #        states CursorKind.Text, so click-to-focus, blur-on-outside, Tab order and the I-beam follow
+  #        from a registration it cannot forget. It replaces a keyed Fill plus a painter branch keyed by
+  #        a magic string -- an identity nothing checks, where a typo yields a silently blank field, and
+  #        Fill means "the app paints something arbitrary here", which a text box is not. TextInputFocus
+  #        owns which field has the keyboard (a settable pointer let code change focus without the
+  #        platform side effects, leaving the app taking no input while the IME stayed up), and
+  #        TextInputInteraction moves in from a consumer's UI project so Tab cycling and commit dispatch
+  #        are testable without a GUI. TextInputRenderer no-ops without a font, like the text helpers.
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
