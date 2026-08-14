@@ -280,6 +280,16 @@ env:
   #          IKeyboardClaimant), and the host asks once, instead of every widget owning an overlay adding a
   #          routing case to its own input switch. Paint order is z-order, so the topmost claims last and
   #          wins; a claimant no longer displayed declines, so a stale claim needs no clearing.
+  # 7.23 - Synced from upstream DIR.Lib 7.30. WindowUiSettings.Focus: which field in the window has the
+  #        keyboard rides on the per-window context with the DPI scale and the fonts, shared the same way
+  #        by ShareUiContext. Additive. Focus is a singleton because there is one keyboard, which makes it
+  #        the same KIND of fact as those -- and a window whose fields sit in more than one widget had to
+  #        hand-thread ONE TextInputFocus through the constructor of each, or they each believe they hold
+  #        the keyboard. That failure is silent: two carets blink, one is dead, Tab cycles the wrong list,
+  #        and nothing throws.
+  #        The practical payoff for this consumer: TextInputInteraction.HandleKey becomes reachable from
+  #        the viewer's single key entry point, so the rules it owns -- the IME composing guard above all
+  #        -- stop being restated per input control, which is where they get forgotten.
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
