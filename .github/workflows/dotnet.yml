@@ -332,6 +332,27 @@ env:
   #        drag on the content underneath -- and those predicates are the remaining way a widget the host
   #        stopped drawing goes on taking input. The viewer's sidebar is exactly that case. True for a
   #        host that does not count frames, like everything else in 7.25.
+  # 8.1  - Synced from upstream DIR.Lib 8.1. A widget can be told where the pointer is, and chrome lights
+  #        under it. PixelWidgetBase.Pointer is the generalisation of the one TabBar already had (TabBar
+  #        now uses the inherited property -- same type and semantics, so a host that sets it reads
+  #        unchanged): a position rather than a hovered index, because the widget owns the geometry it
+  #        drew and a host asked for the index would have to hit-test the PREVIOUS frame's.
+  #        Layout.Node.HoverBackground / .BgHover(colour) paints a second fill while the pointer is inside
+  #        a node's rect, resolved where the ordinary background is already painted -- so what lights up
+  #        and what the pointer is over are the same rectangle, the guarantee Node.Hit has had all along.
+  #        That is why it is here and not in a consumer: the tree hands its rects back only after painting
+  #        them, which is after the fill had to be chosen, so a consumer recomputes the rect by hand and
+  #        drifts the moment a pad, a spacer or a row count changes -- a button lighting while the pointer
+  #        sits a pad above it, which is exactly what the viewer's search bar did.
+  #        RenderDropdownMenu also highlights the row under the pointer, which no consumer could do at
+  #        all: the highlight tracked HighlightIndex and nothing but the keyboard moved it, so a dropdown
+  #        answered the arrow keys and stayed dead under the mouse. Hovering does NOT move HighlightIndex
+  #        -- that is where the keyboard is, and a pointer crossing the list on its way elsewhere must not
+  #        become what Enter takes.
+  #        Inert unless asked for: Pointer is null by default, so a node with no hover fill, and every
+  #        host written before this, paints exactly as before. A host that DOES set it must repaint on
+  #        pointer motion -- motion is not otherwise a reason to draw, and a highlight resolved during
+  #        paint cannot notice the cursor left if no paint happens.
   VERSION_REV: ${{ github.run_attempt }}
   VERSION_HASH: +${{ github.sha }}
   BUILD_CONF: Release
