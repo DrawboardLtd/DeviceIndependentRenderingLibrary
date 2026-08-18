@@ -11,8 +11,16 @@ namespace DIR.Lib;
 /// </remarks>
 public static class TabBarRegions
 {
-    /// <summary>A tab's body, indexed by its position in the titles list.</summary>
+    /// <summary>A selectable tab's body, indexed by its position in the titles list.</summary>
     public const string Tabs = "tabs";
+
+    /// <summary>
+    /// The body of a tab that cannot be selected (<see cref="TabItem{T}.IsEnabled"/> false), at the same
+    /// index. A separate id so that everything asking for a pressable tab matches <see cref="Tabs"/> and
+    /// skips these without a second test, while the region is still present for the position walk
+    /// <see cref="TabBar{TSurface}.SlotAt"/> does.
+    /// </summary>
+    public const string DisabledTabs = "tabs:disabled";
 
     /// <summary>The ✕ inside a tab, at the same index. Registered after the body, so it wins the hit.</summary>
     public const string CloseButtons = "tabs:close";
@@ -22,11 +30,16 @@ public static class TabBarRegions
 }
 
 /// <summary>
-/// Reusable horizontal tab strip: one tab per title, an active highlight + accent, a close button
-/// per tab, ellipsis truncation, hover feedback (give it <see cref="Pointer"/>), and drag-to-reorder
+/// Reusable tab strip: one tab per item, an active highlight + accent, a close button per tab,
+/// ellipsis truncation, hover feedback (give it <see cref="Pointer"/>), and drag-to-reorder
 /// hit-testing. Backend-agnostic — it draws through its <see cref="Renderer{TSurface}"/> and is told the
-/// model (titles + active index) each frame; the host maps the returned <see cref="TabClick"/> /
+/// model (the tabs + which one is active) each frame; the host maps the returned <see cref="TabClick"/> /
 /// <see cref="SlotAt"/> to its own actions.
+///
+/// <para>It attaches to any edge (<see cref="Side"/>) and sizes tabs either to their content or to a
+/// square cell (<see cref="Sizing"/>), so one widget is a document strip along the top and a nav rail
+/// down the side. The defaults — <see cref="TabStripSide.Top"/> and <see cref="TabSizing.Content"/> —
+/// are the layout it has always drawn.</para>
 ///
 /// <para>Titles render through the widget's <see cref="PixelWidgetBase{TSurface}.FontFallback"/>, so
 /// non-Latin file names lay out per-script rather than as <c>.notdef</c> boxes.</para>
@@ -47,6 +60,7 @@ public sealed class TabBar<TSurface>(Renderer<TSurface> renderer) : PixelWidgetB
     private const float BaseCloseBox = 16f;  // clickable size of the ✕ glyph
     private const float BaseMinTabW = 92f;
     private const float BaseMaxTabW = 220f;
+    private const float BaseIconBox = 18f;   // width reserved for a TabItem's glyph, when it has one
 
     /// <summary>Pixel height of the bar — the host reserves this much at the top of the content area.</summary>
     public float Height => BaseHeight * DpiScale;
@@ -76,6 +90,7 @@ public sealed class TabBar<TSurface>(Renderer<TSurface> renderer) : PixelWidgetB
     private float CloseBox => BaseCloseBox * DpiScale;
     private float MinTabW => BaseMinTabW * DpiScale;
     private float MaxTabW => BaseMaxTabW * DpiScale;
+    private float IconBox => BaseIconBox * DpiScale;
 
     /// <summary>Palette, settable by the host like every other presentation value — a theme can change
     /// while the bar is alive, so this is not init-only. Defaults reproduce the bar's original dark
@@ -84,6 +99,20 @@ public sealed class TabBar<TSurface>(Renderer<TSurface> renderer) : PixelWidgetB
 
     /// <summary>A click that landed on a tab. <see cref="Close"/> = the × button (else the body).</summary>
     public readonly record struct TabClick(int Index, bool Close);
+
+    /// <summary>
+    /// Index of the tab under <see cref="PixelWidgetBase{TSurface}.Pointer"/> as of the last render, or -1
+    /// for none (including when the pointer is over a disabled tab). Resolved while the tabs are laid out,
+    /// so it costs the host no hit test of its own.
+    /// </summary>
+    /// <remarks>
+    /// This is how a host draws a tooltip for <see cref="TabItem{T}.Tooltip"/>. The BAR does not draw one,
+    /// deliberately: a tooltip is painted outside the strip, over whatever content is adjacent to it, and a
+    /// widget that clips to its own bounds — which this one does — cannot put it there. Declaring an overlay
+    /// was the alternative and it would move the decision about z-order and placement into a widget that
+    /// cannot see what it would cover.
+    /// </remarks>
+    public int HoveredIndex { get; private set; } = -1;
 
     /// <summary>
     /// Draw a "+" immediately after the last tab, the way a terminal or a browser does. What it opens is
@@ -111,126 +140,289 @@ public sealed class TabBar<TSurface>(Renderer<TSurface> renderer) : PixelWidgetB
     // lays the tabs out. Same type and semantics, so a host that sets it reads unchanged.
 
     /// <summary>
+    /// Which edge the strip is attached to. <see cref="TabStripSide.Top"/> (the default) is the layout
+    /// the bar has always drawn; orientation, the accent edge and the rule against the content all
+    /// derive from this. See <see cref="TabStripSide"/>.
+    /// </summary>
+    public TabStripSide Side { get; set; } = TabStripSide.Top;
+
+    /// <summary>
+    /// How a tab is sized along the axis tabs advance on. <see cref="TabSizing.Content"/> (the default)
+    /// is what the bar has always done; <see cref="TabSizing.Uniform"/> is a nav rail's square cell.
+    /// </summary>
+    public TabSizing Sizing { get; set; } = TabSizing.Content;
+
+    /// <summary>
+    /// Whether tabs carry a ✕. Default true, which is what the strip has always drawn. False draws none
+    /// and, because the box is no longer reserved, makes every tab narrower by it — a strip whose tabs
+    /// cannot be closed should not hold a gap where the control would have been.
+    /// </summary>
+    /// <remarks>
+    /// Positive logic, like <see cref="CanReorderTabs"/> and unlike <see cref="ShowNewTabButton"/>: a
+    /// property that has to be read as "not not closable" is one more negation than a call site should
+    /// have to carry. <see cref="ShowNewTabButton"/> keeps its name because renaming a shipped property
+    /// costs consumers more than the inconsistency does.
+    /// </remarks>
+    public bool CanCloseTabs { get; set; } = true;
+
+    /// <summary>
+    /// Whether a drag may reorder the strip. Default true. False makes <see cref="SlotAt"/> report -1
+    /// for every position, which is the whole mechanism: the BAR never reorders anything, it only
+    /// nominates the slot a host would drop into, so declining to nominate one is how it says no.
+    /// </summary>
+    public bool CanReorderTabs { get; set; } = true;
+
+    /// <summary>
+    /// Size a <see cref="TabItem{T}.Icon"/> is drawn at, already scaled. Null (the default) means
+    /// <see cref="Font"/>, i.e. the size of the label beside it — right for a document tab, where a
+    /// glyph that overshoots the words it sits with reads as misaligned.
+    /// </summary>
+    /// <remarks>
+    /// A nav rail is the opposite case and is why this exists: its cell holds a mark and nothing else,
+    /// so sizing that mark to a label the cell never draws leaves it small in the middle of a large
+    /// square. Deriving it from the cell instead was the alternative, and it would bake a ratio the bar
+    /// has no basis to pick.
+    /// </remarks>
+    public float? IconSize { get; set; }
+
+    /// <summary>True while the strip runs down an edge rather than across one.</summary>
+    private bool Vertical => Side is TabStripSide.Left or TabStripSide.Right;
+
+    /// <summary>
+    /// True when the accent belongs at the LOW end of the cross axis (the top of a Top strip, the left
+    /// of a Left one) — i.e. on the outer edge, away from the content the strip heads. The bar's own
+    /// rule against that content goes on the opposite edge, which is why one flag places both.
+    /// </summary>
+    private bool OuterAtCrossStart => Side is TabStripSide.Top or TabStripSide.Left;
+
+    /// <summary>
     /// Lays the strip out and paints it, registering each tab body, each ✕ and the + as it goes.
     /// </summary>
-    /// <param name="contentLeft">Left edge of the strip — a host with a sidebar starts the tabs past it.</param>
-    /// <param name="viewportW">Right edge. Tabs that do not fit clip off; the + is dropped rather than
-    /// drawn under the clip.</param>
+    /// <param name="contentStart">Where the tabs begin along the axis they advance on — a host with a
+    /// sidebar starts them past it. The strip's x for a horizontal <see cref="Side"/>, its y for a
+    /// vertical one.</param>
+    /// <param name="viewportEnd">Where they stop. Tabs that do not fit clip off; the + is dropped
+    /// rather than drawn under the clip.</param>
     /// <param name="titles">One per tab, in order.</param>
     /// <param name="activeIndex">The tab wearing the accent, or -1 for none (e.g. while the + owns the
     /// window).</param>
-    public void Render(float contentLeft, float viewportW, IReadOnlyList<string> titles, int activeIndex)
+    /// <remarks>
+    /// Places the strip at 0 on its cross axis, so this overload suits <see cref="TabStripSide.Top"/>
+    /// and <see cref="TabStripSide.Left"/>. A <see cref="TabStripSide.Bottom"/> or
+    /// <see cref="TabStripSide.Right"/> strip has to be told where the far edge is, which is a viewport
+    /// dimension the bar does not know — use the <see cref="Render(RectF32, IReadOnlyList{string}, int)"/>
+    /// overload for those.
+    /// </remarks>
+    public void Render(float contentStart, float viewportEnd, IReadOnlyList<string> titles, int activeIndex)
+        => Render(DefaultBounds(contentStart, viewportEnd), titles, activeIndex);
+
+    /// <inheritdoc cref="Render(float, float, IReadOnlyList{string}, int)"/>
+    /// <param name="bounds">The whole strip's rectangle. Its thickness across the flow axis is the
+    /// strip's, so a nav rail states its width here rather than inheriting <see cref="Height"/>.</param>
+    /// <param name="titles">One per tab, in order.</param>
+    /// <param name="activeIndex">The tab wearing the accent, or -1 for none.</param>
+    public void Render(RectF32 bounds, IReadOnlyList<string> titles, int activeIndex)
+        => RenderCore(bounds, new TabTitlesSource(titles), activeIndex);
+
+    /// <summary>
+    /// Lays the strip out and paints it from <see cref="TabItem{T}"/>s, so a press comes back as the
+    /// VALUE it selects rather than an index the host maps through a switch of its own.
+    /// </summary>
+    /// <param name="contentStart">Where the tabs begin along the axis they advance on.</param>
+    /// <param name="viewportEnd">Where they stop. Tabs that do not fit clip off.</param>
+    /// <param name="items">One per tab, in order.</param>
+    /// <param name="activeValue">The item wearing the accent, matched by
+    /// <see cref="EqualityComparer{T}.Default"/>. A value no item carries leaves the strip with no active
+    /// tab, which is what a host showing something other than a tab (a new-tab page) wants.</param>
+    /// <inheritdoc cref="Render(float, float, IReadOnlyList{string}, int)" path="/remarks"/>
+    public void Render<T>(float contentStart, float viewportEnd, IReadOnlyList<TabItem<T>> items, T activeValue)
+        => Render(DefaultBounds(contentStart, viewportEnd), items, activeValue);
+
+    /// <inheritdoc cref="Render{T}(float, float, IReadOnlyList{TabItem{T}}, T)"/>
+    /// <param name="bounds">The whole strip's rectangle.</param>
+    /// <param name="items">One per tab, in order.</param>
+    /// <param name="activeValue">The item wearing the accent.</param>
+    public void Render<T>(RectF32 bounds, IReadOnlyList<TabItem<T>> items, T activeValue)
+    {
+        var comparer = EqualityComparer<T>.Default;
+        var activeIndex = -1;
+        for (var i = 0; i < items.Count; i++)
+        {
+            if (comparer.Equals(items[i].Value, activeValue))
+            {
+                activeIndex = i;
+                break;
+            }
+        }
+
+        RenderCore(bounds, new TabItemsSource<T>(items), activeIndex);
+    }
+
+    /// <summary>The strip laid along its side at cross-axis 0, <see cref="Height"/> thick.</summary>
+    private RectF32 DefaultBounds(float contentStart, float viewportEnd)
+        => Vertical
+            ? new RectF32(0f, contentStart, Height, viewportEnd - contentStart)
+            : new RectF32(contentStart, 0f, viewportEnd - contentStart, Height);
+
+    /// <summary>
+    /// What the two <c>Render</c> overloads have in common, over whatever supplies the tabs.
+    /// </summary>
+    /// <remarks>
+    /// Generic over a STRUCT source with a constraint rather than taking an <c>IReadOnlyList&lt;TabItem&gt;</c>
+    /// both overloads convert into: the older overload takes titles the caller already holds, and converting
+    /// them would allocate a list per frame for a strip that is repainted every frame. The constraint lets
+    /// the JIT specialise each source, so the indirection costs nothing and neither call site allocates.
+    /// </remarks>
+    private void RenderCore<TSource>(RectF32 bounds, TSource source, int activeIndex)
+        where TSource : struct, ITabStripSource
     {
         BeginFrame();
 
-        var h = (int)Height;
+        var vertical = Vertical;
+        var thickness = vertical ? bounds.Width : bounds.Height;
+        var flowStart = vertical ? bounds.Y : bounds.X;
+        var flowEnd = vertical ? bounds.Bottom : bounds.Right;
+        var crossStart = vertical ? bounds.X : bounds.Y;
 
-        // Bar background spans the full content width; clip the strip to its bounds.
-        var barLeft = (int)contentLeft;
-        var barRight = (int)viewportW;
-        PushClip(barLeft, 0, barRight - barLeft, h);
-        FillRect(barLeft, 0, barRight - barLeft, h, Colors.BarBackground);
-
-        // The pointer's x, but only while it is within the strip's own band — one test here instead of
-        // per tab, and null keeps every hover below switched off in one place.
-        var hoverX = Pointer is { } p && p.Y >= 0f && p.Y < h ? p.X : (float?)null;
-
-        var x = contentLeft;
-        var closeSize = CloseBox;
-        for (var i = 0; i < titles.Count; i++)
+        // The pointer's FLOW coordinate measured from the strip's own start, and only while its CROSS
+        // coordinate is inside the strip's band -- one test here rather than per tab, and null switches
+        // every hover off in one place. TabStripTree resolves WHICH tab it lands on.
+        float? pointerFlow = null;
+        float? pointerCross = null;
+        if (Pointer is { } p)
         {
-            var title = titles[i];
-            var active = i == activeIndex;
-
-            var textW = MeasureTitle(title);
-            var w = Math.Clamp(textW + Pad * 2 + closeSize, MinTabW, MaxTabW);
-            var x0 = x;
-            var x1 = x + w;
-            var hovered = hoverX is { } hx && hx >= x0 && hx < x1;
-
-            // Tab background + the accent strip / separators that distinguish active from idle. A
-            // hovered idle tab takes the ACTIVE plate rather than a tone of its own: it previews what
-            // clicking gives you, it is what the + already does, and the palette names no hover
-            // surface — inventing one by blending would paint a colour the theme never chose. The
-            // accent strip stays exclusive to the active tab, which is what keeps the two apart.
-            var lifted = active || hovered;
-            FillRect(x0, 0, w, h, lifted ? Colors.ActiveBackground : Colors.InactiveBackground);
-            if (active)
+            var cross = (vertical ? p.X : p.Y) - crossStart;
+            if (cross >= 0f && cross < thickness)
             {
-                FillRect(x0, 0, w, Border * 2, Colors.ActiveAccent);
+                pointerFlow = (vertical ? p.Y : p.X) - flowStart;
+                pointerCross = cross;
             }
-
-            // Right-hand separator between tabs.
-            FillRect(x1 - Border, 0, Border, h, Colors.Separator);
-
-            // Label, truncated to leave room for the close button. Drawn with per-script fallback.
-            var labelRight = (int)(x1 - closeSize - Pad * 0.5f);
-            var labelLeft = (int)(x0 + Pad);
-            var label = FitTitle(title, labelRight - labelLeft);
-            DrawText(label.AsSpan(), FontPath, labelLeft, 0, labelRight - labelLeft, h - (int)(2 * DpiScale),
-                Font, lifted ? Colors.ActiveText : Colors.InactiveText, TextAlign.Near, TextAlign.Center);
-
-            // Close button (×) at the right edge — Latin, always covered by the primary font.
-            var cx1 = (int)(x1 - Pad * 0.4f);
-            var cx0 = (int)(cx1 - closeSize);
-            // Its own plate under the pointer, because the ✕ is a second target inside the tab and a
-            // tab-wide hover says nothing about where its edge is. Separator is the plate: it is the
-            // one role guaranteed to read against both the panel and the header surface, so this needs
-            // no colour of its own in either theme.
-            if (hovered && hoverX >= cx0 && hoverX <= cx1)
-            {
-                FillRect(cx0, (h - closeSize) * 0.5f, cx1 - cx0, closeSize, Colors.Separator, closeSize * 0.25f);
-            }
-
-            DrawText("×".AsSpan(), FontPath, cx0, 0, cx1 - cx0, h, Font, Colors.CloseMark,
-                TextAlign.Center, TextAlign.Center);
-
-            // The tab first, then its ✕ over the top: the region list resolves last-registered-wins, so
-            // this ordering is what makes the close button a target inside the tab rather than beside it.
-            RegisterClickable(x0, 0, w, h, new HitResult.ListItemHit(TabBarRegions.Tabs, i),
-                cursor: CursorKind.Pointer);
-            RegisterClickable(cx0, 0, cx1 - cx0, h, new HitResult.ListItemHit(TabBarRegions.CloseButtons, i),
-                cursor: CursorKind.Pointer);
-
-            x = x1;
-
-            if (x >= viewportW) break; // ran out of room — remaining tabs clip off (max-resident keeps this rare)
         }
 
-        // The + goes where the tabs stopped, so it reads as the next slot in the strip rather than as a
-        // toolbar button parked at the far end. Skipped when the tabs have already filled the width:
-        // drawing it past the edge would put a control where the clip hides it.
-        if (ShowNewTabButton && x + h <= viewportW)
-        {
-            var x0 = x;
-            var x1 = x + h;   // square, so it matches the strip's own height
-            var hovered = NewTabHovered || (hoverX is { } hx && hx >= x0 && hx < x1);
-            FillRect(x0, 0, x1 - x0, h, NewTabActive || hovered ? Colors.ActiveBackground : Colors.InactiveBackground);
-            if (NewTabActive)
+        var strip = TabStripTree.Build(
+            source,
+            activeIndex,
+            pointerFlow,
+            pointerCross,
+            flowEnd - flowStart,
+            MeasureTitle,
+            new TabStripOptions
             {
-                FillRect(x0, 0, x1 - x0, Border * 2, Colors.ActiveAccent);
-            }
+                Side = Side,
+                Sizing = Sizing,
+                Metrics = new TabStripMetrics(
+                    Thickness: thickness,
+                    FontSize: Font,
+                    Pad: Pad,
+                    Border: Border,
+                    IconBox: IconBox,
+                    CloseBox: CloseBox,
+                    MinTabExtent: MinTabW,
+                    MaxTabExtent: MaxTabW)
+                {
+                    IconSize = IconSize,
+                },
+                Colors = Colors,
+                CanCloseTabs = CanCloseTabs,
+            });
 
-            FillRect(x1 - Border, 0, Border, h, Colors.Separator);
+        HoveredIndex = strip.HoveredIndex;
 
-            // Two bars rather than a "+" glyph: the mark has to be there on any face the host happens to
-            // be using, and geometry stays crisp at 30 px where a typeset plus does not.
-            var cx = (x0 + x1) * 0.5f;
-            var cy = h * 0.5f;
-            var arm = 5f * DpiScale;
-            var t = Math.Max(1f, 1.6f * DpiScale);
-            var ink = NewTabActive || hovered ? Colors.ActiveText : Colors.InactiveText;
-            FillRect(cx - arm, cy - t * 0.5f, arm * 2f, t, ink);
-            FillRect(cx - t * 0.5f, cy - arm, t, arm * 2f, ink);
+        PushClip(bounds.X, bounds.Y, bounds.Width, bounds.Height);
 
-            RegisterClickable(x0, 0, x1 - x0, h, new HitResult.ButtonHit(TabBarRegions.NewTab),
-                cursor: CursorKind.Pointer);
-        }
-
-        // Bottom edge of the whole bar.
-        FillRect(barLeft, h - Border, barRight - barLeft, Border, Colors.Separator);
+        // dpiScale 1 is the device-px escape hatch, and it is REQUIRED here: every metric above is already
+        // scaled (Font is BaseFont * DpiScale, the thickness comes from a device-px rect), so letting the
+        // engine scale design units again multiplies twice. At 1.5x that turned a 78px square cell into
+        // 78x117 -- and no test could have caught it, because they all run at DpiScale 1 where squaring
+        // the scale is the identity.
+        RenderLayout(strip.Root, bounds, dpiScale: 1f);
+        RenderNewTabButton(strip.TabsEnd, vertical, thickness, crossStart, flowStart, flowEnd, pointerFlow);
         PopClip();
     }
+
+    /// <summary>
+    /// The "+" after the last tab. Drawn here rather than as part of the strip's tree, because it belongs
+    /// to a tab BAR and not to a tab strip: a nav rail has none and a terminal tab bar has none. Its
+    /// position comes from <see cref="TabStrip.TabsEnd"/>, so it lands where the tabs actually stopped
+    /// rather than where a second sizing pass believes they did.
+    /// </summary>
+    /// <remarks>
+    /// Its mark IS a <see cref="Layout.IconKind.Plus"/>, drawn straight rather than through a tree: the
+    /// button is one rect at a position the tree does not know, so a node here would buy nothing. What the
+    /// named kind buys is that the mark is no longer this file's private pair of rectangles -- the argument
+    /// against adding it was that no cell surface has a new-tab button, which was true and answered the
+    /// wrong question, since <see cref="Layout.IconKind.Minus"/> and it are a stepper's two halves and a
+    /// terminal has plenty of those.
+    /// </remarks>
+    private void RenderNewTabButton(float tabsEnd, bool vertical, float thickness, float crossStart,
+        float flowStart, float flowEnd, float? pointerFlow)
+    {
+        var flow = flowStart + tabsEnd;
+        if (!ShowNewTabButton || flow + thickness > flowEnd)
+        {
+            return;   // past the edge is under the clip, which is a control nobody can see
+        }
+
+        var rect = TabRect(flow, thickness, crossStart, thickness, vertical);
+        var hovered = NewTabHovered
+            || (pointerFlow is { } pf && pf >= tabsEnd && pf < tabsEnd + thickness);
+        var plate = NewTabActive ? Colors.ActiveBackground
+                  : hovered ? Colors.HoverBackground ?? Colors.ActiveBackground
+                            : Colors.InactiveBackground;
+
+        FillRect(rect.X, rect.Y, rect.Width, rect.Height, plate);
+        if (NewTabActive)
+        {
+            var accent = OuterEdge(rect, Border * 2, vertical);
+            FillRect(accent.X, accent.Y, accent.Width, accent.Height, Colors.ActiveAccent);
+        }
+
+        var sep = TrailingEdge(rect, Border, vertical);
+        FillRect(sep.X, sep.Y, sep.Width, sep.Height, Colors.Separator);
+
+        // Rectangles rather than a "+" glyph: the mark has to be there on any face the host happens to be
+        // using, and geometry stays crisp at 30 px where a typeset plus does not.
+        var mark = 11f * DpiScale;
+        var ink = NewTabActive || hovered ? Colors.ActiveText : Colors.InactiveText;
+        DrawLayoutIcon(Layout.IconKind.Plus, new RectF32(
+            rect.X + (rect.Width - mark) * 0.5f, rect.Y + (rect.Height - mark) * 0.5f, mark, mark), ink);
+
+        RegisterClickable(rect.X, rect.Y, rect.Width, rect.Height,
+            new HitResult.ButtonHit(TabBarRegions.NewTab), cursor: CursorKind.Pointer);
+    }
+
+    /// <summary>
+    /// The screen rect of a tab occupying <paramref name="flowLen"/> from <paramref name="flow"/> along
+    /// the flow axis, spanning the strip's thickness across it. The one place the flow/cross pair is
+    /// mapped back to x/y, which is what lets everything above be written once for all four sides.
+    /// </summary>
+    private static RectF32 TabRect(float flow, float flowLen, float cross, float crossLen, bool vertical)
+        => vertical
+            ? new RectF32(cross, flow, crossLen, flowLen)
+            : new RectF32(flow, cross, flowLen, crossLen);
+
+    /// <summary>
+    /// A band <paramref name="t"/> thick on <paramref name="rect"/>'s OUTER cross edge — the top of a
+    /// Top strip, the left of a Left one. Where the active accent goes.
+    /// </summary>
+    private RectF32 OuterEdge(RectF32 rect, float t, bool vertical)
+        => vertical
+            ? new RectF32(OuterAtCrossStart ? rect.X : rect.Right - t, rect.Y, t, rect.Height)
+            : new RectF32(rect.X, OuterAtCrossStart ? rect.Y : rect.Bottom - t, rect.Width, t);
+
+    /// <summary>A band <paramref name="t"/> thick on <paramref name="rect"/>'s INNER cross edge, facing
+    /// the content. The complement of <see cref="OuterEdge"/>.</summary>
+    private RectF32 InnerEdge(RectF32 rect, float t, bool vertical)
+        => vertical
+            ? new RectF32(OuterAtCrossStart ? rect.Right - t : rect.X, rect.Y, t, rect.Height)
+            : new RectF32(rect.X, OuterAtCrossStart ? rect.Bottom - t : rect.Y, rect.Width, t);
+
+    /// <summary>A band <paramref name="t"/> thick on <paramref name="rect"/>'s trailing FLOW edge — its
+    /// right on a horizontal strip, its bottom on a vertical one. Where tabs are ruled apart.</summary>
+    private static RectF32 TrailingEdge(RectF32 rect, float t, bool vertical)
+        => vertical
+            ? new RectF32(rect.X, rect.Bottom - t, rect.Width, t)
+            : new RectF32(rect.Right - t, rect.Y, t, rect.Height);
 
     /// <summary>
     /// A title's drawn width, through whatever fallback the window set — the same split
@@ -264,7 +456,7 @@ public sealed class TabBar<TSurface>(Renderer<TSurface> renderer) : PixelWidgetB
         => HitTest(x, y) is HitResult.ButtonHit { Action: TabBarRegions.NewTab };
 
     /// <summary>Maps a click to a tab (and whether the ✕ was hit). Null if the click is below the
-    /// bar, on the + button, or in empty bar space.</summary>
+    /// bar, on the + button, on a disabled tab, or in empty bar space.</summary>
     public TabClick? HandleMouseDown(float x, float y) => HitTest(x, y) switch
     {
         HitResult.ListItemHit { ListId: TabBarRegions.CloseButtons, Index: var i } => new TabClick(i, Close: true),
@@ -272,25 +464,63 @@ public sealed class TabBar<TSurface>(Renderer<TSurface> renderer) : PixelWidgetB
         _ => null,
     };
 
-    /// <summary>Maps an x coordinate to the tab slot a dragged tab should occupy, using the midpoints of
-    /// the tab regions the last <see cref="Render"/> registered. Returns -1 if no tabs are laid out.</summary>
+    /// <summary>
+    /// Maps a click to the ITEM it selects, so the host acts on a value instead of mapping an index back
+    /// to meaning. Null on the same misses as <see cref="HandleMouseDown(float, float)"/>.
+    /// </summary>
+    /// <param name="items">The list that was rendered — the same one, in the same order.</param>
+    /// <remarks>
+    /// The items come back in rather than being remembered from <see cref="Render{T}"/> because the bar is
+    /// generic over its SURFACE, not over the item type: holding the last list would mean storing it as
+    /// <c>object</c> and casting on the way out, which turns a caller passing the wrong list from a
+    /// compile error into a runtime one. A host builds this list per frame anyway.
+    /// <para>
+    /// An index the list no longer covers reports null rather than throwing: the strip can outlive its
+    /// model by a frame if the host closes a tab between painting and dispatching.
+    /// </para>
+    /// </remarks>
+    public TabClick<T>? HandleMouseDown<T>(float x, float y, IReadOnlyList<TabItem<T>> items)
+    {
+        if (HandleMouseDown(x, y) is not { } click || click.Index >= items.Count)
+        {
+            return null;
+        }
+
+        return new TabClick<T>(click.Index, items[click.Index].Value, click.Close);
+    }
+
+    /// <summary>Maps a coordinate on the FLOW axis — x on a horizontal strip, y on a vertical one — to
+    /// the tab slot a dragged tab should occupy, using the midpoints of the tab regions the last
+    /// <c>Render</c> registered. Returns -1 if no tabs are laid out, or if
+    /// <see cref="CanReorderTabs"/> is false.</summary>
     /// <remarks>
     /// A drop target is not a hit — there is no region for the gap BETWEEN two tabs — so this is the one
     /// thing the bar computes from its layout rather than reporting from it. It still reads the registered
     /// rects, which is what stops a drag from reordering against geometry the strip no longer has.
     /// </remarks>
-    public int SlotAt(float x)
+    public int SlotAt(float flow)
     {
+        if (!CanReorderTabs)
+        {
+            return -1;
+        }
+
+        var vertical = Vertical;
         var slot = -1;
         foreach (var region in RegisteredRegions)
         {
-            if (region.Result is not HitResult.ListItemHit { ListId: TabBarRegions.Tabs })
+            // Disabled tabs count too: they occupy a position in the strip, so a drop past one lands
+            // where the pointer is rather than one slot short of it.
+            if (region.Result is not HitResult.ListItemHit { ListId: TabBarRegions.Tabs or TabBarRegions.DisabledTabs })
             {
                 continue;
             }
 
             slot++;   // registration order is tab order
-            if (x < region.X + region.Width * 0.5f)
+            var midpoint = vertical
+                ? region.Y + region.Height * 0.5f
+                : region.X + region.Width * 0.5f;
+            if (flow < midpoint)
             {
                 return slot;
             }
