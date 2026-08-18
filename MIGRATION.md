@@ -29,7 +29,7 @@ The larger reason is that the bar was hit-testing against a private copy of its 
 list filled during the draw, read by `HandleMouseDown` and `SlotAt`. That is the shape where draw and
 hit drift apart. It now **registers** each tab, each ✕ and the + as it paints them, and those three
 methods report from the registered rects. Two properties come free with that. The ✕ is registered
-after the tab it sits in, so it wins the hit as an inner control should. And through 7.25's frame
+after the tab it sits in, so it wins the hit as an inner control should. And through 7.32's frame
 stamp the whole strip goes quiet on a frame the host did not draw it in — which a tab bar does meet,
 since a host carrying a torn-out tab as its own small window paints it as a chip and draws no strip,
 leaving the bar holding the layout of a strip that is gone. Whether a press reaches it there was the

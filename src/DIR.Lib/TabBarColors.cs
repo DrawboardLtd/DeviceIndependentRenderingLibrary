@@ -22,6 +22,25 @@ public record TabBarColors
     /// <summary>Fill of every other tab. Default: recessed slate (#1c1c26).</summary>
     public RGBAColor32 InactiveBackground { get; init; } = new(0x1c, 0x1c, 0x26, 0xff);
 
+    /// <summary>
+    /// Fill of an idle tab under the pointer. <b>Null (the default) means it takes
+    /// <see cref="ActiveBackground"/></b>, which is what the strip has always drawn.
+    /// </summary>
+    /// <remarks>
+    /// Defaulting to the active plate is deliberate and stays the default: a hovered tab previews what
+    /// clicking gives you, it is what the + already does, and a palette that names only two chrome
+    /// surfaces has no third tone to offer — inventing one by blending would paint a colour the theme
+    /// never chose.
+    /// <para>
+    /// It is nullable rather than absent because that reasoning stops holding for a strip whose theme
+    /// DOES name a third surface, and for one drawing no accent. Hover and active are then rendered
+    /// identically, so the strip cannot say which tab a click would actually take you to — and a nav
+    /// rail is exactly that case, since its selected cell is a filled plate rather than a plate plus an
+    /// accent. Set this and the three states are three tones again.
+    /// </para>
+    /// </remarks>
+    public RGBAColor32? HoverBackground { get; init; }
+
     /// <summary>Rule between tabs and along the bar's bottom edge. Default: mid slate (#3a3a48).</summary>
     public RGBAColor32 Separator { get; init; } = new(0x3a, 0x3a, 0x48, 0xff);
 
@@ -37,6 +56,18 @@ public record TabBarColors
 
     /// <summary>The per-tab close mark. Default: light grey (#c0c0c8).</summary>
     public RGBAColor32 CloseMark { get; init; } = new(0xc0, 0xc0, 0xc8, 0xff);
+
+    /// <summary>
+    /// Label of a tab that cannot be selected (<see cref="TabItem{T}.IsEnabled"/> false). Default: dark
+    /// slate (#4a4a58) — the SEPARATOR weight rather than a third text tone, deliberately.
+    /// </summary>
+    /// <remarks>
+    /// A disabled tab is not de-emphasised text, it is an affordance that is not there, and WCAG exempts
+    /// inactive components from the contrast minimums for exactly that reason. Taking a text role instead
+    /// makes it read as merely quiet — indistinguishable from an idle tab, so the strip stops saying which
+    /// of its tabs will answer a click.
+    /// </remarks>
+    public RGBAColor32 DisabledText { get; init; } = new(0x4a, 0x4a, 0x58, 0xff);
 
     /// <summary>
     /// Derives a bar palette from the shared chrome roles in <paramref name="palette"/>, so an app that
@@ -67,5 +98,6 @@ public record TabBarColors
         ActiveText = palette.HeaderText,
         InactiveText = palette.DimText,
         CloseMark = palette.BodyText,
+        DisabledText = palette.SeparatorStrong,
     };
 }

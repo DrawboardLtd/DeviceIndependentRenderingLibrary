@@ -310,6 +310,12 @@ namespace DIR.Lib
         /// produced ink spanning 63% (a half-disc) to 100% (the grid) of it, a 1.6x spread that no amount of
         /// centring can hide. A new kind owes the same, and the LayoutIconTests measure it.
         /// <para>
+        /// <see cref="Layout.IconKind.Minus"/> is the sole exception and could not be otherwise: a horizontal
+        /// bar has no height to give. It fills its full WIDTH and borrows <see cref="Layout.IconKind.Plus"/>'s
+        /// bar thickness and centre line, so the pair still lines up where it matters -- beside each other in
+        /// a stepper.
+        /// </para>
+        /// <para>
         /// A kind with no drawing here paints nothing rather than throwing -- a blank button is visible on
         /// the first frame, which is the right way for a forgotten kind to announce itself.
         /// </para>
@@ -406,6 +412,27 @@ namespace DIR.Lib
                     DrawLine(acx + aw / 2f, acy + ah / 2f, acx, acy - ah / 2f, ink, stroke);
                     DrawLine(acx - aw * 0.3f, acy + ah * 0.16f, acx + aw * 0.3f, acy + ah * 0.16f, ink, stroke);
                     break;
+
+                case Layout.IconKind.Plus:
+                case Layout.IconKind.Minus:
+                {
+                    // Whole pixels, because a half-covered bar at chip size reads as a LIGHTER mark than its
+                    // neighbour rather than a thinner one -- and a stepper sets the two side by side, where
+                    // that is the one difference the eye is guaranteed to catch.
+                    var barT = MathF.Max(1f, MathF.Round(side * 0.14f));
+                    var px = rect.X + (rect.Width - side) / 2f;
+                    var py = rect.Y + (rect.Height - side) / 2f;
+
+                    // The arm across is drawn for both, identically, which is what makes the pair align: one
+                    // thickness, one centre line, neither re-derived by the other kind.
+                    FillRect(px, MathF.Round(py + (side - barT) / 2f), side, barT, ink);
+                    if (kind == Layout.IconKind.Plus)
+                    {
+                        FillRect(MathF.Round(px + (side - barT) / 2f), py, barT, side, ink);
+                    }
+
+                    break;
+                }
 
                 case Layout.IconKind.List:
                     var barW = unit * 5.2f;
@@ -739,7 +766,7 @@ namespace DIR.Lib
         /// <inheritdoc/>
         /// <remarks>Empty on a frame this widget did not draw, so Tab never reaches a field that is not on
         /// screen — the same rule <see cref="TextInputFocus.BlurIfUnpainted"/> applies to the focus itself.</remarks>
-        public List<TextInputState> GetRegisteredTextInputs()
+        public virtual List<TextInputState> GetRegisteredTextInputs()
             => RegionsAreCurrent ? _tracker.GetRegisteredTextInputs() : [];
 
         /// <summary>
@@ -775,18 +802,28 @@ namespace DIR.Lib
 
         /// <inheritdoc/>
         /// <remarks>Null on a frame this widget did not draw — see <see cref="WindowUiSettings.FrameId"/>.</remarks>
-        public HitResult? HitTest(float x, float y) => RegionsAreCurrent ? _tracker.HitTest(x, y) : null;
+        public virtual HitResult? HitTest(float x, float y) => RegionsAreCurrent ? _tracker.HitTest(x, y) : null;
 
         /// <summary>The cursor stated by the topmost region under the point, or null if none had a
         /// view — see <see cref="CursorKind"/> for why this is asked of the regions rather than
         /// computed from geometry by the host.</summary>
-        public CursorKind? HitTestCursor(float x, float y)
+        public virtual CursorKind? HitTestCursor(float x, float y)
             => RegionsAreCurrent ? _tracker.HitTestCursor(x, y) : null;
 
         /// <inheritdoc/>
-        /// <remarks>Dispatches nothing on a frame this widget did not draw, which is the case that matters
-        /// most: a stale region here does not merely report a hit, it RUNS the handler.</remarks>
-        public HitResult? HitTestAndDispatch(float x, float y, InputModifier modifiers = InputModifier.None)
+        /// <remarks>
+        /// Dispatches nothing on a frame this widget did not draw, which is the case that matters most: a
+        /// stale region here does not merely report a hit, it RUNS the handler.
+        /// <para>
+        /// <b>Virtual so a COMPOSITE widget can extend dispatch to the widgets it paints.</b> One that
+        /// hosts children — a chrome with a tab strip in it — draws them into the same surface, but their
+        /// regions live on THEIR trackers, so a host asking only the composite silently misses every
+        /// control the children registered. Overriding is how the composite states its own paint order,
+        /// which is knowledge it alone has; a host reconstructing that order would keep a second copy of
+        /// it. Call <c>base</c> for this widget's own regions.
+        /// </para>
+        /// </remarks>
+        public virtual HitResult? HitTestAndDispatch(float x, float y, InputModifier modifiers = InputModifier.None)
             => RegionsAreCurrent ? _tracker.HitTestAndDispatch(x, y, modifiers) : null;
 
         /// <summary>
