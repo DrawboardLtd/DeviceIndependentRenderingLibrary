@@ -9,6 +9,218 @@ this file disagrees with. Bump it there and add the entry here, in the same comm
 Breaking changes carry their migration steps in [MIGRATION.md](MIGRATION.md); this file says what
 changed and why.
 
+## 8.9
+
+`TextTrim.Middle` and `TextFit.TrimMiddleToWidth`: drop the MIDDLE of a run that does not fit,
+ellipsis in the middle, keeping both ends.
+
+The case neither `Start` nor `End` covers, and a path is the canonical one: the root says which
+volume or install this is (a Store package under `WindowsApps`, a dev build under `bin\Debug`) and
+the leaf says which file, while the dozen directories between them are what a reader skips.
+Start-trimming keeps the leaf and throws away the half identifying the install; end-trimming does the
+reverse. A diagnostic panel listing where an app is installed and where it searched for its models
+needs both ends of every line, which is where this came from -- it existed as a private helper inside
+a consumer, which is the same two-copies-of-a-rule mistake the slider primitives had to be walked
+back from.
+
+A cell surface honours it exactly as a pixel surface does, unlike `Shrink`: it is a character-count
+cut, not a scale, so there is nothing to degrade. Console.Lib's `CellLayout` implements the same cut.
+
+`TrimMiddleToWidth` binary-searches the kept-end length rather than walking down from the full run as
+the Start/End case does, because this policy is called from per-FRAME paint paths on runs that can be
+several times too wide; halving is O(log n) either way where the walk is O(n) when a run badly
+overflows. Measured width is not linear in character count on a proportional face, so the search is
+necessary and arithmetic would over- or under-shoot.
+
+## 8.8
+
+`LayoutDamage` answers which rects differ between two painted frames, so a surface can repaint those
+instead of everything. The arranged layout tree is the pixel counterpart to Console.Lib's `CellBuffer`,
+which already paints by diffing -- a clock tick there emits ONE cell rather than repainting the row.
+The measurement that motivated it, from a consumer: repainting a whole window to change one number in
+a status bar costs 8% GPU on an Adreno X1-85 over a 4 Mpix pane, and without damage the only two
+states available are that and zero.
+
+Damage is the SYMMETRIC DIFFERENCE of the two frames' paint signatures, which gets three cases right
+that walking the current frame does not: a node that moved contributes both its old and new bounds,
+one that appeared contributes its new, and one that VANISHED contributes its old. That last is the
+tooltip case, and it is the one that bites -- a dismissed tooltip changes nothing in the current tree,
+so a forward-only diff reports no damage and leaves it painted forever.
+
+Two consequences fall out rather than being written: moving INSIDE a button yields a byte-identical
+tree so nothing repaints, while crossing its edge damages exactly two rects; and the redraw gate
+becomes derivable, since empty damage means do not render.
+
+`PaintSignature` deliberately excludes handlers. `Node` is a record carrying `OnClick`, records compare
+delegates by reference, and trees are rebuilt every frame with fresh lambdas -- so comparing nodes
+would report the whole UI damaged on every frame. Two nodes differing only in which lambda they would
+invoke are pixel-identical, and sizing, padding and alignment are excluded for the same reason: they
+decide the arrangement, and the arrangement is already present as `Bounds`. The background it carries
+is the RESOLVED one, because `HoverBackground` is chosen at paint time and a signature over declared
+properties alone reports no damage on a hover transition -- highlights would silently stop appearing.
+A `TextInput` leaf extracts its state by value (caret, selection anchor, the IME composition run that
+paints over the text, and the placeholder that paints in its place), since `TextInputState` is a
+mutable reference that record equality cannot see into. A `Fill` is opaque -- a painter callback owns
+those pixels -- so `Compute` takes a `fillChanged` predicate.
+
+Damage is deduplicated by rect: a node changing in place appears in BOTH halves of the symmetric
+difference at the same bounds, and emitting it twice scissors two passes over the same pixels, which
+for anything with transparency paints it twice rather than merely costing twice. Changed text is
+exactly that case, so it is the common one, not an edge.
+
+Layout capture is now UNCONDITIONAL, which is the one behaviour change here. It was gated on
+`LayoutInspection.Enabled` for "zero overhead in production", and that cannot stand once the tree is
+what damage diffs against. The cost is one list of structs per widget per frame, accepted deliberately
+against the 8% above. `LayoutInspection` survives as an obsolete no-op rather than being deleted,
+because removing a public type would mean a major bump and a re-pin across four repos for a field
+nothing reads; delete it at the next major.
+
+## 8.7
+
+`FontResolver.ResolveEmojiFont` resolves the platform's colour-emoji face, a third role beside the
+monospace default (`ResolveSystemFont`) and the per-script chain (`ResolveSystemScriptFonts`). Same shape
+as both: an `extra` list is consulted first so a caller can prefer its own bundled asset, and the result is
+an existing path or `""`, never a path that does not exist.
+
+It belongs here for the reason the other two roles do -- "where does this platform keep its emoji font" is
+a property of the platform, not of any one app. Held privately by a consumer it gets copied: TianWen kept
+these tables in its own UI layer and had grown a second copy in a second renderer.
+
+Pair it with `FontFallbackResolver.CanRender` before committing a UI to an emoji mark. An unavailable glyph
+draws NOTHING rather than a placeholder, so a control whose only mark is an emoji loses it silently.
+
+## 8.6
+
+`IconBaker` scales a glyph to fit its mask instead of truncating it. The size passed to `Bake` is an em
+size, and nothing obliges a glyph to keep its ink inside its em box: every emoji in Noto's COLRv1 face
+overruns it by about 15%, and so do the block elements in an ordinary text face. The baker centred that
+oversized raster in the square and dropped whatever fell outside, so every baked mark lost one to two
+pixels off each edge.
+
+The loss was invisible on marks whose extremes are thin -- a sparkle shed a tip nobody could name -- and
+obvious on one bounded by a curve, where a circle acquires a flat top and bottom. A baked globe is what
+gave it away. `Bake` now shrinks its request by the overflow ratio and re-measures until the ink fits,
+which converges in one or two passes; the bounds checks around the emit remain as a backstop for a face
+that defeats the attempt cap.
+
+Baked output therefore CHANGES for any glyph that was overflowing: marks get their full shape at slightly
+smaller ink. Re-bake and commit any generated tables.
+
+## 8.5
+
+Icons can be baked from a font glyph. `IconBaker` turns a glyph into horizontal runs of constant
+coverage, and `PixelWidgetBase.DrawCoverageMask` paints one as a tinted mark.
+
+Three things that buys over drawing the glyph as text at runtime, each of which the text path costs.
+It works where the face is not installed -- an app bundling no emoji font resolves none on a typical
+Linux host, and a missing glyph draws NOTHING rather than a placeholder, so a button's only mark
+silently disappears. It is MONOCHROME, so it takes the ink colour and dims with the label beside it,
+which a COLRv1 colour glyph carrying its own palette structurally cannot. And it is identical
+everywhere, where the text path varies with whichever face the host happened to resolve.
+
+The baking is a LIBRARY API rather than only a build step, because a build-time bake cannot serve
+every case: a theme that turns the whole UI one colour (a night / dark-adaptation mode) wants its
+normally-full-colour emoji as tintable coverage, and which emoji those are is not known until the app
+draws them. Runtime callers should cache per (codepoint, size). `ManagedFontRasterizer` is pure
+managed, so the same font file and inputs give byte-identical output on any host -- which is what lets
+a build pipeline VERIFY a generated file rather than trust it.
+
+Runs rather than a bitmap, so drawing is a loop of rectangle fills and needs no new primitive on the
+renderer seam -- the same reason `IconKind`'s pixel painter is built from rectangles. A 20px mark is
+around 160 runs.
+
+Two details in `DrawCoverageMask` are load-bearing. A run's coverage MODULATES the ink's alpha rather
+than replacing it, which is what makes a baked mark dim exactly as its label does. And row and column
+edges are snapped to whole pixels rather than passed through as floats, because `FillRect` truncates
+its rect to int: a scaled row of height 0.97 rounds to nothing and leaves gaps through the mark.
+Snapping each edge and taking the difference makes consecutive rows tile by construction, at any
+scale.
+
+A test caught a real bug in the quantisation. The obvious `alpha * levels / 256` maps to
+`0..levels-1`, so the faintest bucket of every antialiased edge was discarded as uncovered and marks
+came out slightly thin, invisibly; at one level EVERY pixel landed in bucket 0 and the whole mark
+disappeared. The top bucket is also a full 255 rather than a bucket centre, which is not cosmetic --
+an interior pixel is fully covered, and 223 makes the whole mark read visibly greyer than the text
+beside it.
+
+**New tool: `DIR.Lib.IconBaker`**, consumed via `dnx DIR.Lib.IconBaker`. A thin wrapper that owns the
+generated-file format and the argument parsing while `IconBaker` owns the baking. It ships from this
+repo rather than from a consumer so that a second app with icons to bake takes it off the feed instead
+of vendoring a copy of the generator. Everything about WHICH glyphs is an argument.
+
+    bake-icons --font <path> --out <file.g.cs> --namespace <ns> --glyph Name=U+1F300
+               [--class BakedIcons] [--sizes 13,16,20] [--levels 4] [--access internal]
+
+Bake the DPI scales that matter, not round numbers. A run is a row of PIXELS, so scaling a mask either
+overlaps rows or opens gaps between them; `IconBaker.NearestSize` picks the closest bake so the
+residual scale stays near 1. The default ladder is one size per common DPI scale for a 13-unit mark,
+which keeps every one of them within about 2%; a ladder of pretty numbers left 1.75x resampling by 14%
+and 2.5x by 25%. Each extra size costs around 200 runs, so closing those gaps is nearly free.
+
+Baking redistributes GLYPH SHAPES, so point the tool at a face whose licence permits it (Noto is OFL).
+A proprietary system face is not a valid bake source, and a runtime emoji probe legitimately falling
+back to one does not make its outlines redistributable.
+
+## 8.4
+
+BackgroundTaskTracker grows two shapes it could not hold. `Run` and `RunGuarded` fit work that is
+started and forgotten; what did not fit was work that is SUPERSEDED, and work that returns a VALUE.
+Every consumer had hand-rolled both in a private field.
+
+`RunExclusive(key, ...)` is the first: starting work under a key cancels whatever was running under
+it. That is the right model when the old result is not merely unwanted but about to be WRONG -- a
+second file opened while the first is still loading, star detection restarted because the image was
+replaced. The token is linked to the caller's own, so shutdown cancels it too and no call site
+composes that itself. `IsRunning` and `Cancel` answer for a key, and `DrainAsync` now cancels keyed
+work before awaiting it, so a shutdown neither sits through a load nobody is waiting for nor
+abandons work still touching state.
+
+`RunExclusive<TResult>` plus `TryCollect<TResult>` is the second. The result is PULLED by the
+consumer rather than pushed into a callback, so it is adopted on whichever thread is entitled to
+adopt it -- for a UI that is the render thread, on the frame of its choosing. A callback would
+deliver it on the pool, which is exactly where a render-thread-owned field must not be written.
+`TryCollect` retires the slot whether or not there was a result: a run that cancelled or threw has
+nothing to hand over, and an occupied slot would wedge the key against its next use. Reference types
+only, because for a value type the "nothing to report" answer would be `Nullable<T>`, a different
+runtime type from the one the work produced, and `TryCollect` would stop recognising it. A
+superseded slot is cancelled but not DISPOSED until its task actually ends -- the outgoing work
+still holds the token, and disposing the source out from under it turns an orderly supersede into an
+`ObjectDisposedException`.
+
+`DockLayout<T>.Dock` clamps to what is left. It clamped nothing, so an over-large requested extent
+did two invisible things at once: a Right strip resolves its x as `Right - size`, so it walked LEFT
+past the container origin and painted over its own siblings, and the fill rect was handed the
+negative leftover. Neither half reads as "does not fit" at the call site, which is why it survived --
+everything still looks drawn. Measured in a FITS viewer whose info panel is a Right strip inside the
+second pane of a Split: at surface width 733 the panel arranged at x=283 w=450 inside a parent
+starting at 459, straight over the split divider, and the image pane came out w=-176. The divider
+painted, stated a resize cursor, and could not be pressed at all, which reads as a dead handle
+rather than as a layout overrun.
+
+`CompositeWidget<TSurface>` lets a widget that paints OTHER widgets state its children once, in
+paint order, with `HitTest`, `HitTestAndDispatch`, `HitTestCursor`, `GetRegisteredTextInputs` and the
+new `PaintedRegions` all derived from that one statement. A child's regions live on the CHILD, so a
+host asking only the composite missed every control its children registered: nothing throws, the
+pixels are right, and the controls simply stop answering.
+
+The tab strip becomes a Layout tree. `TabStripTree.Build` describes it as `Layout.Node`,
+`TabStripMetrics` carries what differs between surfaces (pixels vs whole cells), and two policies
+carry the rest -- `TabStripOverflow { Clip, Drop }` and `TabLabelDecoration`. Drop exists because a
+clipped tab leaves a region that is hit but not VISIBLE, so a press lands on something the reader
+cannot see; decoration exists because a terminal's active plate is a bet on the reader's palette, and
+on a monochrome one the brackets are all that says which tab is active. `TabBar` now paints that
+shared tree, its 69 geometry tests passing unchanged.
+
+`TabBarColors.HoverBackground` (nullable, null meaning `ActiveBackground`) adds a third plate tone,
+for the case the old reasoning did not survive: a strip drawing NO accent renders hover and active
+identically and stops being able to say which tab a click would take you to. `CanCloseTabs` and
+`CanReorderTabs` both default true; closing off also stops RESERVING the box, so tabs are narrower by
+it rather than holding a gap where the control would have been.
+
+`IconKind.Plus` and `IconKind.Minus`, because a stepper is `[-] value [+]` and a terminal has plenty
+of those. Both are built from rectangles: a typeset `+` is drawn by whichever face the host resolved,
+at that face's stroke weight, sitting on the text baseline rather than centred in its box.
+
 ## 8.3
 
 The strip attaches to any edge, and a nav rail is the same widget. TabStripSide { Top, Bottom, Left,

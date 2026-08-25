@@ -53,10 +53,13 @@ namespace DIR.Lib
         // on purpose: a selectable-text rect must never shadow a button's click hit-test.
         private readonly List<SelectableTextRegion> _selectableText = [];
 
-        // DEBUG-inspector capture of the arranged layout painted this frame. Null until
-        // LayoutInspection is enabled (zero overhead in production); mirrors _tracker -- cleared in
-        // BeginFrame, appended in PaintLayout, read by the inspector's describe_layout. Render-thread
-        // only, like the region tracker.
+        // The arranged layout painted this frame. Retained UNCONDITIONALLY: it is what damage-based
+        // repaint diffs against the previous frame, so it is load-bearing rather than a debug aid, and
+        // a flag saying whether we have it would be a fact stated twice. It costs one list of structs
+        // per widget per frame, which is the trade made deliberately -- a repaint that touches only the
+        // rects that changed is worth far more than this allocation (measured: 8% GPU for a full-window
+        // repaint of a 4 Mpix pane to update one status-bar number).
+        // Mirrors _tracker: cleared in BeginFrame, appended in PaintLayout. Render-thread only.
         private List<Layout.ArrangedNode<float>>? _capturedLayout;
 
         protected Renderer<TSurface> Renderer { get; } = renderer;
@@ -793,9 +796,9 @@ namespace DIR.Lib
         /// <summary>
         /// Returns the arranged <see cref="Layout.ArrangedNode{T}"/> nodes this widget painted via the
         /// layout DSL since the last <c>BeginFrame</c> (each carries its tree <see cref="Layout.ArrangedNode{T}.Depth"/>),
-        /// or empty when <see cref="LayoutInspection"/> is disabled or the widget draws without the
-        /// layout DSL. Used by the DEBUG inspector's describe_layout to surface the full layout tree
-        /// (not just the clickable subset). Render-thread only, read inside the inspector pump.
+        /// or empty when the widget draws without the layout DSL. Read by damage-based repaint to diff
+        /// against the previous frame, and by the DEBUG inspector's describe_layout to surface the full
+        /// tree (not just the clickable subset). Render-thread only.
         /// </summary>
         public IReadOnlyList<Layout.ArrangedNode<float>> GetCapturedLayout()
             => RegionsAreCurrent && _capturedLayout is { } captured ? captured : [];
@@ -1168,13 +1171,11 @@ namespace DIR.Lib
                 }
             }
 
-            // Retain the arranged tree for the DEBUG inspector's describe_layout. Opt-in (null unless
-            // LayoutInspection is on) so production paints pay nothing; appended across the frame's
-            // multiple PaintLayout calls, exactly like the region tracker.
-            if (LayoutInspection.Enabled)
-            {
-                (_capturedLayout ??= []).AddRange(arranged);
-            }
+            // Retain the arranged tree, always: damage-based repaint diffs it against the previous
+            // frame to decide which rects need painting at all, so this is not a debug aid that can be
+            // switched off. Appended across the frame's multiple PaintLayout calls, like the region
+            // tracker.
+            (_capturedLayout ??= []).AddRange(arranged);
         }
 
         /// <summary>
@@ -1238,6 +1239,47 @@ namespace DIR.Lib
             else
             {
                 Renderer.FillRectangle(rect, color);
+            }
+        }
+
+        /// <summary>
+        /// Draws a baked glyph coverage mask (see <see cref="IconBaker"/>) as a tinted mark.
+        /// </summary>
+        /// <remarks>
+        /// <para>The one place a baked icon is painted, so every host gets the same result instead of
+        /// re-implementing the loop. The run's own coverage MODULATES the ink's alpha rather than replacing
+        /// it, which is what makes a baked mark dim exactly as the label beside it does -- the property a
+        /// colour-emoji glyph cannot have.</para>
+        /// <para>Row and column boundaries are SNAPPED to whole pixels rather than passed through as
+        /// floats, and that is load-bearing: <see cref="FillRect"/> truncates its rect to int, so a scaled
+        /// row of height 0.97 can round to zero height and vanish, leaving gaps through the mark. Snapping
+        /// each edge and taking the difference makes consecutive rows tile by construction, whatever the
+        /// scale.</para>
+        /// </remarks>
+        /// <param name="mask">The baked coverage, at whatever size it was baked.</param>
+        /// <param name="x">Left edge of the square to draw into, in surface pixels.</param>
+        /// <param name="y">Top edge of the square to draw into, in surface pixels.</param>
+        /// <param name="size">Edge of that square. The mask is scaled to it.</param>
+        /// <param name="ink">The colour to tint with; its alpha scales the whole mark.</param>
+        protected void DrawCoverageMask(in IconBaker.CoverageMask mask, float x, float y, float size,
+            RGBAColor32 ink)
+        {
+            if (mask.IsEmpty || size <= 0f || mask.Size <= 0)
+            {
+                return;
+            }
+
+            var scale = size / mask.Size;
+            foreach (var run in mask.Runs)
+            {
+                var x0 = MathF.Round(x + (run.X * scale));
+                var x1 = MathF.Round(x + ((run.X + run.Width) * scale));
+                var y0 = MathF.Round(y + (run.Y * scale));
+                var y1 = MathF.Round(y + ((run.Y + 1) * scale));
+
+                var alpha = (byte)(ink.Alpha * run.Alpha / 255);
+                FillRect(x0, y0, MathF.Max(1f, x1 - x0), MathF.Max(1f, y1 - y0),
+                    new RGBAColor32(ink.Red, ink.Green, ink.Blue, alpha));
             }
         }
 
