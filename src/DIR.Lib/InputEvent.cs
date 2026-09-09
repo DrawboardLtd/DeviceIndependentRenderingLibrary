@@ -1,4 +1,4 @@
-namespace DIR.Lib;
+﻿namespace DIR.Lib;
 
 /// <summary>
 /// Platform-agnostic mouse button identifiers.
@@ -33,7 +33,48 @@ public enum PinchSource
 public abstract record InputEvent
 {
     /// <summary>Key press event.</summary>
-    public sealed record KeyDown(InputKey Key, InputModifier Modifiers = default) : InputEvent;
+    public sealed record KeyDown(InputKey Key, InputModifier Modifiers = default) : InputEvent
+    {
+        /// <summary>
+        /// True when this is the OS auto-repeating a key that is still held, rather than a fresh press.
+        /// <para>
+        /// A TOGGLE has to ignore repeats: held down, it flips at the repeat rate, which reads as the
+        /// action starting and stopping several times a second rather than as one press. A STEP wants
+        /// every one of them, since repeating a step is what auto-repeat is for. Only the host can tell
+        /// the two events apart, which is why the fact travels on the event rather than being inferred
+        /// by a consumer holding its own key-down set.
+        /// </para>
+        /// <para>
+        /// An init-only property rather than a third positional parameter, for the reason
+        /// <see cref="Pinch"/> states: consumers match this record as <c>KeyDown(var key, var mods)</c> in
+        /// dozens of places, and a third element would break every one. A host with no repeat information
+        /// (a synthetic press, a console loop) leaves it false, which is the truthful answer for a press
+        /// it generated once.
+        /// </para>
+        /// </summary>
+        public bool Repeat { get; init; }
+    }
+
+    /// <summary>
+    /// A key being RELEASED. The other half of <see cref="KeyDown"/>, for an action that lasts exactly as
+    /// long as the key is held.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Most bindings need only the press: a toggle, a step, a command. This exists for the ones whose
+    /// meaning is "while held" rather than "on press": hold to pause a running comparison, hold to
+    /// reveal an alternate reading, hold to nudge continuously. Without it a consumer can only guess a
+    /// release from a timer or from the absence of a repeat, and both are wrong the moment the window
+    /// loses focus mid-hold.
+    /// </para>
+    /// <para>
+    /// It is a separate record rather than a flag on <see cref="KeyDown"/> because every existing consumer
+    /// matches <c>KeyDown</c> to mean "a press happened", and a release arriving through that same type
+    /// would fire all of them a second time. A host that has no release information simply never sends
+    /// one, and every consumer that does not match it is unaffected.
+    /// </para>
+    /// </remarks>
+    public sealed record KeyUp(InputKey Key, InputModifier Modifiers = default) : InputEvent;
 
     /// <summary>Character input (from IME or text composition).</summary>
     public sealed record TextInput(string Text) : InputEvent;
