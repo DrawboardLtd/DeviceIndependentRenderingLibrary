@@ -9,6 +9,81 @@ this file disagrees with. Bump it there and add the entry here, in the same comm
 Breaking changes carry their migration steps in [MIGRATION.md](MIGRATION.md); this file says what
 changed and why.
 
+## 8.17
+
+Takes SharpAstro.Fonts 1.12, where a font can no longer take the process down with it.
+
+TrueType's `CALL` and `LOOPCALL` run a function body by recursing the hinting interpreter, and nothing
+bounded the nesting. A font is free to define a function that calls itself, and one embedded in a PDF
+does: it recursed about 600 frames deep and exhausted the machine stack. 1.12 caps the nesting at 128
+frames and abandons the glyph program when it is exceeded, so the glyph falls back to its unhinted
+outline — which is what FreeType does with the same input.
+
+This is a crash fix, not a rendering difference a caller gets to weigh up. A .NET stack overflow is
+not a catchable exception: the process died with no exception and no stack trace, so no amount of
+defensive catching above the interpreter could have helped. It is reachable from any hinted
+rasterization of such a face, which for a library whose callers render fonts embedded in arbitrary
+documents means it is reachable from untrusted input.
+
+## 8.16
+
+`FloatingPalette` — a floating, grip-dragged, collapsible palette of toggle rows, as a `Layout.Node`
+tree plus the pure rules around it (`FloatingPaletteState`, `PaletteItem`, `PaletteColors`).
+
+Hoisted out of two independent implementations of the same panel — a PDF viewer's tool palette and an
+astronomy app's sky-map layer panel — which had already diverged on exactly the parts that are easy
+to get wrong. Those are what this pins:
+
+- **The clamp reconciliation.** `Anchored` clamps a panel into its rect, so the consumer-owned
+  `offsetAlong` and the drawn position diverge wherever the clamp bites, and that stays invisible
+  until the panel's HEIGHT changes: collapse it, the clamp stops binding, and the title bar jumps to
+  the stale offset. `FloatingPaletteState.NoteArranged` writes the drawn offset back every frame,
+  which is the only thing that keeps the two from disagreeing.
+- **A collapsed panel recedes far less than an expanded one** (0.85 against 0.40). Rolled up, the
+  title bar IS the panel, so the expanded floor fades the only thing left of it.
+- **A collapsed bar still carries state** — `LAYERS 7/10`, not just a name.
+- **A grip drag has nothing but successive presses and the last pointer position to work with**, so
+  `PressGrip` times its own double-click. A host that dispatches a widget's clickable regions from
+  the mouse-DOWN hands those callbacks the modifiers and nothing else: no position, no click count.
+- **An unavailable row is drawn and dimmed, never dropped.** A row that comes and goes moves every
+  row under it, and an absent row says nothing about why the thing is unavailable.
+
+Drawing stays the consumer's: `Build` returns a tree and touches no surface, so a palette's geometry
+and its click bindings are testable with a stub measure context and no GPU.
+
+## 8.15
+
+**A pictograph is drawn from the emoji face even where the text face covers it.** `FontFallbackResolver`
+asked one question, "who covers this codepoint", and answered it in role order, so a text face that
+happens to carry a pictograph outline won by position. U+2615 HOT BEVERAGE is the case that found it:
+DejaVu Sans has a real 428-byte glyph for it, so a coffee cup beside a label came out as a small
+monochrome cup while every browser draws the colour emoji, and the app's own emoji face was never
+consulted. Unicode already records which of the two a codepoint is FOR (`Emoji_Presentation`, UTS #51),
+and `TryResolveFont` asks that first now: a rune whose default presentation is emoji resolves to the
+declared `EmojiFontPath` where that face covers it, and to the primary otherwise. `PrimaryCoversAll`
+answers the same question, or the fast path would draw the line in one face and undo it.
+
+Narrow in three deliberate ways. It applies only to a resolver built by `FromRoles`, since a bare
+fallback list declares no roles and an existing caller's answers are byte-identical. It can never lose a
+glyph: a declared face that lacks the rune is skipped. And the property itself is narrow, which is the
+point -- the marks a UI already draws are text-default and do not move (U+2713 and U+2714 check marks,
+U+2605 star, U+26A0 warning sign, U+2744 snowflake, the arrows and triangles), while what flips is the
+set always meant to be a pictograph (U+2615, U+2705, U+274C, U+26C5, U+2B50, and essentially everything
+above U+1F000). Measured over the 73 distinct non-ASCII codepoints in one consumer's four UI projects:
+exactly ONE changes face (the coffee cup), and seventeen more are emoji by default but absent from the
+text face, so they already came from the emoji face and are unaffected.
+
+**`EmojiPresentation`** is that Unicode property, public: `IsDefaultFor(Rune)` / `IsDefaultFor(int)` over
+a table generated from the Unicode Character Database by `tools/gen-emoji-presentation` (81 merged ranges
+over 1219 codepoints, emoji-data 17.0). Generated rather than hand-written because a missing range is
+invisible -- it leaves a pictograph drawn from the text face, which reads as a font choice rather than a
+bug -- and because the set grows with every Unicode release. Explicit presentation selectors (U+FE0F /
+U+FE0E) are still not honoured: those are a property of a SEQUENCE, and this asks about one codepoint.
+
+Pinned by `EmojiPresentationTests` (the table's shape, the binary search against a linear scan over every
+codepoint it could claim, and both halves of the line) plus five `FontFallbackResolverTests`, two of which
+fail with the rule removed while the twenty older ones stay green.
+
 ## 8.14
 
 **A selection no longer hides the text it selects.** `TextInputRenderer` drew the run and then filled the
