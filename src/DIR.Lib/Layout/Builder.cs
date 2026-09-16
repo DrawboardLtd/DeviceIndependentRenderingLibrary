@@ -69,18 +69,41 @@ public static class Builder
     /// case); <paramref name="widthSample"/> only decides anything under <c>Auto</c>.
     /// </para>
     /// </summary>
+    /// <param name="focusOnOpen">Ask for the keyboard when this field first appears, without taking it off
+    /// a field already being typed in -- see <see cref="Content.TextInput.FocusOnOpen"/>.</param>
     public static Node TextInput(TextInputState state, float fontSize = 14f,
-        TextInputColors? colors = null, string? widthSample = null, IconKind? leadingIcon = null)
+        TextInputColors? colors = null, string? widthSample = null, IconKind? leadingIcon = null,
+        bool focusOnOpen = false)
         => new Node.Leaf(new Content.TextInput(state, fontSize)
         {
             Colors = colors,
             WidthSample = widthSample,
             LeadingIcon = leadingIcon,
+            FocusOnOpen = focusOnOpen,
         });
 
     /// <summary>An app-drawn escape-hatch leaf (chart/sky map). Pair with <c>Star</c> sizing to fill; set <paramref name="key"/> to route multiple fills. A text field has its own <see cref="TextInput"/> factory.</summary>
     public static Node Fill(float minWidth = 0f, float minHeight = 0f, string? key = null)
         => new Node.Leaf(new Content.Fill(minWidth, minHeight, key));
+
+    /// <summary>
+    /// A draggable value in a range: <c>Builder.Slider(state)</c> is the whole declaration, and the
+    /// painter takes care of drawing it (through the one shared track/fill/handle implementation),
+    /// registering its <see cref="HitResult.SliderStateHit"/> and arming its own drag. See
+    /// <see cref="Content.Slider"/>.
+    /// <para>
+    /// <c>Star</c> width by default, unlike <see cref="TextInput"/>: a slider almost always fills the row
+    /// it sits in and has no placeholder-shaped content to shrink to under <c>Auto</c> the way a field
+    /// does.
+    /// </para>
+    /// </summary>
+    public static Node Slider(SliderState state, RGBAColor32? fillColor = null, TrackSliderChrome? chrome = null)
+        => new Node.Leaf(new Content.Slider(state)
+        {
+            FillColor = fillColor ?? new RGBAColor32(0xff, 0xff, 0xff, 0xff),
+            Chrome = chrome ?? new TrackSliderChrome(new RGBAColor32(0x40, 0x40, 0x40, 0xff), new RGBAColor32(0xff, 0xff, 0xff, 0xff)),
+        })
+        { Width = Sizing.Star() };
 
     /// <summary>A transparent zero-intrinsic box -- a pure spacer; size it with <c>.ColW()</c> / <c>.HFixed()</c> / a <c>Star</c> weight.</summary>
     public static Node Spacer() => new Node.Leaf(new Content.Box(0f, 0f));
@@ -120,6 +143,139 @@ public static class Builder
     public static Node Anchored(Node child, DockSide? side = null,
         float offsetAlong = 0f, float offsetAcross = 0f, float margin = 0f, bool clamp = true)
         => new Node.Anchored(child, side, offsetAlong, offsetAcross, margin, clamp);
+
+    /// <summary>
+    /// A floating child placed just OUTSIDE <paramref name="side"/> of <paramref name="anchor"/>, still
+    /// clamped inside the node it floats in. The shape a menu, a tooltip or a popover wants: beside the
+    /// thing that opened it, and on screen.
+    /// </summary>
+    /// <remarks>
+    /// A separate method rather than another optional parameter on <see cref="Anchored"/>, because an
+    /// optional parameter added to an existing method changes the signature a compiled caller binds to, the
+    /// same trap the records here carry explicit old-arity members for. A new name is always safe.
+    /// </remarks>
+    public static Node AnchoredTo(RectF32 anchor, Node child, DockSide? side = DockSide.Bottom,
+        float offsetAlong = 0f, float offsetAcross = 0f, float margin = 0f, bool clamp = true)
+        => new Node.Anchored(child, side, offsetAlong, offsetAcross, margin, clamp, anchor);
+
+    /// <summary>
+    /// A popover: <paramref name="content"/> floated beside <paramref name="anchor"/> over a full-bleed
+    /// backdrop that closes it, displayed only while <paramref name="state"/> is open.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>This is the whole five-obligation checklist in one call.</b> The flag, the backdrop that dismisses
+    /// it, the placement, the Escape route and the host dispatcher line are what a hand-written popover cost,
+    /// and forgetting one of them is invisible (see <see cref="PopoverState"/>). Here the painter honours the
+    /// open state, the backdrop is part of the tree, the placement is the engine's, and the keyboard claim
+    /// happens by being painted.
+    /// </para>
+    /// <para>
+    /// The backdrop takes a <see cref="HitResult.ChromeHit"/> and closes on click. It is a real node rather
+    /// than an invisible rule so that a click anywhere outside the content is CONSUMED as well as dismissing:
+    /// without it, dismissing and whatever sat under the pointer would both fire, which is the behaviour
+    /// people read as "it closed and then did something I did not ask for". A null
+    /// <paramref name="backdrop"/> leaves it unpainted, still present, and still dismissing.
+    /// </para>
+    /// </remarks>
+    public static Node Popover(RectF32 anchor, Node content, PopoverState state,
+        DockSide side = DockSide.Bottom, RGBAColor32? backdrop = null)
+    {
+        var scrim = Spacer().Stretch().Clickable(new HitResult.ChromeHit(), _ => state.Close());
+        if (backdrop is { } colour)
+        {
+            scrim = scrim.Bg(colour);
+        }
+
+        return Overlay(scrim, AnchoredTo(anchor, content, side)) with { Popover = state };
+    }
+
+    /// <summary>
+    /// A dropdown menu: <paramref name="state"/>'s entries as a list floated beside
+    /// <paramref name="anchor"/>, on the popover the engine already owns.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>This adds no mechanism.</b> Every behaviour a menu needs is already on the node: the backdrop and
+    /// the Escape claim come from <see cref="Popover"/>, a disabled row is <see cref="Node.Disabled(string)"/>
+    /// (dimmed, press swallowed with <see cref="CursorKind.NotAllowed"/>, the reason as its tooltip), the
+    /// highlight is <see cref="Node.BgHover"/>, the overflow is <see cref="Node.WithScroll"/>. What was
+    /// missing was a node to know them ON -- <c>PixelWidgetBase.RenderDropdownMenu</c> knows all of it
+    /// inside a ten-parameter method carrying the obligation "must be called LAST in the render pass",
+    /// and a caller who gets that order wrong gets a menu that paints under the chrome it belongs to and
+    /// loses its clicks, with nothing to say so.
+    /// </para>
+    /// <para>
+    /// <b>The anchor is the trigger's arranged rect, not remembered geometry.</b> The rendered path carries
+    /// <c>AnchorX</c>/<c>AnchorY</c>/<c>AnchorWidth</c> captured at the moment the menu opened, so a menu
+    /// still open across a resize hangs where the button used to be. Here placement is the engine's, and it
+    /// is re-measured with everything else.
+    /// </para>
+    /// <para>
+    /// Opening one from a button is <c>.Clickable(hit, _ =&gt; state.Popover.Toggle())</c> on the button node.
+    /// There is no dispatcher line to add and none to forget.
+    /// </para>
+    /// </remarks>
+    public static Node Dropdown<T>(RectF32 anchor, DropdownMenuState<T> state,
+        float fontSize = 14f, RGBAColor32? textColor = null, RGBAColor32? background = null,
+        RGBAColor32? highlight = null, RGBAColor32? backdrop = null,
+        float maxHeight = 0f, DockSide side = DockSide.Bottom)
+    {
+        var rowHeight = fontSize * 1.8f;
+        var rowPadding = fontSize * 0.5f;
+
+        var rows = new Node[state.Items.Length];
+        for (var i = 0; i < state.Items.Length; i++)
+        {
+            var item = state.Items[i];
+            // Captured per row. Closing over the loop variable itself would hand every row the final index.
+            var index = i;
+
+            // EVERY row declares its hit and its handler, disabled or not. .Disabled() strips the
+            // handler and marks the region; it does not create one. A disabled row declared without a hit
+            // would register nothing, so the press would fall through to the backdrop and CLOSE the menu --
+            // which reads as "it took my click and did nothing", the precise dead-end the disabled state
+            // exists to remove. TrySelect refuses a disabled index anyway, so the swallow is the point.
+            var row = Text(item.Label, fontSize, textColor)
+                .RowH(rowHeight)
+                .PadX(rowPadding)
+                .Clickable(new HitResult.ListItemHit(DropdownMenuState<T>.ListId, index),
+                    _ => state.TrySelect(index));
+
+            if (item.IsEnabled)
+            {
+                if (highlight is { } hoverColour)
+                {
+                    row = row.BgHover(hoverColour);
+                }
+
+                if (item.Tooltip is { Length: > 0 } tooltip)
+                {
+                    row = row.WithTooltip(tooltip);
+                }
+            }
+            else
+            {
+                row = row.Disabled(item.Tooltip ?? string.Empty);
+            }
+
+            rows[i] = row;
+        }
+
+        var list = VStack(rows).W(Sizing.Fixed(anchor.Size.X)).WithScroll(state.Scroll);
+
+        if (maxHeight > 0f)
+        {
+            list = list.HClamp(0f, maxHeight);
+        }
+
+        if (background is { } menuColour)
+        {
+            list = list.Bg(menuColour);
+        }
+
+        return Popover(anchor, list, state.Popover, side, backdrop);
+    }
 
     /// <summary>Two resizable panes plus a draggable divider; <paramref name="firstExtent"/> is consumer-owned state. See <see cref="Node.Split"/>.</summary>
     public static Node Split(Node first, Node second, Axis axis = Axis.Horizontal,
