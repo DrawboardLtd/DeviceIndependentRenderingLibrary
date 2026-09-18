@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 
 namespace DIR.Lib;
@@ -78,7 +78,6 @@ public sealed class InputRouter(WindowUiSettings ui, BackgroundTaskTracker track
     private InputModifier _captureModifiers;
 
     private (float X, float Y)? _pointer;
-    private Layout.Node? _hoverNode;
     private TooltipRequest? _tooltip;
     private DateTimeOffset _tooltipSince;
     private bool _tooltipAnnounced;
@@ -356,6 +355,7 @@ public sealed class InputRouter(WindowUiSettings ui, BackgroundTaskTracker track
 
     private bool HandleMouseMove(InputEvent.MouseMove move)
     {
+        var from = _pointer;
         _pointer = (move.X, move.Y);
 
         // A gesture in flight owns every move until the button comes up, and it is told the button and
@@ -376,7 +376,7 @@ public sealed class InputRouter(WindowUiSettings ui, BackgroundTaskTracker track
 
         // Motion is not a reason to draw a frame by itself. It is a reason when it changed something the
         // frame shows, which is a lit background or a tooltip, and those are the two the router can see.
-        if (NoteHover(move.X, move.Y))
+        if (NoteHover(from, move.X, move.Y))
         {
             requestRedraw();
         }
@@ -425,12 +425,17 @@ public sealed class InputRouter(WindowUiSettings ui, BackgroundTaskTracker track
     private bool HandleKeyDown(InputEvent.KeyDown key)
     {
         // An overlay that is on screen owns the keyboard: Escape closes a popover before anything else
-        // reads the key. A claimant that is no longer displayed declines, which is what makes the
-        // never-cleared slot harmless.
-        if (ui.KeyboardClaimant?.HandleKeyDown(key.Key) == true)
+        // reads the key. Topmost first, which is the LAST one painted -- so a modal over a popover takes
+        // the key, and dismissing it gives the keyboard back to the one underneath on the next frame,
+        // that one still being painted while the closed one is not.
+        var popovers = ui.PaintedPopovers;
+        for (var i = popovers.Count - 1; i >= 0; i--)
         {
-            requestRedraw();
-            return true;
+            if (popovers[i].HandleKeyDown(key.Key))
+            {
+                requestRedraw();
+                return true;
+            }
         }
 
         var chord = new KeyChord(key.Key, key.Modifiers);
@@ -632,15 +637,23 @@ public sealed class InputRouter(WindowUiSettings ui, BackgroundTaskTracker track
     // ---- hover ------------------------------------------------------------------------------
 
     /// <summary>
-    /// Records what the pointer is now over, and answers whether the frame would look different for it:
-    /// a node whose <see cref="Layout.Node.HoverBackground"/> lights, or a region whose tooltip is now the
-    /// one being waited on.
+    /// Answers whether a move from <paramref name="from"/> to (<paramref name="x"/>, <paramref name="y"/>)
+    /// changes what the frame would show: a different node whose <see cref="Layout.Node.HoverBackground"/>
+    /// lights, or a region whose tooltip is now the one being waited on.
     /// </summary>
-    private bool NoteHover(float x, float y)
+    /// <remarks>
+    /// BOTH ends of the move are resolved against the frame on screen and compared by reference, which is
+    /// sound because both come from that one frame. It used to compare the node under the new position with
+    /// one REMEMBERED from an earlier move; a host builds its tree afresh every paint, so after any repaint
+    /// the remembered node was an object no longer on screen, the two never matched, and every move over a
+    /// lit control asked for a whole frame, whose paint made the next move ask again.
+    /// </remarks>
+    private bool NoteHover((float X, float Y)? from, float x, float y)
     {
-        var node = ResolveHoverNode(x, y);
-        var changed = !ReferenceEquals(node, _hoverNode);
-        _hoverNode = node;
+        var lit = ResolveHoverNode(x, y);
+        var changed = from is { } previous
+            ? !ReferenceEquals(ResolveHoverNode(previous.X, previous.Y), lit)
+            : lit is not null;
 
         var target = ResolveTooltip(x, y);
         if (target != _tooltip)

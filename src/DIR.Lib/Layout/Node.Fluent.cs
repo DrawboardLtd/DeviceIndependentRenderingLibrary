@@ -154,6 +154,13 @@ public abstract partial record Node
     public Node WithShortcut(InputKey key, InputModifier mods = InputModifier.None)
         => this with { Shortcut = new KeyChord(key, mods) };
 
+    /// <summary>
+    /// <inheritdoc cref="WithShortcut(InputKey, InputModifier)" path="/summary"/>
+    /// <para>The <see cref="KeyChord"/> form, for a caller that already HAS one -- a tab or a menu item
+    /// that carries its binding -- so the chord is not taken apart and rebuilt to be passed on.</para>
+    /// </summary>
+    public Node WithShortcut(KeyChord chord) => this with { Shortcut = chord };
+
     /// <summary>States the pointer's appearance over this node without making it a click target — a
     /// panel's card saying "arrow here", so nothing inside it has to repeat the claim. Named apart from
     /// the <see cref="Node.Cursor"/> property it sets, which a same-named method cannot shadow.</summary>
@@ -177,6 +184,31 @@ public abstract partial record Node
 
     /// <summary>Set the between-lines gap on a <see cref="Wrap"/>; no-op on any other node.</summary>
     public Node WithLineGap(float lineGap) => this is Wrap w ? w with { LineGap = lineGap } : this;
+
+    /// <summary>
+    /// Main-axis extent the FIRST line of a <see cref="Wrap"/> must leave free; later lines run the full
+    /// extent. No-op on any other node.
+    /// </summary>
+    /// <remarks>
+    /// Flow around a floated corner item. A <see cref="Dock"/> reserves its strip on every line, which
+    /// narrows the wrapped rows too; this reserves it on the first line only. See
+    /// <see cref="Wrap.FirstLineReserve"/>.
+    /// </remarks>
+    public Node WithFirstLineReserve(float reserve)
+        => this is Wrap wr ? wr with { FirstLineReserve = reserve } : this;
+
+    /// <summary>
+    /// Extra main-axis space before this child in a flow, suppressed when it starts a line. See
+    /// <see cref="LeadingGap"/>.
+    /// </summary>
+    public Node WithLeadingGap(float gap) => this with { LeadingGap = gap };
+
+    /// <summary>
+    /// Most lines a <see cref="Wrap"/> may use; children beyond them are dropped entirely. No-op on any
+    /// other node. See <see cref="Wrap.MaxLines"/>.
+    /// </summary>
+    public Node WithMaxLines(int maxLines)
+        => this is Wrap wml ? wml with { MaxLines = maxLines } : this;
 
     /// <summary>Set the row/column gaps on a <see cref="Grid"/>; no-op on any other node.</summary>
     public Node WithGaps(float rowGap, float columnGap) => this is Grid g ? g with { RowGap = rowGap, ColumnGap = columnGap } : this;

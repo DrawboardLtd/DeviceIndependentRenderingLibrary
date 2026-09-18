@@ -9,6 +9,136 @@ this file disagrees with. Bump it there and add the entry here, in the same comm
 Breaking changes carry their migration steps in [MIGRATION.md](MIGRATION.md); this file says what
 changed and why.
 
+## 10.1
+
+**A colour glyph fades with the text it is drawn in, on the CPU renderer too.** `RgbaImageRenderer` blitted
+COLR/CBDT glyphs exactly as rasterised and ignored the ink's alpha, so an emoji inside a label drawn at half
+alpha stayed at full strength, while SdlVulkan.Renderer's `tex.frag` already multiplies a colour glyph's alpha
+by the draw colour's (`pc.color.a * texel.a`). `DrawText` and `DrawGlyphBitmap` now pass the ink's alpha; the
+glyph still keeps its own RGB and is never tinted. Additive: `RgbaImage.BlitRgba` gains an overload taking an
+`opacity` byte (a new overload, not an optional parameter, which would have been a binary break), and the
+original five-argument form is byte-identical to `opacity: 255`. Pinned by `ColourGlyphOpacityTests`, which fail
+against the old blit.
+
+## 10.0
+
+**The cuts.** Seven things the 9.x line kept alive for consumers that have since stopped using them.
+Every one is a DELETION, each replaced by something that shipped in 9.2 or later, and the consumer diff
+across Console.Lib, SdlVulkan.Renderer, WebGl.Renderer and tianwen is deletions too -- the adoption ran
+first, and the count that gated this release was "zero production uses", checked by RECEIVER rather than
+by name (`ViewContexts.Activate` and `sdlWindow.Activate` are not `TextInputState.Activate`, and counting
+by name gets that wrong in both directions).
+
+Migration steps: [MIGRATION.md](MIGRATION.md).
+
+- **`IPixelWidget.HitTestAndDispatch` retired; `HitTest` stays.** A widget that hit-tests AND runs the
+  handler is a second dispatcher beside `InputRouter`'s, over the same rects, and two dispatchers for one
+  press is the divergence the router exists to remove -- the two the viewer carried disagreed about what a
+  toolbar press means, and the disagreement shipped. `ClickableRegionTracker.HitTestAndDispatch` is
+  untouched: that one is the tracker's own, and a cell surface still calls it.
+- **`IKeyboardClaimant` removed; the window keeps a STACK of painted popovers.**
+  `WindowUiSettings.KeyboardClaimant` (one slot) becomes `WindowUiSettings.PaintedPopovers`, which the
+  router walks topmost-first. One slot meant the last painter won and nothing restored, so a popover
+  raised over another took the keyboard outright and the one underneath never answered Escape again. The
+  stack is cleared per paint CYCLE and filled by PAINTING, the same mechanism as `PointerOwner` -- which
+  is also what retired the interface, whose whole contract was an implementer promising to decline once
+  off screen, because the slot was never cleared. `PopoverState.ContentKeys` is a
+  `Func<InputKey, bool>?` rather than a claimant.
+- **`PixelWidgetBase.RenderDropdownMenu` deleted.** 127 lines, ten parameters and a "must be called LAST
+  in the render pass" obligation, with zero callers since the menus became `Layout.Builder.Dropdown`
+  trees. `DropdownMenuState` itself stays, anchor fields and all: it is what a declared menu is declared
+  FROM.
+- **`HitResult.SliderHit(int)` removed.** A slider is a `Layout.Content.Slider` leaf whose hit carries the
+  live `SliderState`, so the index a host kept a parallel array against has nothing to index.
+- **`TextInputState.Activate` / `Deactivate` are internal.** `TextInputFocus` was the owner from 8.x and
+  a CONVENTION, since these were public -- so one consumer had three spellings of "give this field the
+  keyboard" and nine sites reaching around the owner. They also conflated two acts: seeding a field's text
+  and claiming the keyboard for it. Seed by setting `Text` and `CursorPos`; where the two are genuinely
+  one act, `TextInputFocus.Focus(input, seed)` is the call, and it selects the seed.
+  **`IsActive`'s setter went with them**, still public to READ: it is a cache of the owner's record of
+  focus, and leaving it writable would have renamed `Activate` rather than retired it.
+- **`HitResult.TextInputHit.Painted` is required.** One constructor, no trailing default. It arrived in
+  9.1 as an optional parameter, which is the shape that deletes the old constructor from the assembly --
+  source-compatible and binary-fatal -- and 9.2 papered over that with a second constructor. A default
+  also reads as "geometry optional", and a hit registered without it puts every caret at the start of the
+  field with nothing to distinguish it from a field genuinely painted at zero.
+- **`LayoutInspection` deleted.** An obsolete no-op since layout capture became unconditional; its own
+  doc said to delete it at the next major.
+
+`PixelMenuWidget.HandleInput` is keys only for the same reason: its press arm hit-tested and dispatched
+for itself. A host lists the widget on an `InputRouter` and the rows it declared answer there.
+
+**One addition, and it is what the cuts are for.** `ListCursor.Step(delta, painted)` and
+`ListCursor.PaintedRow(Index, IsDisabled)`: the arrow walk, lifted off `PixelWidgetBase` so it is not a
+pixel-surface rule. `PixelWidgetBase.MoveListCursor` is unchanged from outside and now projects its
+registered regions onto that list; a cell surface projects the window of rows it drew, and gets the same
+behaviour -- the nearest painted row in the direction of travel, disabled rows stepped over, a counted
+list able to step past its own viewport. Console.Lib's `ScrollableList` was the second implementation of
+that walk, and "the same list behaves differently under the arrows depending which surface it is on" is a
+difference nothing would have reported.
+
+## 9.5
+
+**A tab carries its own chord and its own handler.** `TabItem<T>` gains two init-only properties:
+
+- **`Shortcut`** (`KeyChord?`) -- the binding that reaches this tab, put on the node the strip paints.
+  A chord stated on a node is matched against the PAINTED tree, so the binding of a tab that was
+  dropped on overflow, or of one that is `IsEnabled` false, is inert with nothing guarding it. A host's
+  own Ctrl+letter map fires whatever the window is showing, which is why every one of them grows a
+  check beside each key and why the check is what goes missing.
+- **`OnSelect`** (`Action<T>?`) -- what selecting the tab does, handed the tab's own `Value`. This is
+  what makes the chord usable rather than decorative: the router ACTIVATES the node a chord names, and
+  a node with nothing bound to it has nothing to activate. Click and chord then run the same handler,
+  so the two routes cannot drift.
+
+`ITabStripSource` grew `Shortcut(int)` and `Select(int)` as DEFAULT interface members answering "none",
+so every existing implementation keeps compiling and every existing strip lays out identically.
+`Node.WithShortcut(KeyChord)` is the overload for a caller that already has a chord rather than a key
+and a modifier.
+
+**One behaviour change, and it is a fix.** A DISABLED tab now runs nothing. It still registers, under
+`TabBarRegions.DisabledTabs`, so a press on it is swallowed rather than falling through to whatever is
+behind the strip -- but its handlers are dropped. "Still drawn, and inert" is what `IsEnabled` has
+always promised; the strip-wide index callback quietly did not keep it, and fired for a greyed tab as
+readily as for a live one. No shipped consumer passed that callback, so nothing observable changes.
+
+### What moving to 9.5 gets a consumer
+
+A nav rail or tab bar stops re-stating its own bindings after the paint. The shape this replaces:
+override `CollectPaintedNodes`, find the tab cells by their hit, and rewrite each node with a chord out
+of a dictionary and a handler out of a closure -- once per frame, in the host, restating what the item
+already knew. That override goes away; the items carry both.
+
+## 9.4
+
+**A wrap can flow around a floated corner.** Three additions to `Node.Wrap`, all init-only, all zero by
+default, and all from the same consumer: tianwen's toolbar, which pins a help button to the top-right
+corner and wraps the rest beneath it.
+
+- **`FirstLineReserve`** -- main-axis extent the FIRST line alone leaves free. The obvious substitute is
+  a `Dock`, and it is wrong in a way that is invisible until the run wraps: a dock takes its strip out
+  of EVERY line, so the wrapped rows narrow and children that used to fit start being dropped.
+- **`LeadingGap`** (on the CHILD, not the wrap) -- extra space before a child, on top of the
+  container's gap, and suppressed when the child starts a line. Group separation had no spelling that
+  survived wrapping: a spacer node leads the wrapped row and indents it, and folding the gap into a
+  neighbour's width grows that neighbour's hit rect into empty space.
+- **`MaxLines`** -- most lines the flow may use; children past them are DROPPED, not clipped. A clipped
+  child still registers its region and keeps taking the clicks aimed at whatever covers it, which is
+  worse than not being there.
+
+`MeasureWrap` honours all three, so the measured box and the painted rows break at the same places --
+a measure that disagreed would have the caller reserve a band for rows the arrange then drops.
+
+Init-only properties rather than primary-constructor parameters, for the reason the 9.1 `TextInputHit`
+release learned the expensive way.
+
+### What moving to 9.4 gets a consumer
+
+Any bar, chip row or tag list that pins something to a corner and wraps the rest. Before this the
+reservation had to be a hand-written wrap walk with a per-row limit, a group gap and a row cap --
+about 60 lines of arithmetic whose rules are now three properties. Nothing else changes: every
+existing `Wrap` has all three at zero and lays out identically.
+
 ## 9.3
 
 **A dropdown is a popover whose content is a list.** Every behaviour a menu needs was already in the

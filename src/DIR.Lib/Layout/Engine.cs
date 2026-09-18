@@ -592,6 +592,10 @@ public static class Engine
         var lineGap = ToSurfaceOn(ctx, wrap.LineGap, CrossAxis(axis));
         var availSize = new Size<T>(inner.Width, inner.Height);
         var mainAvail = MainOf(axis, availSize);
+        // The first line alone stops short, so a run can flow BENEATH a corner item and still use the
+        // whole extent once it has. Clamped at zero: a reserve wider than the container would otherwise
+        // make the first line's limit negative and push every child onto line two.
+        var firstLineAvail = Max(T.Zero, mainAvail - ToSurfaceOn(ctx, wrap.FirstLineReserve, axis));
 
         // Resolve every child's main + natural cross extent up front (see ResolveWrapChild).
         var childMains = new T[n];
@@ -604,16 +608,23 @@ public static class Engine
         // Flow line by line: a child that would overflow a non-empty line starts the next one (a child
         // wider than the whole extent gets a line of its own and overflows visibly).
         var lineStart = 0;
+        var lineIndex = 0;
         var crossCursor = axis == Axis.Horizontal ? inner.Y : inner.X;
         while (lineStart < n)
         {
             var lineEnd = lineStart; // exclusive
             var used = T.Zero;
             var lineCross = T.Zero;
+            var lineAvail = lineIndex == 0 ? firstLineAvail : mainAvail;
             while (lineEnd < n)
             {
-                var extra = lineEnd == lineStart ? childMains[lineEnd] : gap + childMains[lineEnd];
-                if (lineEnd > lineStart && used + extra > mainAvail)
+                // A line never opens with separation: neither the container's gap nor the child's own
+                // leading gap applies to the child that starts one.
+                var lead = lineEnd == lineStart
+                    ? T.Zero
+                    : gap + ToSurfaceOn(ctx, children[lineEnd].LeadingGap, axis);
+                var extra = lead + childMains[lineEnd];
+                if (lineEnd > lineStart && used + extra > lineAvail)
                 {
                     break;
                 }
@@ -634,10 +645,23 @@ public static class Engine
                     : new Rect<T>(crossCursor, mainCursor, cross, childMains[i]);
                 ArrangeNode(children[i], childRect, ctx, output, depth);
                 mainCursor += childMains[i] + gap;
+                if (i + 1 < lineEnd)
+                {
+                    mainCursor += ToSurfaceOn(ctx, children[i + 1].LeadingGap, axis);
+                }
             }
 
             crossCursor += lineCross + lineGap;
             lineStart = lineEnd;
+            lineIndex++;
+
+            // Out of lines. Everything after this point is dropped -- not arranged, so not painted and
+            // not registered, which is the difference between an absent control and one that is
+            // invisible but still eating the clicks aimed at what covers it.
+            if (wrap.MaxLines > 0 && lineIndex >= wrap.MaxLines)
+            {
+                break;
+            }
         }
     }
 
@@ -907,9 +931,12 @@ public static class Engine
         var gap = ToSurfaceOn(ctx, wrap.Gap, axis);
         var lineGap = ToSurfaceOn(ctx, wrap.LineGap, CrossAxis(axis));
         var mainAvail = MainOf(axis, available);
+        var firstLineAvail = Max(T.Zero, mainAvail - ToSurfaceOn(ctx, wrap.FirstLineReserve, axis));
 
         // Same line flow as ArrangeWrap: intrinsic main = the longest line, intrinsic cross = the sum of
-        // line extents -- so an Auto-height wrap grows taller as its container narrows.
+        // line extents -- so an Auto-height wrap grows taller as its container narrows. The first line's
+        // reserve is honoured HERE too: a measure that broke lines differently from the arrange would
+        // report a box the paint does not fit in, which is the whole class of bug the tree removes.
         var maxLineMain = T.Zero;
         var totalCross = T.Zero;
         var used = T.Zero;
@@ -919,8 +946,10 @@ public static class Engine
         for (var i = 0; i < n; i++)
         {
             var (main, cross) = ResolveWrapChild(children[i], axis, available, ctx);
-            var extra = itemsInLine == 0 ? main : gap + main;
-            if (itemsInLine > 0 && used + extra > mainAvail)
+            var extra = itemsInLine == 0
+                ? main
+                : gap + ToSurfaceOn(ctx, children[i].LeadingGap, axis) + main;
+            if (itemsInLine > 0 && used + extra > (lines == 1 ? firstLineAvail : mainAvail))
             {
                 maxLineMain = Max(maxLineMain, used);
                 totalCross += lineCross;
@@ -937,6 +966,46 @@ public static class Engine
         }
 
         maxLineMain = Max(maxLineMain, used);
+        // A capped flow reports the box it will actually paint, not the one it would need uncapped --
+        // otherwise the caller reserves a band for rows the arrange then drops.
+        if (wrap.MaxLines > 0 && lines > wrap.MaxLines)
+        {
+            lines = wrap.MaxLines;
+            totalCross = T.Zero;
+            var counted = 0;
+            var lineTop = T.Zero;
+            var inLine = 0;
+            var usedInLine = T.Zero;
+            for (var i = 0; i < n && counted < lines; i++)
+            {
+                var (main, cross) = ResolveWrapChild(children[i], axis, available, ctx);
+                var extra = inLine == 0
+                    ? main
+                    : gap + ToSurfaceOn(ctx, children[i].LeadingGap, axis) + main;
+                if (inLine > 0 && usedInLine + extra > (counted == 0 ? firstLineAvail : mainAvail))
+                {
+                    totalCross += lineTop;
+                    counted++;
+                    usedInLine = main;
+                    lineTop = cross;
+                    inLine = 1;
+                    continue;
+                }
+
+                usedInLine += extra;
+                lineTop = Max(lineTop, cross);
+                inLine++;
+            }
+
+            if (counted < lines)
+            {
+                totalCross += lineTop;
+            }
+
+            totalCross += lineGap * T.CreateChecked(lines - 1);
+            return Compose(axis, maxLineMain, totalCross);
+        }
+
         totalCross += lineCross + lineGap * T.CreateChecked(lines - 1);
         return Compose(axis, maxLineMain, totalCross);
     }
