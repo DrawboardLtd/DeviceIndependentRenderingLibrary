@@ -64,6 +64,24 @@ public abstract partial record Node
     /// </summary>
     public float? PaddingY { get; init; }
 
+    /// <summary>
+    /// Extra main-axis space before this child in a flow (<see cref="Wrap"/>), on top of the container's
+    /// own gap -- and suppressed when the child starts a line.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Group separation, without a spacer node.</b> A spacer between two groups is the obvious
+    /// spelling and it breaks on exactly the case that matters: when the line happens to break there,
+    /// the spacer leads the wrapped row and indents it. Carried on the child instead, the rule is the
+    /// one a flow already applies to its own gap -- a line never opens with separation -- so the wrapped
+    /// row starts flush under the one above it, which is what the row break already says.
+    /// </para>
+    /// <para>
+    /// Zero, and therefore invisible, on every node that does not set it.
+    /// </para>
+    /// </remarks>
+    public float LeadingGap { get; init; }
+
     /// <summary>The vertical inset actually applied: <see cref="PaddingY"/> if stated, else <see cref="Padding"/>.</summary>
     public float PadDown => PaddingY ?? Padding;
 
@@ -324,7 +342,52 @@ public abstract partial record Node
     /// <paramref name="Gap"/> separates children within a line, <paramref name="LineGap"/> separates
     /// lines. Intrinsic (Auto) size reflows against the available extent, so an Auto-height wrap grows
     /// taller as its container narrows.</summary>
-    public sealed record Wrap(ImmutableArray<Node> Children, Axis Axis = Axis.Horizontal, float Gap = 0f, float LineGap = 0f) : Node;
+    public sealed record Wrap(ImmutableArray<Node> Children, Axis Axis = Axis.Horizontal, float Gap = 0f, float LineGap = 0f) : Node
+    {
+        /// <summary>
+        /// Main-axis extent the FIRST line alone must leave free, in design units. Later lines run the
+        /// full extent.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// <b>This is flow around a floated corner item</b>, and it is the one wrap shape a
+        /// <see cref="Dock"/> cannot express: docking the corner item reserves its column on EVERY line,
+        /// which silently narrows the wrapped rows and starts dropping children that used to fit.
+        /// </para>
+        /// <para>
+        /// The case it was added for is a toolbar with a help button pinned to the top-right corner. The
+        /// run wraps beneath that button and uses the whole width once it has, because the button is on
+        /// the first row only -- and whether the tail of the bar survives at an ordinary window size
+        /// depends on exactly that. Before this existed the reservation was a hand-written wrap walk with
+        /// a per-row limit, which is the arithmetic a layout engine is for.
+        /// </para>
+        /// <para>
+        /// An init-only property rather than a primary-constructor parameter: adding an optional
+        /// parameter to a record's primary constructor is source-compatible and a BINARY break, and it
+        /// changes the arity its <c>Deconstruct</c> takes. See the 9.1 <c>TextInputHit</c> lesson.
+        /// </para>
+        /// </remarks>
+        public float FirstLineReserve { get; init; }
+
+        /// <summary>
+        /// Most lines the flow may use. Children that do not fit within them are DROPPED -- not
+        /// arranged, not painted, not registered. Zero (the default) means unlimited.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// Dropping rather than clipping, because a half-painted control is worse than an absent one: a
+        /// clipped child still registers its region, so it keeps taking the clicks aimed at whatever is
+        /// drawn over it. That is the bug a toolbar hit when its run slid under a pinned corner button.
+        /// </para>
+        /// <para>
+        /// A cap belongs on the flow rather than on its container because the container cannot see where
+        /// the lines fall. The alternative -- letting the wrap grow and clipping it with a fixed height
+        /// -- turns a small window into a toolbar with a picture attached, and still registers the rows
+        /// nobody can see.
+        /// </para>
+        /// </remarks>
+        public int MaxLines { get; init; }
+    }
 
     /// <summary><paramref name="Base"/> drawn first, <paramref name="Top"/> on top (modal / dropdown / popup). Both fill the same rect.</summary>
     public sealed record Overlay(Node Base, Node Top) : Node;

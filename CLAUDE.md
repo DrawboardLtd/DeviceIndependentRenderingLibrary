@@ -43,9 +43,9 @@ CI (`.github/workflows/dotnet.yml`) runs tests in Release config after building 
 - `Renderer<TSurface>` — abstract generic renderer; backends (SDL/Vulkan, Console) implement this in downstream repos. Provides default polyline + dashed-line implementations on top of the abstract rect / ellipse / text primitives.
 - `RgbaImageRenderer : Renderer<RgbaImage>` — pure software renderer used in tests and headless scenarios
 - `IWidget` / `IPixelWidget` — widget interfaces with input handling and hit testing
-- `PixelWidgetBase<TSurface>` — base class for pixel-based widgets, manages clickable regions, drawing helpers, dropdowns, text inputs
+- `PixelWidgetBase<TSurface>` — base class for pixel-based widgets, manages clickable regions, drawing helpers, text inputs
 - `InputEvent` — abstract record hierarchy (open discriminated union): `KeyDown`, `TextInput`, `MouseDown`, `MouseUp`, `MouseMove`, `Scroll`, `Pinch`, `PinchEnd`
-- `HitResult` — open record hierarchy for click dispatch: `TextInputHit`, `ButtonHit`, `ListItemHit`, `SlotHit<T>`, `SliderHit`
+- `HitResult` — open record hierarchy for click dispatch: `TextInputHit`, `ButtonHit`, `ChromeHit`, `LinkHit`, `ListItemHit`, `SlotHit<T>`, `SliderStateHit`
 - `SignalBus` — thread-safe typed event bus; `Post<T>()` is thread-safe, `ProcessPending()` runs on render thread
 - `DockLayout<T>` — generic dock layout engine using `INumber<T>`
 - `ManagedFontRasterizer` — pure-managed glyph rasterizer (AOT-compatible) backed by `SharpAstro.Fonts.OpenTypeFont`; supports COLRv1 color glyphs, grayscale, and PDF subset fonts
@@ -58,6 +58,7 @@ CI (`.github/workflows/dotnet.yml`) runs tests in Release config after building 
 - `BoxRasterizer.RenderToRgba` (in `DIR.Lib.MathLayout`) — math-layout entry point; returns a raw `RgbaImage` so the caller picks the encoder (PNG / sixel / half-block / …)
 
 **Key design constraints:**
+- **An optional parameter added to a record's primary constructor is a BINARY break.** It is source-compatible, so it reads as additive and the compiler says nothing -- but the old constructor is gone from the assembly, and every already-compiled caller throws `MissingMethodException`. A positional PATTERN breaks too, at compile time in the consumer: a record's synthesized `Deconstruct` takes its arity from the primary constructor, so `Evt(var a, var b)` stops binding the moment a third parameter appears, defaulted or not. So such a change is either a MAJOR, or it ships with an **explicit old-arity constructor AND an explicit old-arity `Deconstruct`**. 9.1 learned this the expensive way: it added `TextInputGeometry Painted = default` to `HitResult.TextInputHit`, called the release "additive throughout", and the published Console.Lib (which calls the one-argument form in `CellLayout.HitOf`) threw on every terminal hit test. It was invisible on a dev box, where `UseLocalSiblings` compiles the sibling from source and the package path CI takes is never exercised. Pinned by `InputEventCompatibilityTests`, whose reflection is the only thing that can see the difference -- a call binds happily to a longer constructor with defaults, so nothing written in C# can tell them apart. Prefer an **init-only property** for a new field on a record (`ArrangedNode.Depth`, `ClickableRegion.OnPress`, `Node.Grid.ColumnSizing`): it adds nothing to the constructor's identity.
 - **AOT compatibility is required** (`IsAotCompatible = true`) — no reflection-based patterns. No native bindings: the font rasterizer is pure-managed.
 - `AllowUnsafeBlocks` is enabled in both library and tests
 - `RectInt(PointInt LowerRight, PointInt UpperLeft)` — note the unusual constructor argument order (LowerRight first)
@@ -84,10 +85,7 @@ This repo's OWN version has **one place to bump**: `VersionMajorMinor` in `src/D
 
 It covers both DIR.Lib and DIR.Lib.Shaping, because CI stamps a single `-p:Version` across them. No csproj declares its own `VersionPrefix`: a per-project one silently overrides the props file, which is how DIR.Lib.Shaping sat at 6.8.0 while DIR.Lib shipped 7.5.0. Upstream has since adopted the same props file, so a sync round no longer re-introduces per-csproj prefixes — but check, because restoring one is silent and only shows up as a version the packages disagree with.
 
-- **An optional parameter added to a record's primary constructor is a BINARY break.** It is source-compatible, so it reads as additive and the compiler says nothing -- but the old constructor is gone from the assembly, and every already-compiled caller throws `MissingMethodException`. A positional PATTERN breaks too, at compile time in the consumer: a record's synthesized `Deconstruct` takes its arity from the primary constructor, so `Evt(var a, var b)` stops binding the moment a third parameter appears, defaulted or not. So such a change is either a MAJOR, or it ships with an **explicit old-arity constructor AND an explicit old-arity `Deconstruct`**. 9.1 learned this the expensive way: it added `TextInputGeometry Painted = default` to `HitResult.TextInputHit`, called the release "additive throughout", and the published Console.Lib (which calls the one-argument form in `CellLayout.HitOf`) threw on every terminal hit test. It was invisible on a dev box, where `UseLocalSiblings` compiles the sibling from source and the package path CI takes is never exercised. Pinned by `InputEventCompatibilityTests`, whose reflection is the only thing that can see the difference -- a call binds happily to a longer constructor with defaults, so nothing written in C# can tell them apart. Prefer an **init-only property** for a new field on a record (`ArrangedNode.Depth`, `ClickableRegion.OnPress`, `Node.Grid.ColumnSizing`): it adds nothing to the constructor's identity.
-
 Add the matching entry to [CHANGELOG.md](CHANGELOG.md) at the repo root, in the same commit as the
 bump. Newest first, one `## Major.Minor` section each. (The notes used to live in a comment block in
-`.github/workflows/dotnet.yml`, justified by the double hyphen several of them contain, which XML
-forbids inside a comment — but nothing ever read them there, and they had grown to 612 of that
+`.github/workflows/dotnet.yml`; nothing ever read them there, and they had grown to 612 of that
 file's 674 lines.)

@@ -37,11 +37,11 @@ Platform bridges (in downstream packages):
 ## Widget System
 
 - **`IPixelWidget`** — extends IWidget with pixel-coordinate hit testing and click dispatch, plus what a router reads back from the last paint: `CollectPaintedRegions` / `CollectPaintedNodes` (a composite folds its children's in), `Pointer`, `ScrollTargetAt`, `HitTestCursor` and `CaretIndexAt`
-- **`PixelWidgetBase<TSurface>`** -- base class for pixel widgets: clickable regions, text input, buttons, dropdowns, drawing helpers. `MeasureLayout` / `MeasureContext` are the measure seam (a box is the MEASUREMENT of its content, through the same context arrange and paint share); `ScrollTargetAt(x, y)` answers which declared list a wheel belongs to; `DimTowards(color, background)` is the one grey a disabled thing is painted in
+- **`PixelWidgetBase<TSurface>`** -- base class for pixel widgets: clickable regions, text input, buttons, drawing helpers. `MeasureLayout` / `MeasureContext` are the measure seam (a box is the MEASUREMENT of its content, through the same context arrange and paint share); `ScrollTargetAt(x, y)` answers which declared list a wheel belongs to; `DimTowards(color, background)` is the one grey a disabled thing is painted in
 - **`PixelLayout`** + **`PixelDockStyle`** — dock-based layout engine (Top/Bottom/Left/Right/Fill)
 - **`DockLayout<T>`** — generic dock layout using `INumber<T>` (the integer / pixel layouts above are built on this)
 - **`ClickableRegion`** + **`ClickableRegionTracker`** — registered during render, walked in reverse for hit testing
-- **`HitResult`** — open discriminated union: `TextInputHit`, `ButtonHit`, `ListItemHit`, `SlotHit<T>`, `SliderHit`
+- **`HitResult`** — open discriminated union: `TextInputHit`, `ButtonHit`, `ChromeHit`, `LinkHit`, `ListItemHit`, `SlotHit<T>`, `SliderStateHit`
 - **`DropdownMenuState`** — dropdown / popup menu state machine
 
 ## Declarative Layout (`DIR.Lib.Layout`)
@@ -150,6 +150,18 @@ if (tracker.ProcessCompletions(logger)) needsRedraw = true;
 var unicode = MarkdownMacros.RenderMathUnicode("E = mc^2");      // "E = mc²"
 var image   = BoxRasterizer.RenderToRgba(boxBuilder(style), style);
 ```
+
+## Upgrading
+
+- **[CHANGELOG.md](CHANGELOG.md)** — what changed in each `Major.Minor`, and why. Newest first.
+- **[MIGRATION.md](MIGRATION.md)** — the port recipe for each BREAKING release, before/after per API.
+  A major is the only place this library removes anything; the current one is **10.0**, which deleted
+  `IPixelWidget.HitTestAndDispatch`, `IKeyboardClaimant`, `PixelWidgetBase.RenderDropdownMenu`,
+  `HitResult.SliderHit` and `LayoutInspection`, made `TextInputState.Activate` / `Deactivate` and the
+  `IsActive` setter internal, and made `HitResult.TextInputHit.Painted` required.
+
+The version number lives in one place, `src/Directory.Build.props` (`VersionMajorMinor`); CI reads it
+back rather than restating it, so a package cannot declare a version the changelog disagrees with.
 
 ## Dependencies
 
