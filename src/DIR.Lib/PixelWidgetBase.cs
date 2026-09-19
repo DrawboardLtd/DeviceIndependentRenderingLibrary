@@ -260,9 +260,20 @@ namespace DIR.Lib
         /// pass.
         /// </summary>
         /// <remarks>
+        /// <para>
         /// The stamp is what makes a widget stop answering when the host stops DRAWING it — see
         /// <see cref="WindowUiSettings.FrameId"/>. It costs nothing to a host that never bumps the frame:
         /// the id stays 0, so does the stamp, and every hit test matches as it always did.
+        /// </para>
+        /// <para>
+        /// <b>From a paint, and from nowhere else.</b> The window's paint cycle -- what clears
+        /// <see cref="WindowUiSettings.PaintedPopovers"/> and <see cref="WindowUiSettings.PointerOwner"/>
+        /// -- ends at the first widget to begin twice, so a call between paints (a Close that wants its
+        /// regions gone) moves that boundary onto this widget for good: every later frame then starts a
+        /// new cycle when THIS widget begins, wiping whatever the widgets painted before it put on the
+        /// window, and a popover painted by one of them stops answering Escape while visibly open. A
+        /// widget that wants its regions gone paints nothing next frame, which drops them the same way.
+        /// </para>
         /// </remarks>
         protected void BeginFrame()
         {
