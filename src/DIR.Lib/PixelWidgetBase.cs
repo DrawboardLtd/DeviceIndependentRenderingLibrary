@@ -1166,6 +1166,10 @@ namespace DIR.Lib
                         Tooltip = tooltip,
                         IsDisabled = disabled,
                         Scroll = node.Scroll,
+                        // A disabled trigger opens nothing, by the same rule that drops its handlers:
+                        // the press is swallowed, and swallowed is all it is.
+                        Opens = disabled ? null : node.OpensPopover,
+                        Dismisses = node.DismissesPopover,
                     });
                 }
                 else if (cursor is not null || tooltip is not null || node.Scroll is not null)
