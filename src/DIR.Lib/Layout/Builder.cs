@@ -268,6 +268,10 @@ public static class Builder
             rows[i] = row;
         }
 
+        // A row is the atom, so the keyboard's EnsureVisible and the wheel's step count rows -- the
+        // engine converts it to surface units when it feeds the controller. Stated on every build for
+        // the same reason the rows are: the menu's font may have changed since the last one.
+        state.Scroll.AtomDesignUnits = rowHeight;
         var list = VStack(rows).W(Sizing.Fixed(anchor.Size.X)).WithScroll(state.Scroll);
 
         if (maxHeight > 0f)

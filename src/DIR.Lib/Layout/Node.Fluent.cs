@@ -140,10 +140,12 @@ public abstract partial record Node
 
     /// <summary>
     /// Declare this node's arranged rect to be <paramref name="controller"/>'s viewport, so a wheel can
-    /// reach the innermost list under the pointer and a list stops re-deriving where it was drawn. The
-    /// rows and row height stay the consumer's, through
-    /// <see cref="ListScrollController.SetExtent"/>. Named With* so it does not shadow the
-    /// <see cref="Node.Scroll"/> property it sets.
+    /// reach the innermost list under the pointer and a list stops re-deriving where it was drawn.
+    /// On a <see cref="Stack"/> it is a scroll CONTAINER: the children are laid out at their full extent
+    /// and slid by the controller's offset, the controller is told what it scrolls over (one surface
+    /// unit per atom), and the painter clips the subtree to this rect and registers only what shows.
+    /// Cap the stack's extent (<see cref="HClamp"/>) or it measures to its content and never scrolls.
+    /// Named With* so it does not shadow the <see cref="Node.Scroll"/> property it sets.
     /// </summary>
     public Node WithScroll(ListScrollController controller) => this with { Scroll = controller };
 

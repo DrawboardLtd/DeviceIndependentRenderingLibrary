@@ -256,6 +256,7 @@ public sealed class InputRouter(WindowUiSettings ui, BackgroundTaskTracker track
                 }
 
                 bool acted;
+                var hadKeyboard = ui.Focus.Current;
 
                 // A popover's backdrop yields to a TRIGGER beneath it. The backdrop consumes every press
                 // outside the content, which is right for the page behind a menu and wrong for the bar the
@@ -282,7 +283,13 @@ public sealed class InputRouter(WindowUiSettings ui, BackgroundTaskTracker track
                 // and does so AFTER the dispatch so a handler reading the field still reads what the
                 // reader saw. A disabled region reaches here with nothing dispatched, which is right:
                 // the press was swallowed, and a swallowed press is still a press somewhere else.
-                if (region.Result is not HitResult.TextInputHit)
+                //
+                // Unless the press GAVE the keyboard to a field -- a button whose handler opens an editor
+                // on a value -- in which case that was the press's whole meaning, and taking it straight
+                // back would leave a field painted as focused that swallows nothing. Told apart by whether
+                // the focus the dispatch left behind is the one it found.
+                if (region.Result is not HitResult.TextInputHit
+                    && ReferenceEquals(ui.Focus.Current, hadKeyboard))
                 {
                     acted |= BlurFocusedField();
                 }

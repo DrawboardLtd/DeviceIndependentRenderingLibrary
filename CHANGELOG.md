@@ -34,6 +34,21 @@ property, a default interface member or a new optional parameter at the END of a
   close the card it came from; a member is exclusive with its siblings and nothing else.
 - **`PopoverState.Opened`**, the transition `Closed` already reported from the other side: where a card
   derives its rows once on open -- an outline walked lazily -- rather than every frame `IsOpen` is true.
+- **A `.WithScroll` stack is a scroll container.** It lays its children out at their full extent and
+  slides them by the controller's offset (`Engine.ArrangeStack`), tells the controller what it scrolls
+  over (`SetExtent` with one surface unit per atom, so an offset is a plain distance), and the pixel
+  painter clips the subtree to the node's rect, registers only the part of a straddling row that shows,
+  and skips a row wholly outside. Before this `.WithScroll` bound the viewport and routed the wheel and
+  nothing else: the controller was never told the content extent, so `MaxOffset` stayed 0 and the wheel
+  was declined; nothing slid or clipped; and a declared dropdown longer than its `maxHeight` overflowed,
+  its overflowing rows still registered and taking the presses aimed at whatever they hung over. A list
+  that fits arranges byte-identically to before. `ListScrollController.AtomDesignUnits` lets a list of
+  uniform rows count its offset in rows instead (`Builder.Dropdown` states its row height), so
+  `EnsureVisible` and the wheel step keep meaning rows there. `LayoutScrollTests`.
+- **A press that gives a field the keyboard keeps it there.** The router blurred the focused field on
+  any press that was not over a field, AFTER dispatch -- so a button whose handler opens an editor on a
+  value (a zoom chip's double-click) focused the field and had it blurred by the same press. It now
+  blurs only when the focus the dispatch left behind is the one it found.
 - **`TabItem.OnPress`** (`Func<T, PointerPress, DragCapture?>`), **`TabItem.OnClose`** and
   **`TabBar.OnNewTab`**. A tab's press carries the button and returns the gesture, so a middle-button
   close, a drag-reorder and a tear-out are declared on the item; the ✕ and the + are live regions rather
