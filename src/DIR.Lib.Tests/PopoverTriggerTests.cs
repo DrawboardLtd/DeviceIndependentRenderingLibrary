@@ -312,6 +312,34 @@ public class PopoverTriggerTests
         bar.A.IsOpen.ShouldBeFalse("closed by the backdrop, and not toggled back by its own trigger");
     }
 
+    /// <summary>
+    /// The other half of that control: the second press opens an EDITOR, which is a field taking the
+    /// keyboard from inside the press. The rule that a press elsewhere blurs the focused field must not
+    /// undo what the press itself just did.
+    /// </summary>
+    [Fact]
+    public void ATriggerWhosePressFocusesAFieldKeepsItFocused()
+    {
+        var bar = new Bar();
+        var field = new TextInputState();
+        Layout.Node ChipA() => Layout.Builder.Box(ChipW, ChipH).WFixed(ChipW).HFixed(ChipH)
+            .Pressable(new HitResult.ButtonHit("a"), press =>
+            {
+                if (press.Clicks >= 2) bar.Widget.Ui.Focus.Focus(field, "100");
+                return null;
+            })
+            .Opens(bar.A);
+
+        bar.Paint(chipA: ChipA());
+        var (x, y) = Bar.OnChip(0);
+        bar.Press(x, y, clicks: 1);
+        bar.Paint(chipA: ChipA());
+        bar.Press(x, y, clicks: 2);
+
+        bar.Widget.Ui.Focus.Current.ShouldBeSameAs(field, "the press gave it the keyboard, and the same press does not take it back");
+        bar.A.IsOpen.ShouldBeFalse();
+    }
+
     /// <summary>A press that claims a drag is a gesture, not a toggle.</summary>
     [Fact]
     public void APressThatClaimsADragDoesNotToggle()

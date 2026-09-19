@@ -1023,6 +1023,14 @@ namespace DIR.Lib
             // capture below for why the owner cannot be read off the Anchored node itself.
             var pendingOwnerDepth = -1;
 
+            // The enclosing SCROLLED nodes, by depth like the link above. A scrolled node's subtree paints
+            // under a clip to the node's own rect (the arrange slid the children and clipped nothing --
+            // see Engine.ArrangeStack), a child wholly outside that rect is not painted, not registered
+            // and not captured, and a child straddling its edge registers only the part that shows. That
+            // last one is not cosmetic: a row arranged below the card's bottom edge is invisible, and a
+            // region registered for it would take the presses aimed at whatever the card is sitting on.
+            var scrolls = new Stack<(int Depth, ListScrollController Scroll, RectF32 Clip)>();
+
             foreach (var arrangedNode in arranged)
             {
                 var (node, bounds) = arrangedNode;
@@ -1030,6 +1038,19 @@ namespace DIR.Lib
                 while (links.Count > 0 && links.Peek().Depth >= arrangedNode.Depth)
                 {
                     links.Pop();
+                }
+
+                while (scrolls.Count > 0 && scrolls.Peek().Depth >= arrangedNode.Depth)
+                {
+                    // The bar over the rows, inside the viewport it belongs to, then the clip released.
+                    var (_, leaving, _) = scrolls.Pop();
+                    leaving.DrawScrollBar(FillRect);
+                    PopClip();
+                }
+
+                if (scrolls.Count > 0 && !Intersects(scrolls.Peek().Clip, bounds))
+                {
+                    continue;
                 }
 
                 while (backgrounds.Count > 0 && backgrounds.Peek().Depth >= arrangedNode.Depth)
@@ -1155,10 +1176,13 @@ namespace DIR.Lib
                 // subtree for no answer that was not already there.
                 var cursor = node.IsDisabled ? CursorKind.NotAllowed : disabled ? null : node.Cursor;
                 var tooltip = node.Tooltip ?? node.DisabledReason;
+                // What the region covers: the arranged rect, or only the part of it inside the enclosing
+                // scrolled node's viewport -- the rest is not on screen and must not answer a press.
+                var region = scrolls.Count > 0 ? Intersect(scrolls.Peek().Clip, bounds) : bounds;
                 if (node.Hit is { } hit)
                 {
                     RegisterClickable(new ClickableRegion(
-                        bounds.X, bounds.Y, bounds.Width, bounds.Height, hit,
+                        region.X, region.Y, region.Width, region.Height, hit,
                         disabled ? null : node.OnClick, cursor)
                     {
                         OnPress = disabled ? null : node.OnPress,
@@ -1178,13 +1202,22 @@ namespace DIR.Lib
                     // statement has nowhere to live. Inert to presses (ChromeHit, no handler), which is
                     // what RegisterCursor has always emitted for the cursor-only case.
                     RegisterClickable(new ClickableRegion(
-                        bounds.X, bounds.Y, bounds.Width, bounds.Height, new HitResult.ChromeHit(),
+                        region.X, region.Y, region.Width, region.Height, new HitResult.ChromeHit(),
                         null, cursor)
                     {
                         Tooltip = tooltip,
                         IsDisabled = disabled,
                         Scroll = node.Scroll,
                     });
+                }
+
+                // From here on, this node's children paint under its viewport. Pushed AFTER the node's own
+                // background and region, which are the viewport itself and are never clipped by it.
+                if (node.Scroll is { } scrolled)
+                {
+                    var clip = scrolls.Count > 0 ? Intersect(scrolls.Peek().Clip, bounds) : bounds;
+                    PushClip(clip.X, clip.Y, clip.Width, clip.Height);
+                    scrolls.Push((arrangedNode.Depth, scrolled, new RectF32(clip.X, clip.Y, clip.Width, clip.Height)));
                 }
 
                 if (node is Layout.Node.Leaf leaf)
@@ -1341,6 +1374,29 @@ namespace DIR.Lib
                 }
             }
 
+            // A scrolled node whose subtree ran to the end of the tree is left open by the loop above,
+            // which only closes one on meeting the next node outside it.
+            while (scrolls.Count > 0)
+            {
+                var (_, leaving, _) = scrolls.Pop();
+                leaving.DrawScrollBar(FillRect);
+                PopClip();
+            }
+        }
+
+        /// <summary>Whether an arranged rect shows at all inside a scrolled node's viewport.</summary>
+        private static bool Intersects(RectF32 clip, Rect<float> bounds)
+            => bounds.X < clip.Right && bounds.X + bounds.Width > clip.X
+               && bounds.Y < clip.Bottom && bounds.Y + bounds.Height > clip.Y;
+
+        /// <summary>The part of an arranged rect inside a scrolled node's viewport.</summary>
+        private static Rect<float> Intersect(RectF32 clip, Rect<float> bounds)
+        {
+            var x0 = MathF.Max(clip.X, bounds.X);
+            var y0 = MathF.Max(clip.Y, bounds.Y);
+            var x1 = MathF.Min(clip.Right, bounds.X + bounds.Width);
+            var y1 = MathF.Min(clip.Bottom, bounds.Y + bounds.Height);
+            return new Rect<float>(x0, y0, MathF.Max(0f, x1 - x0), MathF.Max(0f, y1 - y0));
         }
 
         /// <summary>
