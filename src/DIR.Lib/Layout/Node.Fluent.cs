@@ -161,6 +161,21 @@ public abstract partial record Node
     /// </summary>
     public Node WithShortcut(KeyChord chord) => this with { Shortcut = chord };
 
+    /// <summary>
+    /// Make this node the trigger of <paramref name="popover"/>: a press toggles it, a shortcut on the
+    /// node toggles it, and while it is open a press on its backdrop that lands here reaches here. See
+    /// <see cref="Node.OpensPopover"/>. Pair with <see cref="Clickable"/> or <see cref="Pressable"/> for the
+    /// hit; a trigger with neither registers no region and opens nothing.
+    /// </summary>
+    public Node Opens(PopoverState popover) => this with { OpensPopover = popover };
+
+    /// <summary>
+    /// Make this node the backdrop of <paramref name="popover"/>. <see cref="Builder.Popover"/> states it
+    /// on the scrim it builds; a hand-built backdrop states it here so a trigger beneath it stays
+    /// reachable. See <see cref="Node.DismissesPopover"/>.
+    /// </summary>
+    public Node Dismisses(PopoverState popover) => this with { DismissesPopover = popover };
+
     /// <summary>States the pointer's appearance over this node without making it a click target — a
     /// panel's card saying "arrow here", so nothing inside it has to repeat the claim. Named apart from
     /// the <see cref="Node.Cursor"/> property it sets, which a same-named method cannot shadow.</summary>

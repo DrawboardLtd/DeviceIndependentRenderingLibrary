@@ -9,6 +9,39 @@ this file disagrees with. Bump it there and add the entry here, in the same comm
 Breaking changes carry their migration steps in [MIGRATION.md](MIGRATION.md); this file says what
 changed and why.
 
+## 10.2
+
+**A bar of cards switches in one press, and a tab carries its own press.** Two gaps a consumer with a
+menu-bar-shaped chip row and a reorderable tab strip found on taking 10.0, both filled by declarations
+rather than by anything a host has to route. Additive throughout: every new member is an init-only
+property, a default interface member or a new optional parameter at the END of a private method.
+
+- **`Node.Opens(popover)` -- a node is a popover's TRIGGER.** A press toggles it, a shortcut on the node
+  toggles it, and while it is open a press on its backdrop that lands on a trigger beneath REACHES the
+  trigger: the popover closes and the trigger runs, in one press. The dismissed popover's own trigger is
+  the exception -- the backdrop already closed it, so it does not toggle it back -- which is what makes
+  the lit button's press mean "close". Only the region the press would have hit had the backdrop not
+  been there counts (a trigger under some other card is covered), and never inside the popover's own
+  content rect (`PointerOwner`), where a press on the card's padding is a press on the card. Before this
+  the backdrop consumed the press and the reader pressed again -- on tianwen's toolbar today, and on
+  every consumer that instead re-ordered its own dispatcher to test the triggers before the cards.
+  `Builder.Popover`'s scrim states `Node.Dismisses(popover)` so the router can tell the two apart;
+  `ClickableRegion.Opens` / `.Dismisses` carry both onto the regions. A disabled trigger opens nothing.
+- **`PopoverGroup`** -- at most one member open; `new PopoverState { Group = bar }` joins. Opening a
+  member closes the rest FIRST (their `Closed` fires before the newcomer's `Opened`), and it holds for a
+  press, a shortcut and a consumer's own `Open()` alike. A property of the group and not a flag on the
+  popover, because a submenu raised from a card is a popover too and "close every other one" would
+  close the card it came from; a member is exclusive with its siblings and nothing else.
+- **`PopoverState.Opened`**, the transition `Closed` already reported from the other side: where a card
+  derives its rows once on open -- an outline walked lazily -- rather than every frame `IsOpen` is true.
+- **`TabItem.OnPress`** (`Func<T, PointerPress, DragCapture?>`), **`TabItem.OnClose`** and
+  **`TabBar.OnNewTab`**. A tab's press carries the button and returns the gesture, so a middle-button
+  close, a drag-reorder and a tear-out are declared on the item; the ✕ and the + are live regions rather
+  than hits with no handler. Under a router the latter are DEAD -- consumed, nothing runs -- and the
+  former could not start at all, the region having consumed the press before the host saw it.
+  `TabBar.SlotAt` still nominates the slot and still moves nothing. `ITabStripSource` grew `Press(int)`
+  and `CloseTab(int)` as default members answering "none", so every implementation keeps compiling.
+
 ## 10.1
 
 **A colour glyph fades with the text it is drawn in, on the CPU renderer too.** `RgbaImageRenderer` blitted
