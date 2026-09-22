@@ -5,6 +5,13 @@ on:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+  # A push event can arrive LATE, and the difference from a lost one is not observable while you wait:
+  # upstream saw the 9.4 merge's run created 12 minutes after the commit, with the API reporting zero
+  # runs for that sha throughout -- indistinguishable from a drop until it appeared. Without this
+  # trigger the only recovery from an event that truly never lands is an empty commit.
+  # Upstream needs that to rescue an unpublished package. Here the stake is smaller -- a merge to main
+  # with no nupkg artifact, and no run to fail -- but it is the same recovery and it costs one line.
+  workflow_dispatch:
 
 env:
   # Release notes live in CHANGELOG.md at the repo root, not here. Nothing in this workflow ever
