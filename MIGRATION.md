@@ -6,6 +6,55 @@ listed here -- [CHANGELOG.md](CHANGELOG.md) says what changed in every version, 
 Upgrading across more than one major? Work UP the file: the sections are independent, and a 9.x
 consumer taking 10.0 needs only the 10.0 section.
 
+## 11.0 the caret blinks on the clock
+
+Affects anyone setting `PixelWidgetBase.FrameCount`, or calling `TextInputRenderer.Render` with a
+`frameCount` argument.
+
+### `FrameCount++` per frame -> `CaretPhase` from a clock, and redraw on the flip
+
+```csharp
+// Before -- every frame, and a focused field forced every frame
+widget.FrameCount++;
+bool NeedsRedraw() => ... || focusedField is { IsActive: true };
+
+// After -- once per frame, from a monotonic clock
+var phase = CaretBlink.PhaseAt(TimeProvider.System);   // or PhaseAt(timestamp, ticksPerSecond)
+widget.CaretPhase = phase;
+paintedCaretPhase = phase;
+bool NeedsRedraw() => ... || (focusedField is { IsActive: true }
+    && CaretBlink.PhaseAt(TimeProvider.System) != paintedCaretPhase);
+```
+
+A host that never set `FrameCount` needs nothing: `CaretPhase` defaults to 0, an ON phase, which is
+the steady caret it already drew. A host that only wants the caret hidden in a test sets
+`CaretPhase = 1`.
+
+### `TextInputRenderer.Render(..., frameCount, ...)` -> `caretVisible`
+
+```csharp
+// Before
+TextInputRenderer.Render(renderer, state, x, y, w, h, font, size, frameCount);
+
+// After
+TextInputRenderer.Render(renderer, state, x, y, w, h, font, size,
+    caretVisible: CaretBlink.IsVisible(CaretBlink.PhaseAt(TimeProvider.System)));
+```
+
+The parameter is a `bool` now, so a `long` passed positionally fails to compile rather than being
+read as a visibility.
+
+### `MouseMove` carries `Modifiers` (additive, nothing to port)
+
+A host that produces moves should fill it, from the same keyboard state it reads for a press:
+
+```csharp
+new InputEvent.MouseMove(x, y, MouseButton.None, currentModifiers);
+```
+
+Existing `MouseMove(x, y)` / `MouseMove(x, y, button)` calls and `MouseMove(var x, var y)` /
+`MouseMove(var x, var y, var button)` patterns keep compiling and binding; they mean "no modifiers".
+
 ## 10.0 the cuts: one dispatcher, one focus owner, a popover stack
 
 Affects anyone calling `IPixelWidget.HitTestAndDispatch`, implementing `IKeyboardClaimant` or reading
