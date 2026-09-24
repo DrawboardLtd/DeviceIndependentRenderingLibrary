@@ -287,6 +287,150 @@ public static class Builder
         return Popover(anchor, list, state.Popover, side, backdrop);
     }
 
+    /// <summary>
+    /// A segmented control: one of <paramref name="options"/> is <paramref name="selected"/>, and a press on
+    /// another hands its value to <paramref name="onSelect"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>This adds no mechanism</b>, like <see cref="Dropdown{T}"/>: it is the segments every consumer was
+    /// writing by hand, with the three decisions a hand-written group gets wrong stated once.
+    /// </para>
+    /// <list type="bullet">
+    /// <item><b>Which segment is chosen is the STYLE's to show</b> (<see cref="ButtonGroupStyle"/>), never a
+    /// colour picked per call site: two hand-picked fills once drifted into the same colour and the group
+    /// stopped saying which side won.</item>
+    /// <item><b>Every segment declares its hit, the chosen one included</b>, so a press on it is swallowed
+    /// rather than falling through to whatever is behind -- a row, a card -- which would then act on a press
+    /// the reader aimed at the control. The chosen segment simply has no handler.</item>
+    /// <item><b>Only a segment a press would act on lights under the pointer</b>: not the chosen one, and
+    /// not a disabled one (<see cref="ButtonGroupOption{T}.DisabledReason"/>, which swallows with
+    /// <see cref="CursorKind.NotAllowed"/> and says why).</item>
+    /// <item><b>A null <paramref name="onSelect"/> makes the group a DISPLAY</b>: it shows the value and
+    /// takes no press at all, so a press falls through to what the group sits on. That is a different
+    /// statement from disabling every segment, which SWALLOWS the press: a device row whose On/Off is
+    /// mid-transition wants the row to take the press, a panel locked by a session wants it refused.</item>
+    /// </list>
+    /// <para>
+    /// The group is a horizontal stack sized by its parent: give it a height (<c>.HFixed</c> / <c>RowH</c> on
+    /// the row it sits in). Segments share the width equally unless the style fixes one.
+    /// </para>
+    /// </remarks>
+    /// <param name="fontSize">Label size, and the icon size for an icon segment, in design units.</param>
+    public static Node ButtonGroup<T>(ReadOnlySpan<ButtonGroupOption<T>> options, T selected,
+        Action<T>? onSelect, in ButtonGroupStyle style, float fontSize = 14f)
+    {
+        var comparer = System.Collections.Generic.EqualityComparer<T>.Default;
+        var segments = new Node[options.Length];
+        var insetWeight = (1f - style.InsetFraction) * 0.5f;
+        var interactive = onSelect is not null;
+
+        for (var i = 0; i < options.Length; i++)
+        {
+            var option = options[i];
+            var isSelected = comparer.Equals(option.Value, selected);
+            var enabled = option.DisabledReason is null;
+            var contentColour = isSelected ? style.SelectedContent : style.UnselectedContent;
+
+            var face = option.Icon is { } icon
+                ? Icon(icon, fontSize, contentColour)
+                : Text(option.Label ?? string.Empty, fontSize, contentColour, TextAlign.Center, TextAlign.Center);
+            face = face.WStar().HStar();
+
+            // Background, radius and hover on the FACE, which is the whole segment or its inset band.
+            var fill = option.Fill ?? (isSelected ? style.SelectedFill : style.UnselectedFill);
+            if (fill is { } background)
+            {
+                face = face.Bg(background);
+            }
+            if (style.CornerRadius > 0f)
+            {
+                face = face.Radius(style.CornerRadius);
+            }
+            if (interactive && enabled && !isSelected)
+            {
+                face = face.BgHover(option.HoverFill ?? style.HoverFill);
+            }
+
+            // The press covers the whole cell even when the look is an inset pill, so the hit sits on the
+            // OUTER node: the engine binds a node's background and its hit to the same rect, so an inset
+            // background and a full-height hit cannot share one leaf.
+            var cell = style.InsetFraction < 1f
+                ? VStack(Spacer().HStar(insetWeight), face.HStar(style.InsetFraction), Spacer().HStar(insetWeight))
+                : face;
+            cell = style.SegmentWidth is { } width ? cell.WFixed(width).HStar() : cell.WStar().HStar();
+
+            // A display group registers nothing, so the press reaches whatever the group sits on.
+            if (onSelect is not null)
+            {
+                var value = option.Value;
+                var hit = option.Hit ?? new HitResult.ButtonHit(option.Label ?? value?.ToString() ?? string.Empty);
+                Action<InputModifier>? press = enabled && !isSelected ? _ => onSelect(value) : null;
+                cell = cell.Clickable(hit, press);
+
+                if (!enabled)
+                {
+                    cell = cell.Disabled(option.DisabledReason ?? string.Empty);
+                }
+                else if (option.Tooltip is { Length: > 0 } tooltip)
+                {
+                    cell = cell.WithTooltip(tooltip);
+                }
+            }
+
+            segments[i] = cell;
+        }
+
+        return HStack(segments).WithGap(style.Gap);
+    }
+
+    /// <summary>
+    /// A checkbox row: a box that carries a drawn tick when <paramref name="isChecked"/>, then the label, and
+    /// a press anywhere on the row hands the OTHER state to <paramref name="onToggle"/>.
+    /// </summary>
+    /// <remarks>
+    /// The rules are <see cref="ButtonGroup{T}"/>'s, for the same reasons: the look is the style's
+    /// (<see cref="CheckboxStyle"/>), the row lights only when a press would act, a
+    /// <paramref name="disabledReason"/> swallows the press and says why, and a null
+    /// <paramref name="onToggle"/> makes it a DISPLAY that registers nothing, so the press reaches what it
+    /// sits on. The whole row is the target, not only the box: a box the size of a letter is a hard thing
+    /// to hit, and the label is what the reader is looking at when they reach for it.
+    /// </remarks>
+    /// <param name="hit">The row's hit, or null for a <see cref="HitResult.ButtonHit"/> named after the label.</param>
+    public static Node Checkbox(string label, bool isChecked, Action<bool>? onToggle, in CheckboxStyle style,
+        float fontSize = 14f, HitResult? hit = null, string? disabledReason = null)
+    {
+        var boxSide = style.BoxSize > 0f ? style.BoxSize : fontSize;
+        var box = isChecked
+            ? Icon(IconKind.Check, boxSide * 0.7f, style.CheckColor)
+            : Spacer();
+        box = box.Bg(style.BoxFill).WFixed(boxSide).HFixed(boxSide);
+        if (style.CornerRadius > 0f)
+        {
+            box = box.Radius(style.CornerRadius);
+        }
+
+        var labelColour = isChecked ? style.CheckedLabelColor ?? style.LabelColor : style.LabelColor;
+        var row = HStack(box, Text(label, fontSize, labelColour, TextAlign.Near, TextAlign.Center).WStar().HStar())
+            .CrossCenter()
+            .WithGap(style.Gap);
+
+        if ((isChecked ? style.CheckedRowFill ?? style.RowFill : style.RowFill) is { } rowFill)
+        {
+            row = row.Bg(rowFill);
+        }
+
+        if (onToggle is null)
+        {
+            return row;
+        }
+
+        row = row.Clickable(hit ?? new HitResult.ButtonHit(label), disabledReason is null ? _ => onToggle(!isChecked) : null);
+        return disabledReason is null
+            ? row.BgHover(style.HoverFill)
+            : row.Disabled(disabledReason);
+    }
+
     /// <summary>Two resizable panes plus a draggable divider; <paramref name="firstExtent"/> is consumer-owned state. See <see cref="Node.Split"/>.</summary>
     public static Node Split(Node first, Node second, Axis axis = Axis.Horizontal,
         float firstExtent = 0f, float dividerThickness = 6f,
