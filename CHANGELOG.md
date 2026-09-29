@@ -9,6 +9,58 @@ this file disagrees with. Bump it there and add the entry here, in the same comm
 Breaking changes carry their migration steps in [MIGRATION.md](MIGRATION.md); this file says what
 changed and why.
 
+## 11.6
+
+**CFF and Type 1 text keeps its hairlines.** SharpAstro.Fonts 1.13 fixes the MTSDF of a CFF or Type 1
+glyph with a counter (a, e, o, d, ...): its generator read contour windings as TrueType's, so every texel
+outside such a glyph measured its distance to the counter, and each outer edge drew about half a texel
+inside the outline. At reading size that erased the top of a Times `a`. Glyphs with one contour and every
+TrueType glyph were never affected. `SdfGlyphDiskCache` moves to format 7, so a `.sdfg` written with the
+thin fields is rewritten on its next append instead of serving them. No API change.
+
+## 11.5
+
+**An inspector payload key that binds nothing is refused, and a key matches its parameter in any case.**
+The generated `SignalDirectory` used to read each parameter from its name with only the first letter
+lowered, and to ignore any key it did not look for. So TianWen's pin signal, whose parameter is `RA`, was
+read from `rA`; a payload spelling it `ra` bound nothing, and the target was pinned at RA 0 by a call
+that answered "queued" like any other.
+
+- `SignalJson` matches a key in any case (`RA`, `ra` and `rA` all reach `RA`), the exact spelling first.
+- The generator camel-cases as `System.Text.Json` does (`RA` to `ra`, `OtaIndex` to `otaIndex`,
+  `URLValue` to `urlValue`), which is the spelling a payload's author expects.
+- New: `SignalJson.RequireKnownKeys(el, signal, keys)`, which every generated factory calls first. A key
+  that names no bindable parameter throws `ArgumentException` listing the keys the signal does take, as an
+  unknown signal name already does, so the inspector answers with the fix instead of posting a default.
+  A key for a parameter no payload can set (a complex type with a `null` default) is refused too.
+
+The generator's output was never tested: CI builds Release, where it emits nothing. The new
+`SignalDirectoryGeneratorTests` run it with `DEBUG` defined and compile what it emits against
+`SignalJson`, so a call that stops binding fails there, in either configuration.
+
+## 11.4
+
+**`BackgroundTaskTracker` is safe to use from any thread.** It was written for the render thread alone,
+and the assumption broke without anyone deciding it: `SignalBus.ProcessPending` runs an async handler
+inline only up to its first `await`, and a host with no synchronization context (TianWen's SDL loop, the
+TUI) resumes it on the thread pool, so a handler that submits work after an await submits from a pool
+thread while the render thread completes work on the same tracker. TianWen's session and flat-run
+bootstrappers both do. Over a plain `List` and `Dictionary` that could:
+
+- lose a submission, so `HasPending` answered false while the work still ran (a quit that waits on it
+  could exit in the middle of a session's `Finalise`);
+- throw "Collection was modified" out of `DrainAsync`, when work submitted a follow-up while it drained;
+- corrupt the keyed slots when two `RunExclusive` calls met on one key.
+
+The whole state is now one immutable value replaced by compare-and-swap, the lock-free shape of the org's
+`CircularBuffer`. Every effect (starting the work, cancelling or disposing a token source, logging a fault)
+happens once, after the swap, done by the caller whose swap made the change. A superseded slot is disposed
+by whichever of its displacer and its retirement settles second, so a cancel can never meet a disposed
+source. `DrainAsync` now also waits for work submitted while it drains. One ordering moved, harmlessly:
+`RunExclusive` starts the new work a moment BEFORE cancelling its predecessor rather than just after, since
+the start cannot sit inside a swap that may retry; cancellation is cooperative, so the two overlapped
+already. Three tests pin it, each seen failing on the old tracker first. No API change.
+
 ## 11.3
 
 **A glyph's outline, for a consumer that draws vectors.** `ManagedFontRasterizer.TryDrawGlyphOutline(fontPath,
