@@ -813,6 +813,33 @@ public class InputRouterTests
     // ---- tooltip and cursor -------------------------------------------------------------------
 
     /// <summary>
+    /// A drag keeps the cursor of the region that armed it wherever the pointer travels, which no region under the
+    /// pointer can state: a host used to keep a flag ("the divider is being dragged") beside its own cursor rule.
+    /// </summary>
+    [Fact]
+    public void ADragKeepsTheCursorItBeganWithUntilTheButtonComesUp()
+    {
+        var harness = new Harness();
+        var widths = new List<float>();
+        harness.Paint(front: Layout.Builder.HStack(
+                Layout.Builder.Box(10f, 200f).WFixed(10f)
+                    .Pressable(new HitResult.ButtonHit("divider"),
+                        _ => new DragCapture(move => widths.Add(move.X), _ => { }), CursorKind.ResizeEW),
+                Layout.Builder.Spacer().Stretch())
+            .Stretch());
+
+        harness.Router.CursorAt(100f, 50f).ShouldBeNull("over the content, before any drag");
+
+        harness.Press(5f, 50f);
+        harness.Move(100f, 50f);
+        harness.Router.CursorAt(100f, 50f).ShouldBe(CursorKind.ResizeEW, "the drag keeps the divider's cursor");
+        widths.ShouldBe([100f]);
+
+        harness.Release(100f, 50f);
+        harness.Router.CursorAt(100f, 50f).ShouldBeNull("the drag ended");
+    }
+
+    /// <summary>
     /// The delay is the half three hand-written tooltip painters were all missing. Without one a tooltip
     /// appears under the pointer on its way past, which is why a reader learns to steer around them.
     /// </summary>
@@ -832,6 +859,68 @@ public class InputRouterTests
         due.Text.ShouldBe("Cool the camera");
         due.Anchor.Y.ShouldBe(0f, 0.01f, "anchored to the region it belongs to");
         due.Anchor.Height.ShouldBe(20f, 0.01f);
+    }
+
+    /// <summary>
+    /// An open popover claims the pointer for its tooltips as it does for the hover highlight: its backdrop states
+    /// no tooltip, and a lookup that looked straight through it let the button underneath explain itself.
+    /// </summary>
+    [Fact]
+    public void ATooltipUnderAnOpenPopoversBackdropIsNeverDue()
+    {
+        var harness = new Harness();
+        var popover = new PopoverState();
+        popover.Open();
+        harness.Paint(
+            back: Layout.Builder.VStack(
+                Layout.Builder.Box(200f, 20f).RowH(20f).WithTooltip("Cool the camera"),
+                Layout.Builder.Spacer().Stretch()).Stretch(),
+            front: Layout.Builder.Popover(new RectF32(40f, 100f, 20f, 10f), Layout.Builder.Box(50f, 30f), popover));
+
+        harness.Move(10f, 10f);
+        harness.Clock.Advance(harness.Router.TooltipDelay);
+
+        harness.Router.Tooltip.ShouldBeNull("the popover's backdrop covers the button");
+    }
+
+    [Fact]
+    public void ARegionsTooltipSideReachesTheRequestAndBelowIsTheDefault()
+    {
+        var harness = new Harness();
+        harness.Paint(front: Layout.Builder.VStack(
+            Layout.Builder.Box(200f, 20f).RowH(20f).WithTooltip("Home", Layout.DockSide.Right),
+            Layout.Builder.Box(200f, 20f).RowH(20f).WithTooltip("Equipment")).Stretch());
+
+        harness.Move(10f, 10f);
+        harness.Clock.Advance(harness.Router.TooltipDelay);
+        harness.Router.Tooltip.ShouldNotBeNull().Side.ShouldBe(Layout.DockSide.Right);
+
+        harness.Move(10f, 30f);
+        harness.Clock.Advance(harness.Router.TooltipDelay);
+        harness.Router.Tooltip.ShouldNotBeNull().Side.ShouldBe(Layout.DockSide.Bottom);
+    }
+
+    /// <summary>
+    /// The delay runs out while nothing happens, so a host that paints only when asked needs telling; and once a
+    /// frame has been painted with the tooltip due, it has been shown and the host is told no more.
+    /// </summary>
+    [Fact]
+    public void ATooltipAsksForAFrameOnceItIsDueAndNotAgainAfterThePaint()
+    {
+        var harness = new Harness();
+        harness.Paint(front: Layout.Builder.VStack(
+            Layout.Builder.Box(200f, 20f).RowH(20f).WithTooltip("Cool the camera"),
+            Layout.Builder.Spacer().Stretch()).Stretch());
+
+        harness.Move(10f, 10f);
+        harness.Router.TooltipNeedsFrame.ShouldBeFalse("not due yet");
+
+        harness.Clock.Advance(harness.Router.TooltipDelay);
+        harness.Router.TooltipNeedsFrame.ShouldBeTrue("due, and no frame has shown it");
+
+        harness.Router.AfterPaint();
+        harness.Router.TooltipNeedsFrame.ShouldBeFalse("the frame just painted showed it");
+        harness.Router.Tooltip.ShouldNotBeNull("still due: asking for no frame is not taking it down");
     }
 
     [Fact]
