@@ -9,6 +9,88 @@ this file disagrees with. Bump it there and add the entry here, in the same comm
 Breaking changes carry their migration steps in [MIGRATION.md](MIGRATION.md); this file says what
 changed and why.
 
+## 11.17
+
+**A widget can ask for a file without knowing the platform.** `IFileDialogs` is the platform's open, save and
+folder dialogs as a widget asks for them (`OpenAsync`, `SaveAsync`, `OpenFolderAsync` over a `FileDialogRequest`:
+title, `FileDialogFilter`s, start folder, suggested name, many), answered with a `FileDialogResult`. A host
+implements it over its windowing, and a test substitutes it, which a static helper never allowed. The contract is
+stated on the interface: the call never blocks the thread that asked, the task completes on the window's event
+thread, a token cancellation completes it as CANCELLED rather than as an empty result (so "the user said no" and
+"the caller gave up" stay apart), and a save path is given an extension when the user typed none
+(`FileDialogFilter.WithDefaultExtension`, Windows' `lpstrDefExt` applied on every platform, since GTK's portal,
+zenity and macOS append nothing). `FileDialogResult.FilterIndex` is -1 where the platform does not say, which is
+often, and is documented as not to be relied on: decide a format from the extension.
+
+Additive. SdlVulkan.Renderer implements it over SDL's dialogs.
+
+## 11.16
+
+**A drag keeps the cursor it began with.** While a gesture is captured, `InputRouter.CursorAt` answers the cursor
+of the region whose press armed it, wherever the pointer travels: a divider being dragged shows the resize cursor
+over the picture it crosses, a text selection the I-beam past its field's edge. A host used to keep a flag ("the
+divider is being dragged") beside its own cursor rule for exactly this, and the flag outlived the drag's own
+handling. No region under the pointer can state it, which is why it is the router's.
+
+Behaviour change only while a capture is active, and only where the arming region stated a cursor.
+
+## 11.15
+
+**Hand-painted chrome asks the painter's hover rule.** `PixelWidgetBase.PointerHovers(rect)` answers whether the
+pointer hovers a rect the way a declared `.BgHover` node lights (inside it, and not claimed away by an open popover,
+`WindowUiSettings.PointerClaim`), and `HoverAllowedAt(x, y)` answers the claim half alone. Chrome that still decides
+its own highlight, a hand-painted list row or a picture's hover wash, used to keep its own prediction of which
+overlays were open beside it; it asks these instead, so it cannot disagree with the declared nodes around it.
+
+Additive (two protected members).
+
+## 11.14
+
+**An open popover's claim on the pointer confines what is painted BEFORE it too.** A popover paints last, over
+the chrome it covers, and claims the pointer by being painted, so a declared button painted earlier in the frame
+saw no claim and lit under an open menu's backdrop. Consumers kept a hand-written "does an overlay own the pointer"
+prediction beside their chrome for exactly this.
+
+- **`WindowUiSettings.PointerClaim`**: the claim in force for what is painted now. It is `PointerOwner` once a popover
+  has painted this frame; before that, it is the claim the last frame ended with, for as long as that popover is
+  still open. Hover painting confines itself to it.
+- **`WindowUiSettings.PointerClaimSettled`** is false the frame a popover opens, moves or closes, and
+  `InputRouter.AfterPaint` then asks for one more frame. Without that, a highlight painted before the popover's
+  first paint would stay up until something else repainted.
+
+Additive. `PointerOwner` keeps its meaning (this frame's record, what the router resolves events against).
+
+## 11.13
+
+**One tooltip painter, `Layout.Builder.Tooltip`.** The router has decided which tooltip is due and where it is
+anchored since 9.2, and nothing drew it: a consumer painted its own, measuring the text and placing the box by
+hand with no hover delay, and every `.WithTooltip` outside those painters was dead. A host now paints the
+router's due tooltip once a frame, last, over the whole window:
+
+```csharp
+RenderLayout(Layout.Builder.Tooltip(router.Tooltip, style), windowRect);   // nothing when it is null
+```
+
+- **`Layout.Builder.Tooltip(TooltipRequest, TooltipStyle)`** draws the text in a bordered box beside the region,
+  and **`Tooltip(anchor, content, style, side)`** frames any content (a readout of several coloured lines) by the
+  same rule. `TooltipStyle` holds the colours, the font size, the padding, the border and the margin. The box
+  registers no region and lights no hover, so painting it changes nothing the router resolves.
+- **A tooltip says which side it opens on**: `.WithTooltip(text, side)` (`Node.TooltipSide`,
+  `ClickableRegion.TooltipSide`, `TooltipRequest.Side`, below by default).
+- **The tab strip declares its tabs' tooltips** (`ITabStripSource.Tooltip`, a default member;
+  `TabItemsSource` answers `TabItem.Tooltip`), opening away from the strip: right of a strip down the left edge.
+  A disabled tab's is its reason. `TabBar.HoveredIndex` stays, but a host no longer needs it for a tooltip.
+- **`InputRouter.TooltipNeedsFrame`**: the hover delay runs out while the pointer rests, which nothing else
+  notices, so a host that paints only when asked ORs this into its redraw check, as it does a blinking caret.
+- **Fixed: a tooltip showed through an open popover.** The lookup treated regions with nothing to say as
+  transparent, the popover's backdrop among them, so a button under an open popover explained itself through it.
+  It now honours the popover's pointer claim, as the hover highlight always did.
+- **`Node.Anchored.CenterAlong` and `FlipWhenCramped`** (init-only, so additive): against an anchor, centre the
+  child on the edge it opens beside, and open on the opposite side when it would run out of the rect on the named
+  one. `Builder.Tooltip` sets both.
+
+Additive; no public API was removed or changed in shape.
+
 ## 11.12
 
 **A caller can keep glyph quads across frames.** A renderer that lays a page's text out once, in a
