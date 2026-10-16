@@ -3,8 +3,9 @@ using System;
 namespace DIR.Lib;
 
 /// <summary>
-/// The pixel-surface implementation of <see cref="Layout.IMeasureContext{T}"/>: text intrinsic size comes from
-/// <see cref="Renderer{TSurface}.MeasureText"/>, and design-unit scalars (padding, gaps, fixed/font sizes)
+/// The pixel-surface implementation of <see cref="Layout.IMeasureContext{T}"/>: text intrinsic width comes from
+/// <see cref="Renderer{TSurface}.MeasureText"/> and its height is the face's line box (see <see cref="MeasureText"/>),
+/// and design-unit scalars (padding, gaps, fixed/font sizes)
 /// scale into device pixels. So the arranged rects come back in device pixels; the painter must
 /// draw text at <c>fontSize * FontScale</c> to match what was measured — which is why the painter should be
 /// handed THIS context (<see cref="PixelWidgetBase{TSurface}"/>'s context-taking layout methods) rather than a
@@ -39,9 +40,24 @@ public sealed class PixelMeasureContext<TSurface>(Renderer<TSurface> renderer, s
     /// a nominal 8x16 cell by default — pass the terminal's real cell size when it is known. The mirror of
     /// <c>CellMeasureContext.PixelAuthored</c>: a <c>fontSize: 1f</c> text leaf (one cell tall there) is
     /// measured and painted at <paramref name="cellHeight"/> pixels here.
+    /// <para>
+    /// <b>Its line box is one cell, not 1.3 em.</b> On a terminal the line box IS the cell --
+    /// <c>CellMeasureContext</c> gives a <c>fontSize: 1f</c> run one row -- so a text leaf here measures
+    /// exactly <c>fontSize</c> cells tall. With the pixel line box instead, the same shared tree would stack
+    /// its lines 1.3 cells apart on pixels and 1 apart on a terminal, and the two would no longer mirror.
+    /// </para>
     /// </summary>
     public static PixelMeasureContext<TSurface> CellAuthored(Renderer<TSurface> renderer, string fontPath,
-        float cellWidth = 8f, float cellHeight = 16f) => new(renderer, fontPath, cellWidth, cellHeight);
+        float cellWidth = 8f, float cellHeight = 16f) => new(renderer, fontPath, cellWidth, cellHeight)
+        {
+            LineHeightFactor = 1f,
+        };
+
+    /// <summary>
+    /// A text leaf's line box as a multiple of its scaled font size: <see cref="TextBaseline.LineHeightFactor"/>
+    /// on every pixel-authored mapping, one on <see cref="CellAuthored"/>, where a line is a cell.
+    /// </summary>
+    private float LineHeightFactor { get; init; } = TextBaseline.LineHeightFactor;
 
     /// <summary>The font the tree's text is measured against; the painter must draw with the same one.</summary>
     public string FontPath => fontPath;
@@ -84,15 +100,30 @@ public sealed class PixelMeasureContext<TSurface>(Renderer<TSurface> renderer, s
     /// </summary>
     public float FontScale => scaleY;
 
+    /// <summary>
+    /// A text leaf's intrinsic size: the run's advance width, and the face's LINE BOX for height
+    /// (<see cref="TextBaseline.LineHeight"/> at the scaled size), whatever glyphs the run holds. On
+    /// <see cref="CellAuthored"/> the line box is one cell per unit of font size instead, the terminal's own.
+    /// <para>
+    /// Not the ink. Every renderer's <c>DrawText</c> lays a line out in that box, so a leaf measured to it
+    /// and drawn top-aligned sits exactly where a hand-centred row would put it -- which is what lets a
+    /// button size itself from its padding alone, with no <c>.RowH(fontSize + gap)</c>. Measuring the ink
+    /// made the height depend on which letters were present: "LOG" and "gjpq" at one size came back
+    /// different heights, so a row of labels could not agree on how tall it was. The renderer's own
+    /// <see cref="Renderer{TSurface}.MeasureText"/> still answers ink; only the layout's question changed.
+    /// </para>
+    /// </summary>
     public Layout.Size<float> MeasureText(ReadOnlySpan<char> text, float fontSize)
     {
+        var px = fontSize * FontScale;
+        var lineHeight = px * LineHeightFactor;
+
         if (string.IsNullOrEmpty(fontPath) || text.IsEmpty)
         {
             // No font (e.g. headless) or empty run: width 0, but keep a sensible line height for row sizing.
-            return new Layout.Size<float>(0f, fontSize * FontScale);
+            // The same line box a drawn run gets, so an empty label does not collapse its row.
+            return new Layout.Size<float>(0f, lineHeight);
         }
-
-        var px = fontSize * FontScale;
 
         // Only split when the primary can't draw the whole run — PrimaryCoversAll is
         // allocation-free and true for essentially all chrome, so the common path is unchanged.
@@ -100,18 +131,16 @@ public sealed class PixelMeasureContext<TSurface>(Renderer<TSurface> renderer, s
         {
             var runs = _runs ??= [];
             fallback.CoverageRuns(text, runs);
-            float w = 0f, h = 0f;
+            float w = 0f;
             foreach (var (start, length, runFont) in runs)
             {
-                var (rw, rh) = renderer.MeasureText(text.Slice(start, length), runFont, px);
-                w += rw;
-                if (rh > h) h = rh;
+                w += renderer.MeasureText(text.Slice(start, length), runFont, px).Width;
             }
-            return new Layout.Size<float>(w, h);
+            return new Layout.Size<float>(w, lineHeight);
         }
 
-        var (width, height) = renderer.MeasureText(text, fontPath, px);
-        return new Layout.Size<float>(width, height);
+        var width = renderer.MeasureText(text, fontPath, px).Width;
+        return new Layout.Size<float>(width, lineHeight);
     }
 
     // Scratch for the run split. A context is per-widget-per-paint and used from the render

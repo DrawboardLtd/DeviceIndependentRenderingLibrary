@@ -9,6 +9,120 @@ this file disagrees with. Bump it there and add the entry here, in the same comm
 Breaking changes carry their migration steps in [MIGRATION.md](MIGRATION.md); this file says what
 changed and why.
 
+## 11.22
+
+**A content-capped Star: `Sizing.StarUpToContent(weight = 1, min = 0)`**, with the fluent `.WStarUpToContent` /
+`.HStarUpToContent`. A plain Star's share is set by its weight and never by its text, so a trimming Star label was
+trimmed whenever its share fell under its text, even with room in the row (TianWen's orrery strip gave a 170 px time
+label about 140 px at 1.0x, and at 1.5x overflowed because the labels could only be Auto, which never shrinks;
+tianwen#1584). A content-capped Star is capped at its own measured content, width sample included, and along a
+Stack's axis it is served before the plain Stars: with room it sits at exactly its content and the surplus goes to
+the plain Stars; in a short row the plain Stars give way first, then the content-capped ones shrink by weight toward
+`min` (water-filling: one whose share exceeds its content hands the excess to the others), and their text fits
+through its own `TextTrim` as before. A plain Star's `Min` is reserved before they are served; with no plain Star
+the rest of the row stays unused, the rule a `Max`-capped Star already follows. It counts its content in an Auto
+Stack's natural size, and across a Stack it takes its content instead of stretching. In a Dock strip, a Grid column
+or a Wrap it acts as a plain Star.
+
+A minor: `Sizing.UpToContent` is an init-only property, not a constructor parameter, so `Sizing`'s constructor and
+`Deconstruct` keep their published shape, and every existing tree (no Star carries the flag) arranges exactly as it
+did.
+
+## 11.21
+
+**The debug inspector is found through a per-user file registry, and answers LAN multicast only when asked.** A
+started `DebugInspectorCore` writes one descriptor file per instance, `<pid>-<tcpPort>.json`, under
+`LocalApplicationData/DIR.Lib/inspector` (`%LOCALAPPDATA%\DIR.Lib\inspector` on Windows), before `Start` returns,
+keeps it current from `Pump` when the host's `DiscoveryExtras` change, and deletes it on `Dispose`; each start also
+sweeps the descriptors a crash left behind. The UDP multicast responder binds `0.0.0.0:47892`, and Windows Firewall
+prompted for that once per executable path, so every DEBUG build at a new path (each git worktree) asked again. It
+now starts only for `DebugInspectorDiscovery.Lan`: from the new `Start(host, DebugInspectorDiscovery)` overload, or,
+without a consumer release, with `DIR_LIB_INSPECTOR_LAN=1`. Neither overrides `enableDiscovery: false`, which still
+means not findable at all. The format the sidecars read is specified in `src/DIR.Lib/Diagnostics/inspector-registry.md`.
+
+`Start(host, bool enableDiscovery = true)` keeps its exact signature, so a consumer compiled against 11.20 binds to it
+unchanged, and `true` now means the registry. A sidecar that only multicasts stops finding DEBUG apps built against
+11.21 until it reads the registry, or until the app runs with `DIR_LIB_INSPECTOR_LAN=1`. The multicast reply is byte
+for byte what it was, so a sidecar that does both still finds older builds. The stderr banner now ends in
+` (registry)`, ` (registry, LAN discovery on ...)` or ` (discovery off)`.
+
+A minor, not a major: no API was removed or changed, and the inspector is `#if DEBUG`, so it is absent from every
+published package and nothing a package consumer can reach behaves differently.
+
+## 11.20
+
+**A text leaf measures its line box, not its ink.** `PixelMeasureContext.MeasureText`, the height every text node in a
+pixel layout gets, is now the face's line box at the scaled size (`TextBaseline.LineHeight`, 1.3 em) whatever glyphs
+the run holds: on the single-face path, on the fallback path (a run split across faces used to take its tallest run's
+ink, a colour emoji's bitmap included), and with no font or an empty run (which used to be one em). Width is the
+renderer's advance as before. The renderers' own `MeasureText` still answers ink, for what needs ink: a label placed
+against a shape.
+
+Measuring the ink made a node's height depend on what it said. "LOG" at 18 px measured its cap height, 13 px, and
+"gjpq" 18 px, so two buttons side by side measured differently, and every declared text control stated its height by
+hand as a line box, `.RowH(fontSize + gap)`. Every renderer's `DrawText` already lays a line out in the 1.3 em box, so a
+leaf of that height drawn top-aligned lands where a hand-centred row put it, and a text button is now its padding
+alone: `.Pad(across, down)` in place of the hand line box. To keep a row's old height exactly, the vertical padding
+per side is `(fontSize + gap - TextBaseline.LineHeight(fontSize)) / 2`.
+
+**Every text node's measured height moves.** A node whose height is fixed (`RowH`, `HFixed`) or star does not: the
+measure never reached it. An Auto-height one grows from its ink to 1.3 em, and what is stacked after it moves down by
+the difference: `Builder.Tooltip`'s box at 10 px is 21 tall rather than 18, and a `TextInput` leaf is one line box
+tall. A cell-authored tree does not take the 1.3 em: on a terminal the line box IS one cell, so its own cell context is
+untouched, and `PixelMeasureContext.CellAuthored`, the mirror that arranges such a tree onto pixels, measures a text
+leaf exactly `fontSize` cells tall (a `fontSize: 1f` leaf is one `cellHeight`), whatever its ink. A shared tree stacks
+its lines one cell apart on both surfaces. No visual baseline here moved: none of them arranges a text node through
+the engine.
+
+## 11.19
+
+**Data views: a virtualised list, a table whose header cannot drift from its rows, a tree, and a treemap.** None adds
+a mechanism; each is the primitives arranged the way consumers were arranging them by hand, with what goes wrong
+stated once.
+
+- `Builder.VirtualList(count, rowHeight, scroll, row)` builds only the rows on screen, standing a spacer in for the
+  rest so the scroll extent is still the whole list's: a hundred thousand rows cost what thirty do. It makes an atom
+  a row (`ListScrollController.AtomDesignUnits`), and pairs with `ListCursor.Open(id, index, count)` so the arrows
+  can step past the built window.
+- `Builder.TableHeader(columns, sort, onSort, style)` and `Builder.TableRow(columns, cells, style)` take the SAME
+  span of `TableColumn`s (title, `Sizing`, alignment, `Sortable`, `DescendingFirst`) and one `TableStyle`, so a title
+  sits over its values whatever either is edited to. A press on a sortable title reports `TableSort.Next`: the same
+  column flips, another starts in its own direction. The sort itself stays the consumer's, like a split's extent.
+- `TreeExpansion<T>` holds which nodes are open, by reference, and `Flatten` turns a tree into `TreeRowItem<T>` rows
+  (item, depth, can-open, is-open, parent row) for a list to show: a tree gets the list's keyboard, scrolling and
+  virtualisation instead of a second copy of each. Children are read only for an open node, so a lazily loaded tree
+  costs nothing until it is opened. `HandleKey` adds the two keys a list does not own: Right opens or descends,
+  Left closes or ascends. `Builder.TreeRow(depth, hasChildren, isExpanded, onToggle, content, style)` draws the
+  indent and a caret that takes its own press inside the row.
+- `Builder.Treemap(weights, aspect, cell)` is a squarified treemap (`Treemap.Squarify`, Bruls et al.) built from
+  nested `Star`-weighted stacks, so every cell is a node, drawn and hit through one rect, and its area is exactly
+  proportional at any size. The aspect only decides how square the cells are, so last frame's is fine.
+
+Additive. `Builder` became `partial` to hold them, which changes nothing in the assembly.
+
+**Context menus.** `Node.WithContextMenu(Action<PointerPress>)` states what a RIGHT press does; the router runs it in
+place of the click and hands it the press, so the menu opens at the pointer (pair it with `Builder.Dropdown`). Until now
+the router never read the button, so a right press on a row WAS a click; a node that declares no menu keeps exactly
+that. A right press over a part of a row with no menu of its own (a twirl caret, a cell button) reaches the row's menu
+beneath it, and a popover backdrop stops that search.
+
+## 11.18
+
+**A split's divider drags itself.** `Builder.Split(first, second, onResize, ...)` (`Node.Split.OnResize`) arms the drag
+from the divider's own press and reports every step as a `SplitResize`: the first pane's new extent in design units,
+ready to hand back as next frame's `FirstExtent`, and whether the step is the release. The drag is relative to the
+press, so a press anywhere in the grab band moves nothing until the pointer does, and the extent is clamped to what the
+split can lay out. The divider states the resize cursor of its axis (a drag keeps it, 11.16) and registers as a
+`ChromeHit` when it is given no hit. `grabThickness` (`Node.Split.GrabThickness`) widens the band that answers a press
+past the drawn `dividerThickness`, centred on the line and kept inside the split; a wider band is its own node, emitted
+after both panes so it wins the press over whatever they put at their edges.
+
+Before this a divider carried a hit and no handler, which a router consumes and runs nothing for, so a consumer
+registered a second region over it to arm the drag and turned the pointer back into an extent by hand: against a pane
+origin it assumed, in a scale it read off the window, and jumping by wherever inside the band the press landed.
+
+Additive: a `Split` without `OnResize` arranges and paints as before.
+
 ## 11.17
 
 **A widget can ask for a file without knowing the platform.** `IFileDialogs` is the platform's open, save and
