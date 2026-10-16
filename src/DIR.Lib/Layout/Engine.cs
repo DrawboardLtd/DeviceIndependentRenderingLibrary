@@ -298,17 +298,71 @@ public static class Engine
         // Synthesize the divider as its own draw==hit node: the painter fills DividerColor and binds
         // DividerHit to the SAME arranged rect, so the grab region cannot drift from the drawn bar.
         // Emitted only when there is something to draw or hit (otherwise the divider is a pure gap).
-        if (split.DividerColor is not null || split.DividerHit is not null)
+        var hit = split.DividerHit ?? (split.OnResize is null ? null : new HitResult.ChromeHit());
+        var onPress = split.OnResize is { } onResize ? ResizeDrag(onResize, first, maxFirst, split.Axis, ctx) : null;
+        var cursor = onPress is null ? (CursorKind?)null : horizontal ? CursorKind.ResizeEW : CursorKind.ResizeNS;
+
+        // A grab band wider than the drawn divider is its own node, placed over both panes' edges, so it is emitted
+        // AFTER the second pane: a later node wins the hit, and the band must win it over what the panes put there.
+        var grab = hit is null ? T.Zero : Max(ToSurfaceOn(ctx, split.GrabThickness, split.Axis), divider);
+        var separateGrab = grab > divider;
+        if (split.DividerColor is not null || hit is not null)
         {
             var dividerNode = new Node.Leaf(new Content.Box(0f, 0f))
             {
                 Background = split.DividerColor,
-                Hit = split.DividerHit,
+                Hit = separateGrab ? null : hit,
+                OnPress = separateGrab ? null : onPress,
+                Cursor = separateGrab ? null : cursor,
             };
             output.Add(new ArrangedNode<T>(dividerNode, dividerRect) { Depth = depth });
         }
 
         ArrangeNode(split.Second, secondRect, ctx, output, depth);
+
+        if (separateGrab)
+        {
+            var two = T.One + T.One;
+            var mainStart = (horizontal ? inner.X : inner.Y) + first + divider / two - grab / two;
+            var mainMin = horizontal ? inner.X : inner.Y;
+            var start = Max(mainStart, mainMin);
+            var end = Min(mainStart + grab, mainMin + mainAvail);
+            var grabRect = horizontal
+                ? new Rect<T>(start, inner.Y, Max(T.Zero, end - start), inner.Height)
+                : new Rect<T>(inner.X, start, inner.Width, Max(T.Zero, end - start));
+            var grabNode = new Node.Leaf(new Content.Box(0f, 0f)) { Hit = hit, OnPress = onPress, Cursor = cursor };
+            output.Add(new ArrangedNode<T>(grabNode, grabRect) { Depth = depth });
+        }
+    }
+
+    /// <summary>
+    /// The press of a divider that drags itself (<see cref="Node.Split.OnResize"/>): the drag is relative to the press,
+    /// so wherever in the grab band it landed moves nothing until the pointer does, and every extent reported is in
+    /// design units, clamped to what the split can lay out.
+    /// </summary>
+    private static Func<PointerPress, DragCapture?> ResizeDrag<T>(Action<SplitResize> onResize, T first, T maxFirst,
+        Axis axis, IMeasureContext<T> ctx) where T : INumber<T>
+    {
+        // Surface units per design unit along the axis, probed over a long run so a cell surface, which rounds a
+        // single design unit, still gives its true ratio.
+        const float probe = 4096f;
+        var perUnit = float.CreateSaturating(ToSurfaceOn(ctx, probe, axis)) / probe;
+        var startExtent = perUnit > 0f ? float.CreateSaturating(first) / perUnit : 0f;
+        var maxExtent = perUnit > 0f ? float.CreateSaturating(maxFirst) / perUnit : 0f;
+        var horizontal = axis == Axis.Horizontal;
+
+        return press =>
+        {
+            var origin = horizontal ? press.X : press.Y;
+            onResize(new SplitResize(startExtent, Ended: false));
+            return new DragCapture(
+                move => onResize(new SplitResize(ExtentAt(move), Ended: false)),
+                release => onResize(new SplitResize(ExtentAt(release), Ended: true)));
+
+            float ExtentAt(in PointerMove at) => perUnit > 0f
+                ? Math.Clamp(startExtent + ((horizontal ? at.X : at.Y) - origin) / perUnit, 0f, maxExtent)
+                : startExtent;
+        };
     }
 
     private static void ArrangeStack<T>(Node.Stack stack, Rect<T> rect, Rect<T> inner, IMeasureContext<T> ctx,
@@ -436,7 +490,8 @@ public static class Engine
             var cross = crossSizing.Kind switch
             {
                 SizeKind.Fixed => ToSurfaceOn(ctx, crossSizing.Value, CrossAxis(axis)),
-                SizeKind.Star => crossAvail,                                   // stretch to fill cross axis
+                SizeKind.Star when !crossSizing.UpToContent => crossAvail,     // stretch to fill cross axis
+                // Auto, and a content-capped Star: its content, never more than the axis holds.
                 _ => Min(crossAvail, CrossOf(axis, Measure(children[i], availSize, ctx))),
             };
             cross = Clamp(cross, crossSizing, ctx, CrossAxis(axis));
@@ -469,7 +524,9 @@ public static class Engine
     /// <summary>
     /// Passes 1+2 of the stack arrange over the non-collapsed subset: Fixed mains resolve directly and
     /// Auto mains measure (clamped), then Star children split the leftover by weight with their Min/Max
-    /// clamps honoured (<see cref="DistributeStars"/>).
+    /// clamps honoured (<see cref="DistributeStars"/>). Content-capped Stars
+    /// (<see cref="Sizing.UpToContent"/>) are served first, out of what the plain Stars' floors leave
+    /// (<see cref="DistributeContentCappedStars"/>), and the plain Stars share whatever they do not take.
     /// </summary>
     private static void ResolveStackMains<T>(ImmutableArray<Node> children, bool[] included, int includedCount,
         Axis axis, T mainAvail, T gap, Size<T> availSize, IMeasureContext<T> ctx, T[] mains) where T : INumber<T>
@@ -477,6 +534,9 @@ public static class Engine
         var n = children.Length;
         var starIndices = new List<int>();
         var starWeights = new List<float>();
+        List<int>? cappedIndices = null;
+        List<float>? cappedWeights = null;
+        List<T>? cappedContent = null;
         var usedMain = T.Zero;
         for (var i = 0; i < n; i++)
         {
@@ -487,6 +547,15 @@ public static class Engine
             }
 
             var sizing = MainSizing(axis, children[i]);
+            if (sizing.IsStar && sizing.UpToContent)
+            {
+                // Its cap is what an Auto child here would get: the measure, Min/Max clamps included.
+                (cappedIndices ??= []).Add(i);
+                (cappedWeights ??= []).Add(sizing.Value);
+                (cappedContent ??= []).Add(Clamp(MainOf(axis, Measure(children[i], availSize, ctx)), sizing, ctx, axis));
+                continue;
+            }
+
             if (sizing.IsStar)
             {
                 starIndices.Add(i);
@@ -501,14 +570,121 @@ public static class Engine
             usedMain += size;
         }
 
-        if (starIndices.Count == 0)
+        if (starIndices.Count == 0 && cappedIndices is null)
         {
             return;
         }
 
         var gaps = gap * T.CreateChecked(Math.Max(0, includedCount - 1));
         var leftover = Max(T.Zero, mainAvail - usedMain - gaps);
-        DistributeStars(leftover, children, axis, starIndices, starWeights, ctx, mains);
+
+        if (cappedIndices is not null)
+        {
+            // The plain Stars' floors are theirs whatever happens, so they come off the top; the
+            // content-capped Stars are served from the rest, and what they leave goes to the plain Stars.
+            var plainFloors = T.Zero;
+            foreach (var i in starIndices)
+            {
+                var min = MainSizing(axis, children[i]).Min;
+                if (min > 0f)
+                {
+                    plainFloors += ToSurfaceOn(ctx, min, axis);
+                }
+            }
+
+            var taken = DistributeContentCappedStars(Max(T.Zero, leftover - plainFloors), children, axis,
+                cappedIndices, cappedWeights!, cappedContent!, ctx, mains);
+            leftover = Max(T.Zero, leftover - taken);
+        }
+
+        if (starIndices.Count > 0)
+        {
+            DistributeStars(leftover, children, axis, starIndices, starWeights, ctx, mains);
+        }
+    }
+
+    /// <summary>
+    /// Splits <paramref name="pool"/> among the content-capped Stars by weight, each held to
+    /// [its <see cref="Sizing.Min"/>, its <paramref name="content"/>], and returns what they took. With room
+    /// every one sits at its content and the surplus is left for the caller; short, they shrink by weight and
+    /// the one whose share exceeds its content hands the excess back to the others (water-filling). Each pass
+    /// freezes only the violators on the side of the net violation -- floors when the shares undershoot, caps
+    /// when they overshoot -- so freezing one never invalidates another, and each pass freezes at least one
+    /// Star: at most count passes. Floors that do not fit hold and overflow, as a min-clamped Star does.
+    /// </summary>
+    private static T DistributeContentCappedStars<T>(T pool, ImmutableArray<Node> children, Axis axis,
+        List<int> indices, List<float> weights, List<T> content, IMeasureContext<T> ctx, T[] mains)
+        where T : INumber<T>
+    {
+        var count = indices.Count;
+        var floors = new T[count];
+        for (var s = 0; s < count; s++)
+        {
+            var min = MainSizing(axis, children[indices[s]]).Min;
+            // A floor above the content is the content: Min/Max were already applied to the measure.
+            floors[s] = min > 0f ? Min(ToSurfaceOn(ctx, min, axis), content[s]) : T.Zero;
+        }
+
+        var frozen = new bool[count];
+        var remaining = pool;
+        var taken = T.Zero;
+        var activeSlots = new List<int>(count);
+        var activeWeights = new List<float>(count);
+        while (true)
+        {
+            activeSlots.Clear();
+            activeWeights.Clear();
+            for (var s = 0; s < count; s++)
+            {
+                if (!frozen[s])
+                {
+                    activeSlots.Add(s);
+                    activeWeights.Add(weights[s]);
+                }
+            }
+
+            if (activeSlots.Count == 0)
+            {
+                return taken;
+            }
+
+            var shares = DistributeByWeight(remaining, activeWeights);
+            var net = T.Zero;
+            for (var a = 0; a < activeSlots.Count; a++)
+            {
+                var s = activeSlots[a];
+                net += Min(Max(shares[a], floors[s]), content[s]) - shares[a];
+            }
+
+            if (net == T.Zero)
+            {
+                // Nothing to give back or claw back: every share stands, clamped (a tie of a floor and a
+                // cap violation cancelling out freezes both at their bounds, which is also exact).
+                for (var a = 0; a < activeSlots.Count; a++)
+                {
+                    var s = activeSlots[a];
+                    var main = Min(Max(shares[a], floors[s]), content[s]);
+                    mains[indices[s]] = main;
+                    taken += main;
+                }
+
+                return taken;
+            }
+
+            for (var a = 0; a < activeSlots.Count; a++)
+            {
+                var s = activeSlots[a];
+                var violates = net > T.Zero ? shares[a] < floors[s] : shares[a] > content[s];
+                if (violates)
+                {
+                    var main = net > T.Zero ? floors[s] : content[s];
+                    mains[indices[s]] = main;
+                    frozen[s] = true;
+                    taken += main;
+                    remaining = Max(T.Zero, remaining - main);
+                }
+            }
+        }
     }
 
     /// <summary>
@@ -789,8 +965,9 @@ public static class Engine
     /// <para>
     /// The sample is <see cref="Content.TextInput.WidthSample"/> or the placeholder, deliberately never the
     /// live text -- see that property for why. Height is the measured line and nothing more, so the field is
-    /// exactly as tall as its text on a pixel surface and exactly one row on a cell one; a field wanting
-    /// breathing room takes it from its row's height, which is where every real call site sets it.
+    /// exactly one line box tall on a pixel surface (the context measures text to its face's line box, not
+    /// its ink) and exactly one row on a cell one; a field wanting breathing room takes it from its row's
+    /// height, which is where every real call site sets it.
     /// </para>
     /// </summary>
     private static Size<T> MeasureTextInput<T>(Content.TextInput field, IMeasureContext<T> ctx)
@@ -816,7 +993,9 @@ public static class Engine
             var child = stack.Children[i];
             var size = Measure(child, available, ctx);
             // Star main contributes nothing to the natural size — it only claims leftover at arrange time.
-            if (!MainSizing(axis, child).IsStar)
+            // A content-capped Star does: its content is the size it asks for while there is room.
+            var mainSizing = MainSizing(axis, child);
+            if (!mainSizing.IsStar || mainSizing.UpToContent)
             {
                 main += MainOf(axis, size);
             }

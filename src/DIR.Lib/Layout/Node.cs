@@ -213,6 +213,27 @@ public abstract partial record Node
     public Action<InputModifier>? OnDoubleClick { get; init; }
 
     /// <summary>
+    /// What a RIGHT press on this node does, set via <see cref="WithContextMenu"/>: open a menu of what can
+    /// be done to the row, the file, the cell under the pointer. Handed the whole <see cref="PointerPress"/>,
+    /// since a context menu opens where the pointer is and the node's own rect does not say where that was.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// It runs INSTEAD of <see cref="OnClick"/> for that press. Before it existed the router did not look at
+    /// the button at all, so a right press on a row WAS a click -- harmless for a row that selects, a
+    /// surprise for one that toggles, and with nowhere to hang a menu. A node that declares nothing keeps
+    /// exactly that behaviour, so no existing tree changes meaning.
+    /// </para>
+    /// <para>
+    /// A right press over a part of the row that has no menu of its own -- a twirl caret, a button in a
+    /// cell -- reaches the row's menu beneath it rather than clicking the part, because what a reader
+    /// right-clicks is the row they are looking at. A popover backdrop stops that search: a right press
+    /// on the scrim is a press on the scrim.
+    /// </para>
+    /// </remarks>
+    public Action<PointerPress>? OnContextMenu { get; init; }
+
+    /// <summary>
     /// Hover text for this node, set via <see cref="WithTooltip"/>. A node with a tooltip and no
     /// <see cref="Hit"/> still registers a region -- inert to presses -- because a statement about what
     /// is under the pointer has nowhere else to live.
@@ -480,7 +501,41 @@ public abstract partial record Node
         float FirstExtent = 0f,
         float DividerThickness = 6f,
         HitResult? DividerHit = null,
-        RGBAColor32? DividerColor = null) : Node;
+        RGBAColor32? DividerColor = null) : Node
+    {
+        /// <summary>
+        /// Makes the divider drag itself: its press arms the drag, and every step of it is reported here as the
+        /// first pane's new extent in design units, ready to be stored as the next frame's
+        /// <see cref="FirstExtent"/>. Null (the default) leaves the divider to the host, as before 11.18.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// <b>Why the engine and not the host.</b> A divider with a hit and no handler is silently dead under a
+        /// router, which consumes a press whether or not anything ran, so every consumer registered a second region
+        /// over the divider just to arm the drag, then converted the pointer back into an extent by hand: against a
+        /// pane origin it assumed, in a scale it read off the window, jumping by wherever inside the grab band the
+        /// press landed. The arrange pass already holds the split's origin, its scale and the extent it laid out, so
+        /// the conversion is stated once here.
+        /// </para>
+        /// <para>
+        /// The drag is RELATIVE to the press, so a press anywhere in the grab band moves nothing until the pointer
+        /// does, and the extent reported is clamped to what the split can lay out. The press reports the extent it
+        /// starts from (<see cref="SplitResize.Ended"/> false), so a consumer can light the divider as the drag
+        /// begins, and the release reports the last one with <see cref="SplitResize.Ended"/> true. The divider states
+        /// the resize cursor of its axis, and a drag keeps it wherever the pointer travels (11.16). With no
+        /// <see cref="DividerHit"/> the divider registers as <see cref="HitResult.ChromeHit"/>.
+        /// </para>
+        /// </remarks>
+        public Action<SplitResize>? OnResize { get; init; }
+
+        /// <summary>
+        /// How wide the divider's grab band is, in design units, centred on the drawn divider and never narrower than
+        /// it: a two-unit line that answers only on its own two units is one a mouse misses. Zero (the default) is the
+        /// drawn thickness. Only a divider with <see cref="OnResize"/> or a <see cref="DividerHit"/> has a band, and a
+        /// band wider than the divider is placed over both panes' edges and kept inside the split.
+        /// </summary>
+        public float GrabThickness { get; init; }
+    }
 
     /// <summary>
     /// One child placed at its own measured size somewhere INSIDE this node's rect, rather than filling it
@@ -596,6 +651,12 @@ public abstract partial record Node
     /// <summary>A terminal paintable piece.</summary>
     public sealed record Leaf(Content Content) : Node;
 }
+
+/// <summary>
+/// One step of a <see cref="Node.Split"/>'s divider drag (<see cref="Node.Split.OnResize"/>): the first pane's extent
+/// in design units, and whether this is the release that ends the drag.
+/// </summary>
+public readonly record struct SplitResize(float FirstExtent, bool Ended);
 
 /// <summary>One node placed at an absolute rect by <see cref="Engine.Arrange{T}"/>. Emitted in
 /// pre-order (parent before children, <see cref="Node.Overlay"/> base-subtree before top-subtree)

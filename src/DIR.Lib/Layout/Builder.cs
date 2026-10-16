@@ -17,7 +17,7 @@ namespace DIR.Lib.Layout;
 /// (<c>Node</c>, <c>Content</c>, <c>Size&lt;T&gt;</c>) stay out of consumer scope that way.
 /// </para>
 /// </summary>
-public static class Builder
+public static partial class Builder
 {
     // ---- Leaf content factories (each returns a Node.Leaf wrapping the content) ----
 
@@ -482,6 +482,21 @@ public static class Builder
         float firstExtent = 0f, float dividerThickness = 6f,
         HitResult? dividerHit = null, RGBAColor32? dividerColor = null)
         => new Node.Split(first, second, axis, firstExtent, dividerThickness, dividerHit, dividerColor);
+
+    /// <summary>
+    /// Two resizable panes whose divider drags itself: <paramref name="onResize"/> is told the first pane's new extent
+    /// in design units at every step of the drag, to be handed back as <paramref name="firstExtent"/> next frame, and
+    /// <paramref name="grabThickness"/> widens the band that answers a press past the drawn
+    /// <paramref name="dividerThickness"/>. See <see cref="Node.Split.OnResize"/>.
+    /// </summary>
+    public static Node Split(Node first, Node second, Action<SplitResize> onResize, Axis axis = Axis.Horizontal,
+        float firstExtent = 0f, float dividerThickness = 6f, float grabThickness = 0f,
+        HitResult? dividerHit = null, RGBAColor32? dividerColor = null)
+        => new Node.Split(first, second, axis, firstExtent, dividerThickness, dividerHit, dividerColor)
+        {
+            OnResize = onResize,
+            GrabThickness = grabThickness,
+        };
 
     /// <summary>Strips pinned to edges (see <see cref="Left"/>/<see cref="Right"/>/<see cref="Top"/>/<see cref="Bottom"/>); <paramref name="fill"/> takes the remainder.</summary>
     public static Node Dock(Node fill, params ReadOnlySpan<DockChild> docked)
