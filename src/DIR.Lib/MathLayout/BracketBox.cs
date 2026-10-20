@@ -26,7 +26,8 @@ public enum BracketKind { Paren, Square, Curly }
 /// <list type="bullet">
 ///   <item><c>Paren</c>: smooth crescents drawn as ellipse arcs.</item>
 ///   <item><c>Square</c>: two vertical strokes plus short horizontal serifs.</item>
-///   <item><c>Curly</c>: two-stroke S-curves meeting at a centre tip.</item>
+///   <item><c>Curly</c>: per half, two quarter-curves joined by a straight
+///   spine, the halves meeting at a sharp cusp.</item>
 /// </list>
 /// </summary>
 public sealed class BracketBox : Box
@@ -57,25 +58,46 @@ public sealed class BracketBox : Box
         // were 0.08 em — visibly tight against letters in (x), [a,b], and
         // pmatrix). Matches MathJax/TeX visual spacing where the inner
         // baseline width does not equal the bracket-to-bracket interior.
-        _padding = style.FontSize * 0.15f;
+        // An empty pair, (), has no content to set off, so its delimiters
+        // sit side by side as TeX sets them.
+        _padding = inner.Width <= 0 && inner.TotalHeight <= 0 ? 0 : style.FontSize * 0.15f;
 
-        // Try MATH-driven brackets first. requiredHeight = the inner content's
-        // own extent, no extra padding — fonts with sparse stretch coverage
-        // (DejaVu only ships base + tall-assembly with nothing in between)
-        // would otherwise see a ~10% over-request push past the base glyph
-        // and snap to the much taller assembly, producing badly disproportionate
-        // brackets around 1em-tall content. Visual padding is added externally
-        // by Width/Height around the chosen delimiter, not by inflating the
-        // request to the font.
-        var requiredHeight = inner.TotalHeight;
+        // Try MATH-driven brackets first. The delimiters are centred on the
+        // math axis, so they must reach as far from it as the content does on
+        // its farther side: requiredHeight = 2 * max(height - axis, depth +
+        // axis), as TeX sizes a \left..\right pair. The content's total height
+        // is the same only for content centred on the axis; a fraction whose
+        // numerator is itself a fraction reaches further above the axis than
+        // below, and asking for its total height left its numerator above the
+        // delimiters. No padding is added to the request. A font's delimiters
+        // come in steps (DejaVu Sans ships no size variants, and its assembly
+        // grows by more than an em a copy), so asking for more than the content
+        // reaches only takes a larger step than TeX would. The visual padding
+        // around the delimiters comes from Width and Height, not from the
+        // request.
+        var requiredHeight = DelimiterRequest(inner, style);
         var (leftCp, rightCp) = BracketCodepoints(kind);
-        var left = new StretchyVerticalBox(leftCp, requiredHeight, style);
-        var right = new StretchyVerticalBox(rightCp, requiredHeight, style);
+        // As TeX's \left..\right, a delimiter may fall short of the request by
+        // \delimiterfactor and \delimitershortfall, and the two are drawn at
+        // one height (StretchyVerticalBox.DelimiterPair).
+        var (left, right) = StretchyVerticalBox.DelimiterPair(leftCp, rightCp, requiredHeight, style);
         if (left.IsAvailable && right.IsAvailable)
         {
             _leftFont = left;
             _rightFont = right;
         }
+    }
+
+    /// <summary>
+    /// The height a <c>\left..\right</c> pair asks the font for around <paramref name="inner"/>: twice the
+    /// content's larger reach from the math axis, 2 * max(height - axis, depth + axis), as TeX sizes one.
+    /// Every pair goes through it, this box's and the markdown visitor's pair of two kinds alike, so
+    /// <c>[a, b)</c> sizes its delimiters as <c>[a, b]</c> does.
+    /// </summary>
+    internal static float DelimiterRequest(Box inner, BoxStyle style)
+    {
+        var axis = style.AxisHeight;
+        return 2 * MathF.Max(inner.Height - axis, inner.Depth + axis);
     }
 
     private static (int left, int right) BracketCodepoints(BracketKind kind) => kind switch
@@ -153,18 +175,38 @@ public sealed class BracketBox : Box
             }
             case BracketKind.Curly:
             {
-                // Two-stroke S: top half curls in to a centre tip, bottom
-                // half curls back out. Approximated as four straight strokes
-                // (the renderer doesn't expose Bezier curves; if it ever
-                // does, swap these for a proper cubic).
+                // Each half: a quarter-curve from the end, which lies towards
+                // the content, out to a straight vertical spine; the spine; and
+                // a quarter-curve from the spine out to the cusp at mid-height,
+                // which points away from the content. Both curves meet the cusp
+                // running horizontally, which is what makes it sharp, so the
+                // left one reads as { and the right one as }. Each curve is a
+                // quarter ellipse sampled into short strokes, as the paren's
+                // arc is (the renderer has no curve primitive).
                 float midY = (top + bottom) / 2;
-                float tipX = openLeft ? xOrigin + bw * 0.85f : xOrigin + bw * 0.15f;
-                float farX = openLeft ? xOrigin + bw * 0.30f : xOrigin + bw * 0.70f;
-                float spineX = openLeft ? xOrigin + bw * 0.55f : xOrigin + bw * 0.45f;
-                renderer.DrawLine(farX, top, spineX, top + (midY - top) * 0.3f, color, curveThickness);
-                renderer.DrawLine(spineX, top + (midY - top) * 0.3f, tipX, midY, color, curveThickness);
-                renderer.DrawLine(tipX, midY, spineX, midY + (bottom - midY) * 0.7f, color, curveThickness);
-                renderer.DrawLine(spineX, midY + (bottom - midY) * 0.7f, farX, bottom, color, curveThickness);
+                float inward = openLeft ? 1f : -1f;
+                float spineX = xOrigin + bw * 0.5f;
+                float reach = bw * 0.35f;
+                float halfHeight = (bottom - top) / 2;
+                float curl = MathF.Min(MathF.Max(halfHeight * 0.25f, reach), halfHeight * 0.5f);
+                int steps = Math.Max(6, (int)MathF.Ceiling(MathF.Max(curl, reach) / 1.5f));
+
+                // The top half, end to cusp; the bottom half mirrors it.
+                var points = new (float X, float Y)[4 * steps + 3];
+                var n = 0;
+                for (int i = 0; i <= steps; i++)
+                {
+                    float a = MathF.PI / 2 * i / steps;
+                    points[n++] = (spineX + inward * reach * (1 - MathF.Sin(a)), top + curl * (1 - MathF.Cos(a)));
+                }
+                for (int i = 0; i <= steps; i++)
+                {
+                    float a = MathF.PI / 2 * i / steps;
+                    points[n++] = (spineX - inward * reach * (1 - MathF.Cos(a)), midY - curl * (1 - MathF.Sin(a)));
+                }
+                for (int i = n - 2; i >= 0; i--)
+                    points[n++] = (points[i].X, 2 * midY - points[i].Y);
+                renderer.DrawPolyline(points.AsSpan(0, n), color, curveThickness);
                 break;
             }
             case BracketKind.Paren:

@@ -24,13 +24,18 @@ namespace DIR.Lib.Markdown;
 /// <see cref="DIR.Lib.MathLayout.SupSubBox"/> so they share a baseline pair
 /// like a proper chemistry isotope.</para>
 ///
-/// <para>Limitations carried over:
-/// <list type="bullet">
-///   <item>Element symbols render math-italic in box mode (the grammar maps
-///   single letters to <c>id</c>; there's no <c>\mathrm</c> support in the
-///   visitor yet). Box-mode chem looks "math-style" — readable but not
-///   strictly chemistry-convention upright.</item>
-/// </list></para>
+/// <para>Letters are upright, the chemistry convention. Every element
+/// symbol, and every other run of letters (state markers such as
+/// <c>(aq)</c>, an <c>e</c> for the electron, letters in a script), is
+/// emitted inside <c>\mathrm{...}</c>: <c>\ce{H2O}</c> becomes
+/// <c>\mathrm{H}_{2}\mathrm{O}</c>. <see cref="BoxBuildingVisitor"/> sets
+/// a bare letter in math italic, as TeX does, and the letters inside
+/// <c>\mathrm</c> upright; on the Unicode path <c>\mathrm{X}</c> is just
+/// <c>X</c>. A LaTeX command's name in the body (<c>\alpha</c>) is copied
+/// through untouched, and so is a <c>\text{...}</c> argument; any other
+/// command's arguments are chemistry like the rest of the body. A
+/// <c>\mathrm{...}</c> in the body is unwrapped, since its letters go out
+/// upright anyway: <c>\ce{\mathrm{H2}}</c> is <c>\mathrm{H}_{2}</c>.</para>
 ///
 /// <para>Wired into the markdown pipeline by
 /// <see cref="MarkdownMacros.ExpandLatexMacros"/> and by Console.Lib's
@@ -164,6 +169,20 @@ public static class Mhchem
                 continue;
             }
 
+            if (ch == '\\' && i + 1 < body.Length && IsAsciiLetter(body[i + 1]))
+            {
+                // \mathrm{X} reads as X, from the same state (see
+                // TryUnwrapMathrm).
+                if (TryUnwrapMathrm(ref body, i)) continue;
+                // A LaTeX command's name (\alpha, and \text{aq} whole) goes
+                // through as written. Without this its name would be read as
+                // letters: wrapped in \mathrm, or, for \Gamma, cut at Ga.
+                CopyCommand(body, ref i, sb);
+                atTermStart = false;
+                justSawSymbol = false;
+                continue;
+            }
+
             if (IsAsciiLetterUpper(ch))
             {
                 // Greedy 2-letter symbol if the second char is lowercase
@@ -172,17 +191,16 @@ public static class Mhchem
                 // so stray uppercase letters in arbitrary prose don't get
                 // mistakenly tagged).
                 //
-                // 2-letter elements wrap in `{...}` so a trailing script
-                // attaches to the whole symbol via the grammar's group
-                // rule (A → '{' E '}'), not just to the second letter via
-                // its P → P op A reduction. `Fe_{2}` should subscript Fe,
-                // not just `e`; `{Fe}_{2}` parses that way.
+                // Each symbol is its own \mathrm{...}, which is one atom to
+                // the grammar (A0 → cmdmathrm A), so a trailing script
+                // attaches to the whole symbol rather than to its last
+                // letter: \mathrm{Fe}_{2} subscripts Fe, not just `e`.
                 if (i + 1 < body.Length && IsAsciiLetterLower(body[i + 1]))
                 {
                     var two = body.Substring(i, 2);
                     if (s_elements.Contains(two))
                     {
-                        sb.Append('{').Append(two).Append('}');
+                        AppendUpright(sb, two);
                         i += 2;
                         atTermStart = false;
                         justSawSymbol = true;
@@ -190,25 +208,29 @@ public static class Mhchem
                     }
                 }
                 var one = ch.ToString();
-                if (s_elements.Contains(one))
-                {
-                    sb.Append(ch);
-                    i++;
-                    atTermStart = false;
-                    justSawSymbol = true;
-                    continue;
-                }
-                // Unknown uppercase — passthrough, no symbol state.
-                sb.Append(ch);
+                AppendUpright(sb, one);
                 i++;
+                atTermStart = false;
+                // Unknown uppercase: upright like the rest, but no symbol
+                // state, so a digit after it is not its subscript.
+                justSawSymbol = s_elements.Contains(one);
+                continue;
+            }
+
+            if (IsAsciiLetterLower(ch))
+            {
+                // A lowercase run not taken by an element symbol: a state
+                // marker's (aq), an electron's e. Upright, as one atom.
+                int start = i;
+                while (i < body.Length && IsAsciiLetterLower(body[i])) i++;
+                AppendUpright(sb, body.Substring(start, i - start));
                 atTermStart = false;
                 justSawSymbol = false;
                 continue;
             }
 
-            // Anything else: passthrough one char (lowercase letters not
-            // adjacent to an uppercase, punctuation other than the cases
-            // above, etc.).
+            // Anything else: passthrough one char (punctuation other than
+            // the cases above, etc.).
             sb.Append(ch);
             i++;
             atTermStart = false;
@@ -270,18 +292,124 @@ public static class Mhchem
     /// <c>\minus</c> turns them into cmd atoms; the visitors translate the
     /// commands to the appropriate glyph (and the Unicode Superscripts table
     /// still maps the rendered glyph to U+207A / U+207B downstream).
+    /// A run of letters in the script is upright like any other chem
+    /// letter (<c>^{n\plus}</c> is <c>^{\mathrm{n}\plus}</c>), and a LaTeX
+    /// command in it is copied as written.
     /// </summary>
     private static void AppendLatexScript(StringBuilder sb, string content, bool super)
     {
         if (string.IsNullOrEmpty(content)) return;
         sb.Append(super ? "^{" : "_{");
-        foreach (var c in content)
+        int i = 0;
+        while (i < content.Length)
         {
+            var c = content[i];
+            if (c == '\\' && i + 1 < content.Length && IsAsciiLetter(content[i + 1]))
+            {
+                if (TryUnwrapMathrm(ref content, i)) continue;
+                CopyCommand(content, ref i, sb);
+                continue;
+            }
+            if (IsAsciiLetter(c))
+            {
+                int start = i;
+                while (i < content.Length && IsAsciiLetter(content[i])) i++;
+                AppendUpright(sb, content.Substring(start, i - start));
+                continue;
+            }
             if (c == '+') sb.Append(@"\plus");
             else if (c == '-') sb.Append(@"\minus");
             else sb.Append(c);
+            i++;
         }
         sb.Append('}');
+    }
+
+    /// <summary>
+    /// Emits <paramref name="letters"/> as <c>\mathrm{letters}</c>, the form
+    /// every chem letter takes. One <c>\mathrm</c> is one grammar atom, so a
+    /// script after it binds the whole run.
+    /// </summary>
+    private static void AppendUpright(StringBuilder sb, string letters)
+        => sb.Append(@"\mathrm{").Append(letters).Append('}');
+
+    /// <summary>
+    /// If a <c>\mathrm{...}</c> starts at <paramref name="i"/>, replaces it
+    /// in <paramref name="s"/> by its argument, braces and all, and returns
+    /// true; the caller then reads on from <paramref name="i"/>, where the
+    /// argument now starts. Every chem letter goes out in its own
+    /// <c>\mathrm</c> already, so the user's adds nothing, and keeping it
+    /// nests one inside the other: <c>\ce{\mathrm{H2}}</c> would be
+    /// <c>\mathrm{\mathrm{H}_{2}}</c> rather than <c>\mathrm{H}_{2}</c>, as
+    /// <c>\ce{H2}</c> is. Blanks before the brace are skipped, as LaTeX
+    /// skips them. Returns false, changing nothing, for any other command,
+    /// or a <c>\mathrm</c> with no balanced brace group after it, or one
+    /// whose argument ends in a command with a letter straight after the
+    /// closing brace: without the brace between them the two would read as
+    /// one command, <c>\mathrm{\Delta}H</c> as <c>\DeltaH</c>. That one
+    /// stays wrapped, as <c>\mathrm{\Delta}\mathrm{H}</c>.
+    /// </summary>
+    private static bool TryUnwrapMathrm(ref string s, int i)
+    {
+        const string name = @"\mathrm";
+        if (!s.AsSpan(i).StartsWith(name, StringComparison.Ordinal)) return false;
+        int open = i + name.Length;
+        if (open < s.Length && IsAsciiLetter(s[open])) return false;
+        while (open < s.Length && (s[open] == ' ' || s[open] == '\t')) open++;
+        if (open >= s.Length || s[open] != '{') return false;
+        int depth = 1;
+        int close = open + 1;
+        while (close < s.Length && depth > 0)
+        {
+            if (s[close] == '{') depth++;
+            else if (s[close] == '}') depth--;
+            if (depth > 0) close++;
+        }
+        if (depth > 0) return false;
+        if (close + 1 < s.Length && IsAsciiLetter(s[close + 1]) && EndsInControlWord(s, open + 1, close)) return false;
+        s = string.Concat(s.AsSpan(0, i), s.AsSpan(open + 1, close - open - 1), s.AsSpan(close + 1));
+        return true;
+    }
+
+    /// <summary>Whether <paramref name="s"/> from <paramref name="start"/> up
+    /// to <paramref name="end"/> ends in a backslash and one or more
+    /// letters, a command's name that a following letter would extend.</summary>
+    private static bool EndsInControlWord(string s, int start, int end)
+    {
+        int k = end;
+        while (k > start && IsAsciiLetter(s[k - 1])) k--;
+        return k < end && k > start && s[k - 1] == '\\';
+    }
+
+    /// <summary>
+    /// Copies the LaTeX command at <paramref name="i"/> (a backslash and its
+    /// letters). For <c>\text</c> it also copies its one argument, the brace
+    /// group straight after the name, balanced and as written, so
+    /// <c>\text{aq}</c> reaches the <c>\text</c> expansion whole; a second
+    /// group (<c>\text{a}{b}</c>) is not its argument and is chemistry. Any
+    /// other command's arguments are chemistry too and go back through the
+    /// caller's loop: <c>\sqrt{H2}</c> is <c>\sqrt{\mathrm{H}_{2}}</c>.
+    /// Leaves <paramref name="i"/> past what it copied.
+    /// </summary>
+    private static void CopyCommand(string s, ref int i, StringBuilder sb)
+    {
+        int start = i;
+        i++;
+        while (i < s.Length && IsAsciiLetter(s[i])) i++;
+        var isText = s.AsSpan(start, i - start).SequenceEqual(@"\text");
+        if (isText && i < s.Length && s[i] == '{')
+        {
+            int depth = 1;
+            int j = i + 1;
+            while (j < s.Length && depth > 0)
+            {
+                if (s[j] == '{') depth++;
+                else if (s[j] == '}') depth--;
+                j++;
+            }
+            i = j;
+        }
+        sb.Append(s, start, i - start);
     }
 
     /// <summary>
@@ -314,6 +442,7 @@ public static class Mhchem
     private static bool IsAsciiDigit(char c) => c >= '0' && c <= '9';
     private static bool IsAsciiLetterUpper(char c) => c >= 'A' && c <= 'Z';
     private static bool IsAsciiLetterLower(char c) => c >= 'a' && c <= 'z';
+    private static bool IsAsciiLetter(char c) => IsAsciiLetterUpper(c) || IsAsciiLetterLower(c);
 
     /// <summary>
     /// All 118 IUPAC element symbols. FrozenSet for AOT-friendly fast lookup;

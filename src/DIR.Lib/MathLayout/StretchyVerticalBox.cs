@@ -38,18 +38,63 @@ public sealed class StretchyVerticalBox : Box
     private readonly float _depth;
     private readonly uint _variantGlyphId;
     private readonly int _inkRightX;
+    private readonly ManagedFontRasterizer.TopSnap _topSnap;
 
     /// <summary>
-    /// Compose a stretchy delimiter for <paramref name="codepoint"/> covering
-    /// at least <paramref name="requiredHeightPx"/> using <paramref name="style"/>'s
-    /// font + size. If the font has no MATH coverage for this codepoint the
-    /// box reports <see cref="IsAvailable"/> = false and zero metrics — the
-    /// caller should pick another rendering path.
+    /// Compose a stretchy delimiter for <paramref name="codepoint"/> at about
+    /// <paramref name="requiredHeightPx"/> using <paramref name="style"/>'s
+    /// font + size: the base glyph or a size variant that covers it, else the
+    /// assembly built to it, else the candidate scaled least to fit (see
+    /// <see cref="ManagedFontRasterizer.RasterizeStretchyVertical(string, float, Rune, float)"/>).
+    /// If the font has no MATH coverage for this codepoint the box reports
+    /// <see cref="IsAvailable"/> = false and zero metrics; the caller should
+    /// pick another rendering path.
     /// </summary>
     public StretchyVerticalBox(int codepoint, float requiredHeightPx, BoxStyle style)
+        : this(codepoint, requiredHeightPx, style, snapTopEdge: false)
+    { }
+
+    /// <summary>
+    /// As the public constructor, and with <paramref name="snapTopEdge"/> the glyph is moved vertically
+    /// by under half a pixel so the top of its outline lands on a pixel row (see
+    /// <see cref="ManagedFontRasterizer.RasterizeStretchyVertical(string, float, Rune, float, bool, out uint, out ManagedFontRasterizer.TopSnap)"/>).
+    /// Only <see cref="SqrtBox"/> asks for it: the radical's flag is the glyph's top, and the vinculum
+    /// continuing it needs that edge crisp. Brackets and every other delimiter keep the unsnapped glyph.
+    /// </summary>
+    internal StretchyVerticalBox(int codepoint, float requiredHeightPx, BoxStyle style, bool snapTopEdge)
+        : this(Rasterize(codepoint, requiredHeightPx, style, snapTopEdge), style)
+    { }
+
+    private static (GlyphBitmap Bitmap, uint GlyphId, ManagedFontRasterizer.TopSnap Snap) Rasterize(
+        int codepoint, float requiredHeightPx, BoxStyle style, bool snapTopEdge)
     {
-        var rune = new Rune(codepoint);
-        _bitmap = SharedRasterizer.RasterizeStretchyVertical(style.FontPath, style.FontSize, rune, requiredHeightPx, out _variantGlyphId);
+        var bitmap = SharedRasterizer.RasterizeStretchyVertical(style.FontPath, style.FontSize, new Rune(codepoint),
+            requiredHeightPx, snapTopEdge, out var glyphId, out var snap);
+        return (bitmap, glyphId, snap);
+    }
+
+    /// <summary>
+    /// A <c>\left..\right</c> pair, <paramref name="open"/> and <paramref name="close"/>, at one height. As
+    /// the public constructor for each, but the unstretched glyph or a size variant may fall short of
+    /// <paramref name="requiredHeightPx"/> by TeX's rule (<see cref="ManagedFontRasterizer.DelimiterCovers"/>),
+    /// so content just over a variant does not take the next size up; and where the two sides come out
+    /// a different number of rows tall, the one nearer the request sets the other's height
+    /// (<see cref="ManagedFontRasterizer.RasterizeStretchyDelimiterPair"/>). <see cref="BracketBox"/> builds
+    /// its delimiters this way, and so does the pair of two kinds the markdown visitor draws; a radical
+    /// asks for its whole height.
+    /// </summary>
+    internal static (StretchyVerticalBox Open, StretchyVerticalBox Close) DelimiterPair(
+        int open, int close, float requiredHeightPx, BoxStyle style)
+    {
+        var (opening, closing) = SharedRasterizer.RasterizeStretchyDelimiterPair(style.FontPath, style.FontSize,
+            new Rune(open), new Rune(close), requiredHeightPx, out var openGlyphId, out var closeGlyphId);
+        return (new((opening, openGlyphId, ManagedFontRasterizer.TopSnap.None), style),
+                new((closing, closeGlyphId, ManagedFontRasterizer.TopSnap.None), style));
+    }
+
+    private StretchyVerticalBox((GlyphBitmap Bitmap, uint GlyphId, ManagedFontRasterizer.TopSnap Snap) glyph, BoxStyle style)
+    {
+        (_bitmap, _variantGlyphId, _topSnap) = glyph;
 
         if (_bitmap.Rgba is null || _bitmap.Width == 0 || _bitmap.Height == 0)
         {
@@ -122,6 +167,12 @@ public sealed class StretchyVerticalBox : Box
     /// bounding-box top edge (which usually has a row or two of transparent
     /// padding).</summary>
     internal GlyphBitmap Bitmap => _bitmap;
+
+    /// <summary>What the snap learned from the outline when the box was built with <c>snapTopEdge</c>:
+    /// the bitmap row the outline's top begins at and the rows the stroke at its top-right touches;
+    /// <see cref="ManagedFontRasterizer.TopSnap.None"/> when it was not, or when the glyph could not be
+    /// snapped.</summary>
+    internal ManagedFontRasterizer.TopSnap TopSnap => _topSnap;
 
     /// <summary>One past the rightmost column index that contains non-
     /// transparent ink across the whole bitmap. Equals <see cref="Width"/>

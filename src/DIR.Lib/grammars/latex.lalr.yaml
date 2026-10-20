@@ -14,11 +14,24 @@
 #   \sin(\alpha + \beta) = \sin\alpha \cos\beta + \cos\alpha \sin\beta
 #   \sqrt[3]{x}, \sqrt[n]{x^2+1}           (n-th root: optional index)
 #   [a, b], [0, 1), (0, 1]                 (brackets, half-open intervals)
+#   \{1, 2, 3\}, \{x\}                     (escaped braces: a set, drawn as braces)
+#   f(), [], \{\}                          (empty pairs)
+#   \mathrm{d}x, \mathrm{H}_{2}\mathrm{O}   (upright letters, as TeX's \mathrm)
+#   \operatorname{tr} A, \textrm{if}       (an operator name; upright text)
+#   \operatorname*{arg\,max}_x             (\, \: \; \!: TeX's math spaces)
+#   \{ x \in \mathbb{R} \mid x > 0 \}     (set-builder: \mid, \mathbb, < and >)
+#   \hat{x}, \bar{\psi}, \vec{v}          (accents over their argument)
+#   \mathbf{1024}                         (bold letters and digits)
+#   \lfloor x \rfloor, \lceil x \rceil    (named delimiter pairs, \left/\right or not)
+#   f'(x), x''                            (primes)
 #
 # Things that don't:
 #   - \begin{...}\end{...} environments, alignments, multi-line displays.
 #   - Macro definitions (\def, \newcommand) and any TeX programming.
-#   - String content inside \text{...} (treated as opaque \cmd).
+#   - String content inside \text{...} on the Unicode path (treated as an opaque
+#     \cmd there). The box path's preparation spells it \textrm{...}, which is
+#     lexed whole, so its blanks survive, with groups inside two deep.
+#   - A named delimiter without its partner (\lfloor x): it does not parse.
 #   - Implicit prefix unary minus inside group-arguments without parens
 #     (e.g. \frac{-1}{2} works because -1 reduces via F -> '-' F, but
 #     \sqrt -2 does not — write \sqrt{-2}).
@@ -36,7 +49,7 @@
 #                                                         doesn't parse as 1·(-2))
 #   P:  ^ _                                              (postfix scripts, leftmost)
 #   A:  atoms (numbers, identifiers, commands, groups, parens, brackets,
-#       \frac, \sqrt)
+#       braces, \frac, \sqrt, \mathrm, \mathbb, \operatorname, \textrm)
 #   A0: every atom except the ones that open with `[`
 #
 # Why A0 exists: LaTeX reads a `[` straight after \sqrt as the start of the
@@ -88,6 +101,18 @@ symbols:
   - '['        # 26
   - ']'        # 27
   - ','        # 28  punctuation atom: [a, b], f(x, y), x_{i,j}
+  - cmdmathrm  # 29  \mathrm (binds one atom argument, which it sets upright)
+  - lbrace     # 30  \{ : a brace as a glyph, where a bare '{' opens a group
+  - rbrace     # 31  \}
+  - cmdmathbb  # 32  \mathbb (binds one atom argument, which it sets double-struck)
+  - opname     # 33  \operatorname or \operatorname* (binds one atom argument, a name in upright letters)
+  - textrm     # 34  \textrm{X}, its braced text in the token
+  - mspace     # 35  a math space: \, \: \; \!
+  - accent     # 36  \hat \bar \tilde \vec \dot \ddot ... (binds one atom argument, which it sets the accent over)
+  - cmdmathbf  # 37  \mathbf (binds one atom argument, which it sets bold)
+  - ldelim     # 38  \lfloor \lceil \langle : a named opening delimiter
+  - rdelim     # 39  \rfloor \rceil \rangle : its closing partner
+  - prime      # 40  ' (one or more): a prime on the atom before it
 
 productions:
   # Start production. Single-non-terminal so it trims at parse time and the
@@ -137,6 +162,7 @@ productions:
     rules:
       - { lhs: P, rhs: [P, '^', A], action: sup }
       - { lhs: P, rhs: [P, '_', A], action: subscript }
+      - { lhs: P, rhs: [P, prime],  action: primed }
       - { lhs: P, rhs: [A] }
 
   # Atoms: leaves of the expression tree. \frac takes A-typed arguments and
@@ -150,7 +176,11 @@ productions:
   # The atoms that open with `[` are A's own; everything else is an A0 (see
   # the header for why). `bracket` covers the matched [E] and both half-open
   # mixes, [E) and (E]; the visitor reads which delimiters it got from Arg0
-  # and Arg2. `,` is an atom rather than an operator so it can sit wherever a
+  # and Arg2. `brace` is the escaped pair \{E\}, a set: drawn as braces, where
+  # the bare pair {E} is an invisible group. It is an A0, like `(`: only a
+  # `[` means something else straight after \sqrt. `emptyPair` is the pair
+  # with nothing inside, (), [] or \{\}, which E cannot be; Arg0 says which.
+  # `,` is an atom rather than an operator so it can sit wherever a
   # \name could, which is exactly where the Unicode path's placeholder for an
   # unlexed comma used to sit: a trailing "x = 1," still parses.
   - derivation: none
@@ -158,6 +188,7 @@ productions:
       - { lhs: A,  rhs: [A0] }
       - { lhs: A,  rhs: ['[', E, ']'],     action: bracket }
       - { lhs: A,  rhs: ['[', E, ')'],     action: bracket }
+      - { lhs: A,  rhs: ['[', ']'],        action: emptyPair }
       - { lhs: A0, rhs: [n],               action: number }
       - { lhs: A0, rhs: [id],              action: variable }
       - { lhs: A0, rhs: [cmd],             action: command }
@@ -165,11 +196,22 @@ productions:
       - { lhs: A0, rhs: ['(', E, ')'],     action: paren }
       - { lhs: A0, rhs: ['(', E, ']'],     action: bracket }
       - { lhs: A0, rhs: ['{', E, '}'],     action: group }
+      - { lhs: A0, rhs: [lbrace, E, rbrace], action: brace }
+      - { lhs: A0, rhs: ['(', ')'],        action: emptyPair }
+      - { lhs: A0, rhs: [lbrace, rbrace],  action: emptyPair }
       - { lhs: A0, rhs: [cmdsqrt, A0],     action: sqrt }
       - { lhs: A0, rhs: [cmdsqrt, '[', E, ']', A], action: nthRoot }
       - { lhs: A0, rhs: [cmdfrac, A, A],   action: frac }
+      - { lhs: A0, rhs: [cmdmathrm, A],    action: mathRm }
+      - { lhs: A0, rhs: [cmdmathbb, A],    action: mathBb }
+      - { lhs: A0, rhs: [opname, A],       action: operatorName }
+      - { lhs: A0, rhs: [textrm],          action: textRm }
+      - { lhs: A0, rhs: [mspace],          action: mathSpace }
+      - { lhs: A0, rhs: [accent, A],       action: accented }
+      - { lhs: A0, rhs: [cmdmathbf, A],    action: mathBf }
+      - { lhs: A0, rhs: [ldelim, E, rdelim], action: namedPair }
 
-# Single lexer state. Ordering matters: `\frac` and `\sqrt` (and the explicit
+# Single lexer state. Ordering matters: `\frac`, `\sqrt`, `\mathrm`, `\mathbb`, `\operatorname` (and the explicit
 # multiplication aliases `\cdot` / `\times`) must come before the `\\[a-zA-Z]+`
 # catchall so first-rule-wins picks them on identical-length matches. (Longer
 # real names like `\fraction` would still win via longest-match — they fall
@@ -178,6 +220,33 @@ lexer:
   root:
     - { symbol: cmdfrac, match: '\\frac' }
     - { symbol: cmdsqrt, match: '\\sqrt' }
+    - { symbol: cmdmathrm, match: '\\mathrm' }
+    - { symbol: cmdmathbb, match: '\\mathbb' }
+    - { symbol: cmdmathbf, match: '\\mathbf' }
+    # Accents. A longer name (\dots, \barwedge, \vecx) is another command
+    # and still goes to `cmd` by longest match.
+    - { symbol: accent,  match: '\\(hat|widehat|bar|overline|tilde|widetilde|vec|dot|ddot|check|breve|acute|grave)' }
+    - { symbol: ldelim,  match: '\\(lfloor|lceil|langle)' }
+    - { symbol: rdelim,  match: '\\(rfloor|rceil|rangle)' }
+    - { symbol: prime,   match: "'+" }
+    # \operatorname's argument is math, as in amsmath, so it is an atom like
+    # \mathrm's; the star (limits) may follow a blank, as TeX's \@ifstar
+    # allows.
+    - { symbol: opname,  match: '\\operatorname([ \t\r\n]*\*)?' }
+    # \textrm takes its braced argument into the token, because the argument
+    # is text: the grammar would read `if` as two variables and drop the
+    # blank in `a b`. The argument is any run of plain characters, escape
+    # pairs (\{ \PHa) and groups nested up to two deep, each of the same:
+    # `a {b} c`, `x\{y\}`. Deeper than that, the longest match is the bare
+    # name, which falls to `cmd`.
+    - { symbol: textrm,  match: '\\textrm[ \t\r\n]*\{([^\{\}\\]|\\.|\{([^\{\}\\]|\\.|\{([^\{\}\\]|\\.)*\})*\})*\}' }
+    # TeX's math spaces. Only the box path lexes them: its preparation keeps
+    # them as written, where the Unicode path's turns each into a
+    # placeholder for a blank first.
+    - { symbol: mspace,  match: '\\,' }
+    - { symbol: mspace,  match: '\\:' }
+    - { symbol: mspace,  match: '\\;' }
+    - { symbol: mspace,  match: '\\!' }
     - { symbol: '*',     match: '\\cdot' }
     - { symbol: '*',     match: '\\times' }
     # Binary relations. Must precede the `\\[a-zA-Z]+` catchall so on the
@@ -206,6 +275,11 @@ lexer:
     - { symbol: rel,     match: '\\rightarrow' }
     - { symbol: rel,     match: '\\pm' }
     - { symbol: rel,     match: '\\mp' }
+    - { symbol: rel,     match: '\\mid' }
+    # < and > as written. The Unicode path never lexes them: its lexer-safety
+    # pass turns each into a placeholder atom first, as it always has.
+    - { symbol: rel,     match: '<' }
+    - { symbol: rel,     match: '>' }
     - { symbol: cmd,     match: '\\[a-zA-Z]+' }
     - { symbol: n,       match: '[0-9]+(\.[0-9]+)?' }
     - { symbol: id,      match: '[a-zA-Z]' }
@@ -220,6 +294,8 @@ lexer:
     - { symbol: ')',     match: '\)' }
     - { symbol: '{',     match: '\{' }
     - { symbol: '}',     match: '\}' }
+    - { symbol: lbrace,  match: '\\\{' }
+    - { symbol: rbrace,  match: '\\\}' }
     - { symbol: '[',     match: '\[' }
     - { symbol: ']',     match: '\]' }
     - { symbol: ',',     match: ',' }

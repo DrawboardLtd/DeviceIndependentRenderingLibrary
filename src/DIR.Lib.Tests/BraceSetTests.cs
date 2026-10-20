@@ -1,0 +1,1040 @@
+using System.Reflection;
+using System.Text;
+using System.Text.RegularExpressions;
+using DIR.Lib.Markdown;
+using DIR.Lib.MathLayout;
+using LALR.CC.LexicalGrammar;
+using SharpAstro.Fonts;
+using SharpAstro.Png;
+using Shouldly;
+
+namespace DIR.Lib.Tests;
+
+/// <summary>
+/// Sets keep their braces on both math paths. <c>\{1, 2, 3\}</c>,
+/// <c>\left\{ … \right\}</c> and <c>\lbrace … \rbrace</c> all mean the same
+/// pair of curly braces as glyphs, unlike a bare <c>{ … }</c>, which is an
+/// invisible group.
+///
+/// <para>The box path here is the whole of it up to the parse:
+/// <see cref="MarkdownMacros.TryPrepareMathBoxSource"/>, then the grammar's
+/// lexer and a parser bound to a <see cref="BoxBuildingVisitor"/>.
+/// <see cref="BracketBox"/> keeps its kind private, so a test proves the kind
+/// by rendering: the parsed box must paint exactly what a hand-built curly
+/// <see cref="BracketBox"/> around the expected content paints.</para>
+/// </summary>
+public sealed class BraceSetTests
+{
+    private const float FontSize = 32f;
+
+    private static readonly RGBAColor32 Ink = new(0, 0, 0, 255);
+
+    private static readonly BoxStyle Stix = StyleFor("STIX2Math");
+
+    /// <summary>Where the renders land for a look by eye; never compared.</summary>
+    private static string OutputDir =>
+        Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "obj", "brace-set-output");
+
+    // ── Unicode path ───────────────────────────────────────────────────
+
+    /// <summary>
+    /// Every spelling of a set keeps both braces. <c>\left\{</c> used to
+    /// alias to a bare <c>{</c>, which the grammar reads as a group, so the
+    /// braces vanished; nothing aliased <c>\lbrace</c>, so it printed as its
+    /// own name. <c>\{1, 2, 3\}</c> already kept them.
+    /// </summary>
+    [Theory]
+    [InlineData(@"\left\{ 1, 2 \right\}", "{1, 2}")]
+    [InlineData(@"\lbrace x \rbrace", "{x}")]
+    [InlineData(@"\{1, 2, 3\}", "{1, 2, 3}")]
+    [InlineData(@"\left\lbrace x \right\rbrace", "{x}")]
+    [InlineData(@"\left\{ \frac{1}{2} \right\}", "{1⁄2}")]
+    public void UnicodePath_SetKeepsBothBraces(string latex, string expected)
+        => MarkdownMacros.RenderMathUnicode(latex).ShouldBe(expected);
+
+    /// <summary>
+    /// <c>\lbrace</c> and <c>\rbrace</c> alias only as whole command names:
+    /// <c>\lbracex</c> is a different command, and stays as written.
+    /// </summary>
+    [Theory]
+    [InlineData(@"\lbracex")]
+    [InlineData(@"\rbracex")]
+    [InlineData(@"\lbraceX \rbraceY")]
+    public void UnicodePath_LongerCommandIsNotAliased(string latex)
+    {
+        MarkdownMacros.NormalizeLatexAliases(latex).ShouldBe(latex);
+        MarkdownMacros.RenderMathUnicode(latex).ShouldBe(latex.Replace(" ", ""));
+    }
+
+    /// <summary>
+    /// An unbalanced brace, and the empty set, render as they did before
+    /// the box path learned braces (each pinned to the string the build
+    /// before this change produced).
+    /// </summary>
+    [Theory]
+    [InlineData(@"\{x", "{x")]
+    [InlineData(@"x\}", "x}")]
+    [InlineData(@"\{a, b", "{a, b")]
+    [InlineData(@"a, b\}", "a, b}")]
+    [InlineData(@"\{\}", "{}")]
+    public void UnicodePath_UnbalancedRendersAsBefore(string latex, string expected)
+        => MarkdownMacros.RenderMathUnicode(latex).ShouldBe(expected);
+
+    /// <summary>
+    /// An escaped brace inside <c>\text{...}</c> is a glyph, not one of the
+    /// argument's braces, so it neither opens nor closes the argument. The
+    /// argument's end used to be found by counting every brace, so
+    /// <c>\text{\{}</c> never closed and printed its own source. A <c>\\</c> is
+    /// one unit, so the brace after it still closes the argument.
+    /// </summary>
+    [Theory]
+    [InlineData(@"\text{\{}", "{")]
+    [InlineData(@"\text{\lbrace}", "{")]
+    [InlineData(@"\text{\}}", "}")]
+    [InlineData(@"\text{a\}b}", "a}b")]
+    [InlineData(@"\text{\{a, b\}}", "{a, b}")]
+    [InlineData(@"\text{a\\}", "a ")]
+    // Balanced arguments, as they rendered before.
+    [InlineData(@"\text{a {b} c}", "a {b} c")]
+    [InlineData(@"\text{if } x", "if x")]
+    public void UnicodePath_EscapedBraceInsideText(string latex, string expected)
+        => MarkdownMacros.RenderMathUnicode(latex).ShouldBe(expected);
+
+    /// <summary>
+    /// A piecewise definition, <c>\left\{</c> with no right brace
+    /// (<c>\right.</c>) around an environment, now parses. Its brace used to
+    /// alias to a bare <c>{</c> that left a group unclosed, so the formula
+    /// fell back to its source text, blanks and all:
+    /// <c>"f(x) = { x    x > 0\n 0    otherwise "</c>.
+    /// </summary>
+    [Fact]
+    public void UnicodePath_PiecewiseKeepsItsBrace()
+        => MarkdownMacros.RenderMathUnicode(
+                @"f(x) = \left\{ \begin{array}{ll} x & x > 0 \\ 0 & \text{otherwise} \end{array} \right.")
+            .ShouldBe("f(x) = {x    x > 0\n 0    otherwise");
+
+    // ── Box path ───────────────────────────────────────────────────────
+
+    /// <summary>
+    /// A set is a curly <see cref="BracketBox"/> around its content, in STIX
+    /// Two Math and in DejaVu Sans. Both draw the braces from their MATH
+    /// table's stretchy brace (DejaVu Sans as an assembly of parts); the
+    /// parametric fallback is <see cref="BoxPath_SetWithoutMathCoverage_TakesTheParametricPath"/>'s.
+    /// </summary>
+    [Theory]
+    [InlineData("STIX2Math", @"\{1, 2, 3\}", "1, 2, 3")]
+    [InlineData("STIX2Math", @"\{a\}", "a")]
+    [InlineData("STIX2Math", @"\lbrace x \rbrace", "x")]
+    [InlineData("STIX2Math", @"\left\{ \frac{1}{2} \right\}", @"\frac{1}{2}")]
+    [InlineData("DejaVuSans", @"\{1, 2, 3\}", "1, 2, 3")]
+    [InlineData("DejaVuSans", @"\{a\}", "a")]
+    [InlineData("DejaVuSans", @"\lbrace x \rbrace", "x")]
+    [InlineData("DejaVuSans", @"\left\{ \frac{1}{2} \right\}", @"\frac{1}{2}")]
+    public void BoxPath_Set_IsCurlyBracketBox(string font, string latex, string inner)
+    {
+        var style = StyleFor(font);
+        var box = BuildBox(latex, style).ShouldBeOfType<BracketBox>($"'{latex}' should build a bracket box");
+
+        var innerBox = BuildBox(inner, style).ShouldNotBeNull();
+        Render(box, style).ShouldBe(Render(new BracketBox(innerBox, BracketKind.Curly, style), style),
+            $"'{latex}' should paint a curly bracket box around '{inner}'");
+        Render(box, style).ShouldNotBe(Render(new BracketBox(innerBox, BracketKind.Square, style), style));
+    }
+
+    /// <summary>
+    /// The braces stretch with their content: around a fraction they are
+    /// taller than around a single letter, as brackets and parens are.
+    /// </summary>
+    [Fact]
+    public void BoxPath_SetAroundFraction_Stretches()
+    {
+        var tall = BuildBox(@"\left\{ \frac{1}{2} \right\}", Stix).ShouldBeOfType<BracketBox>();
+        var single = BuildBox(@"\{x\}", Stix).ShouldBeOfType<BracketBox>();
+        tall.TotalHeight.ShouldBeGreaterThan(single.TotalHeight * 1.3f);
+    }
+
+    /// <summary>
+    /// A font with no MATH construction for the brace draws a set's braces
+    /// with <see cref="BracketBox"/>'s parametric strokes once the content is
+    /// taller than its brace glyph. Among the test fonts that is BabelStone
+    /// Xiangqi Colour: a colour-glyph fixture, but it maps <c>{</c>, <c>}</c>,
+    /// the digits and Latin letters, and has no MATH table. Around a fraction
+    /// its brace glyph is too short, so the braces are strokes.
+    /// </summary>
+    [Fact]
+    public void BoxPath_SetWithoutMathCoverage_TakesTheParametricPath()
+    {
+        var style = StyleFor("BabelStone");
+        var inner = BuildBox(@"\frac{1}{2}", style).ShouldNotBeNull();
+        new StretchyVerticalBox('{', inner.TotalHeight, style).IsAvailable.ShouldBeFalse("no stretchy { in the font");
+        new StretchyVerticalBox('}', inner.TotalHeight, style).IsAvailable.ShouldBeFalse("no stretchy } in the font");
+
+        var box = BuildBox(@"\left\{ \frac{1}{2} \right\}", style).ShouldBeOfType<BracketBox>();
+        Render(box, style).ShouldBe(Render(new BracketBox(inner, BracketKind.Curly, style), style));
+        Render(box, style).ShouldNotBe(Render(new BracketBox(inner, BracketKind.Square, style), style));
+    }
+
+    /// <summary>
+    /// What a set paints: a brace on each side, each at least as tall as
+    /// the content, with the content's ink between them, and each brace's
+    /// cusp (its mid-height point) turned away from the content, so the left
+    /// one reads as <c>{</c> and the right one as <c>}</c>. Read off the
+    /// raster, so it holds for a font's own braces and for the parametric
+    /// strokes alike.
+    /// </summary>
+    [Theory]
+    [InlineData("STIX2Math", @"\{1, 2, 3\}")]
+    [InlineData("STIX2Math", @"\left\{ \frac{1}{2} \right\}")]
+    [InlineData("DejaVuSans", @"\{1, 2, 3\}")]
+    [InlineData("DejaVuSans", @"\left\{ \frac{1}{2} \right\}")]
+    [InlineData("BabelStone", @"\left\{ \frac{1}{2} \right\}")]
+    public void BoxPath_Set_PaintsBracesAroundTheContent(string font, string latex)
+    {
+        var style = StyleFor(font);
+        var image = BoxRasterizer.RenderToRgba(BuildBox(latex, style).ShouldBeOfType<BracketBox>(), style);
+
+        var runs = InkColumnRuns(image);
+        runs.Count.ShouldBeGreaterThanOrEqualTo(3, "a brace either side and the content between");
+        var (left, right) = (runs[0], runs[^1]);
+        var content = (Start: runs[1].Start, End: runs[^2].End);
+
+        // To within a row: a font's own brace at text size is centred on the
+        // math axis, and DejaVu Sans's then tops out a row below its digits.
+        var (contentTop, contentBottom) = InkRows(image, content.Start, content.End);
+        foreach (var (name, brace) in new[] { ("left", left), ("right", right) })
+        {
+            var (top, bottom) = InkRows(image, brace.Start, brace.End);
+            top.ShouldBeLessThanOrEqualTo(contentTop + 1, $"the {name} brace should reach the content's top");
+            bottom.ShouldBeGreaterThanOrEqualTo(contentBottom - 1, $"the {name} brace should reach the content's bottom");
+        }
+
+        var (leftTop, leftBottom) = InkRows(image, left.Start, left.End);
+        var leftMid = (leftTop + leftBottom) / 2;
+        var leftCusp = ExtremeInkX(image, left, leftMid - 1, leftMid + 1, leftmost: true);
+        leftCusp.ShouldBeLessThan(ExtremeInkX(image, left, leftTop, leftTop, leftmost: true),
+            "the left brace's cusp should be left of its top end");
+        leftCusp.ShouldBeLessThan(ExtremeInkX(image, left, leftBottom, leftBottom, leftmost: true),
+            "the left brace's cusp should be left of its bottom end");
+
+        var (rightTop, rightBottom) = InkRows(image, right.Start, right.End);
+        var rightMid = (rightTop + rightBottom) / 2;
+        var rightCusp = ExtremeInkX(image, right, rightMid - 1, rightMid + 1, leftmost: false);
+        rightCusp.ShouldBeGreaterThan(ExtremeInkX(image, right, rightTop, rightTop, leftmost: false),
+            "the right brace's cusp should be right of its top end");
+        rightCusp.ShouldBeGreaterThan(ExtremeInkX(image, right, rightBottom, rightBottom, leftmost: false),
+            "the right brace's cusp should be right of its bottom end");
+    }
+
+    /// <summary>
+    /// A brace that is not escaped is still an invisible group: it builds
+    /// what its content builds, with no bracket around it.
+    /// </summary>
+    [Fact]
+    public void BoxPath_BareBraces_StayAGroup()
+    {
+        var group = BuildBox(@"{a + b}", Stix).ShouldNotBeNull();
+        group.ShouldNotBeOfType<BracketBox>();
+        Render(group, Stix).ShouldBe(Render(BuildBox(@"a + b", Stix).ShouldNotBeNull(), Stix));
+    }
+
+    /// <summary>
+    /// An unbalanced brace does not parse on the box path, so the terminal
+    /// falls back to the Unicode path, which renders it as before. (An empty
+    /// set does parse: <see cref="BoxPath_EmptyPair_IsAnUnstretchedBracketBox"/>.)
+    /// </summary>
+    [Theory]
+    [InlineData(@"\{x")]
+    [InlineData(@"x\}")]
+    [InlineData(@"\left\{ x \right.")]
+    public void BoxPath_Unbalanced_DoesNotParse(string latex)
+        => BuildBox(latex, Stix).ShouldBeNull();
+
+    // ── Empty pairs ────────────────────────────────────────────────────
+
+    /// <summary>
+    /// An empty pair parses on the box path, so a display formula that holds
+    /// one keeps its box rather than falling to the Unicode path whole. It is
+    /// a bracket box around nothing: the font's two delimiters at their normal
+    /// height, unstretched (a stretchy delimiter asked for no height is the
+    /// font's base glyph), and side by side, since there is no content for
+    /// the usual padding to set off.
+    /// </summary>
+    [Theory]
+    [InlineData("STIX2Math", @"\{\}", BracketKind.Curly)]
+    [InlineData("STIX2Math", @"A = \{\}", BracketKind.Curly)]
+    [InlineData("STIX2Math", @"f()", BracketKind.Paren)]
+    [InlineData("STIX2Math", @"[]", BracketKind.Square)]
+    [InlineData("DejaVuSans", @"\{\}", BracketKind.Curly)]
+    [InlineData("DejaVuSans", @"A = \{\}", BracketKind.Curly)]
+    [InlineData("DejaVuSans", @"f()", BracketKind.Paren)]
+    [InlineData("DejaVuSans", @"[]", BracketKind.Square)]
+    public void BoxPath_EmptyPair_IsAnUnstretchedBracketBox(string font, string latex, BracketKind kind)
+    {
+        var style = StyleFor(font);
+        var box = BuildBox(latex, style).ShouldNotBeNull($"'{latex}' should parse on the box path");
+        var pair = BracketBoxesIn(box).ShouldHaveSingleItem($"'{latex}' should hold one bracket box");
+        Render(pair, style).ShouldBe(Render(new BracketBox(new HBox(), kind, style), style),
+            $"'{latex}' should be an empty {kind} pair");
+
+        var (left, right) = Delimiters(kind, requiredHeight: 0, style);
+        pair.Height.ShouldBe(MathF.Max(left.Height, right.Height), "the delimiters' own height");
+        pair.Depth.ShouldBe(MathF.Max(left.Depth, right.Depth), "the delimiters' own depth");
+        pair.Width.ShouldBe(left.Width + right.Width, 0.001f, "the two delimiters side by side");
+    }
+
+    /// <summary>
+    /// A pair with content keeps the 0.15 em of padding either side that
+    /// sets its content off: only an empty pair drops it, and a full one
+    /// builds exactly as before (the committed bracket baselines pin its
+    /// pixels too).
+    /// </summary>
+    [Theory]
+    [InlineData("STIX2Math", @"\{x\}", BracketKind.Curly)]
+    [InlineData("STIX2Math", @"(x)", BracketKind.Paren)]
+    [InlineData("STIX2Math", @"[x]", BracketKind.Square)]
+    [InlineData("DejaVuSans", @"\{x\}", BracketKind.Curly)]
+    [InlineData("DejaVuSans", @"(x)", BracketKind.Paren)]
+    [InlineData("DejaVuSans", @"[x]", BracketKind.Square)]
+    public void BoxPath_PairWithContent_KeepsItsPadding(string font, string latex, BracketKind kind)
+    {
+        var style = StyleFor(font);
+        var pair = BuildBox(latex, style).ShouldBeOfType<BracketBox>();
+        var inner = BuildBox("x", style).ShouldNotBeNull();
+        var (left, right) = Delimiters(kind, inner.TotalHeight, style);
+        pair.Width.ShouldBe(left.Width + inner.Width + right.Width + 2 * 0.15f * FontSize, 0.001f);
+    }
+
+    /// <summary>
+    /// On the Unicode path an empty pair keeps its delimiters as written,
+    /// whether it parses now (<c>()</c>, <c>[]</c>) or reaches the lexer as
+    /// placeholders (<c>\{\}</c>). <c>\left( \right)</c> used to fail to
+    /// parse and print its source with the blank, "( )".
+    /// </summary>
+    [Theory]
+    [InlineData(@"\{\}", "{}")]
+    [InlineData(@"A = \{\}", "A = {}")]
+    [InlineData(@"f()", "f()")]
+    [InlineData(@"()", "()")]
+    [InlineData(@"[]", "[]")]
+    [InlineData(@"x = [] + ()", "x = [] + ()")]
+    [InlineData(@"\left( \right)", "()")]
+    public void UnicodePath_EmptyPairKeepsItsDelimiters(string latex, string expected)
+        => MarkdownMacros.RenderMathUnicode(latex).ShouldBe(expected);
+
+    /// <summary>
+    /// In a font with no MATH table an empty pair still draws the font's own
+    /// delimiters, not <see cref="BracketBox"/>'s parametric strokes: a
+    /// stretchy delimiter asked for no height is the base glyph, which a font
+    /// that maps the delimiter has, MATH table or not. BabelStone Xiangqi
+    /// Colour has none, and each delimiter of its empty pairs inks from about
+    /// the top of its digits down to the baseline. Read off one raster of a
+    /// digit beside the pair, so both stand on the same baseline.
+    /// </summary>
+    [Theory]
+    [InlineData(@"\{\}", BracketKind.Curly)]
+    [InlineData(@"()", BracketKind.Paren)]
+    [InlineData(@"[]", BracketKind.Square)]
+    public void BoxPath_EmptyPairWithoutMath_StandsAsTallAsTheDigits(string latex, BracketKind kind)
+    {
+        var style = StyleFor("BabelStone");
+        var pair = BuildBox(latex, style).ShouldBeOfType<BracketBox>();
+        var digit = new GlyphBox("1", style);
+        var image = BoxRasterizer.RenderToRgba(new HBox(digit, pair), style);
+
+        var margin = (int)MathF.Ceiling(FontSize * 0.15f);
+        var (left, right) = Delimiters(kind, requiredHeight: 0, style);
+        var digitColumns = (Start: margin, End: margin + (int)digit.Width - 1);
+        var leftStart = margin + digit.Width;
+        var leftColumns = (Start: (int)MathF.Ceiling(leftStart), End: (int)(leftStart + left.Width) - 1);
+        var rightColumns = (Start: (int)MathF.Ceiling(leftStart + left.Width), End: (int)(leftStart + left.Width + right.Width) - 1);
+
+        var (digitTop, digitBottom) = InkRows(image, digitColumns.Start, digitColumns.End);
+        foreach (var (name, columns) in new[] { ("left", leftColumns), ("right", rightColumns) })
+        {
+            var (top, bottom) = InkRows(image, columns.Start, columns.End);
+            top.ShouldBeLessThanOrEqualTo(digitTop + 1, $"the {name} delimiter of '{latex}' should reach the digits' top");
+            bottom.ShouldBeGreaterThanOrEqualTo(digitBottom - 1, $"the {name} delimiter of '{latex}' should reach the baseline");
+        }
+    }
+
+    /// <summary>
+    /// A pair with content in that font keeps its height and depth, pinned
+    /// here, whatever is done for empty pairs. <c>(x)</c> takes the font's
+    /// paren glyph; around a fraction the brace glyph is too short, and the
+    /// braces are parametric.
+    /// </summary>
+    [Theory]
+    [InlineData(@"(x)", 20.5f, 4.5f)]
+    [InlineData(@"\left\{ \frac{1}{2} \right\}", 37.04889f, 21.04889f)]
+    public void BoxPath_PairWithContentWithoutMath_KeepsItsHeight(string latex, float height, float depth)
+    {
+        var pair = BuildBox(latex, StyleFor("BabelStone")).ShouldBeOfType<BracketBox>();
+        pair.Height.ShouldBe(height, 0.01f);
+        pair.Depth.ShouldBe(depth, 0.01f);
+    }
+
+    /// <summary>
+    /// <c>A = \{\} + f()</c> in BabelStone Xiangqi Colour, written to
+    /// <c>obj/</c> for a look by eye; asserts ink, none of it on the raster's
+    /// edge. Not a baseline.
+    /// </summary>
+    [Fact]
+    public void BoxPath_EmptyPairsWithoutMath_WritePngForInspection()
+    {
+        var style = StyleFor("BabelStone");
+        var image = BoxRasterizer.RenderToRgba(BuildBox(@"A = \{\} + f()", style).ShouldNotBeNull(), style);
+        InkPixels(image).ShouldBeGreaterThan(0);
+        EdgeInkPixels(image).ShouldBe(0);
+
+        Directory.CreateDirectory(OutputDir);
+        File.WriteAllBytes(Path.Combine(OutputDir, "BabelStone-empty-pairs.png"),
+            PngWriter.Encode(image.Pixels, image.Width, image.Height));
+    }
+
+    private const string NestedFraction = @"\frac{\frac{a}{b}}{\frac{c}{d}}";
+
+    /// <summary>
+    /// Each brace of a set reads as a brace, not as a paren or an angle
+    /// bracket (<see cref="BraceShapeFault"/>), whether the font draws it
+    /// (STIX Two Math, DejaVu Sans) or <see cref="BracketBox"/>'s parametric
+    /// fallback does (BabelStone Xiangqi Colour, around a fraction). A brace the
+    /// font designed at that size (a MATH size variant: STIX Two Math's around
+    /// the nested fraction, which TeX's shortfall now takes over the assembly)
+    /// is checked on its own shape, the cusp and the hooks, without the straight
+    /// spine an assembled brace gets from its extenders.
+    /// </summary>
+    [Theory]
+    [InlineData("STIX2Math", @"\{1, 2, 3\}")]
+    [InlineData("STIX2Math", @"\left\{ \frac{1}{2} \right\}")]
+    [InlineData("STIX2Math", @"\left\{ " + NestedFraction + @" \right\}")]
+    [InlineData("DejaVuSans", @"\{1, 2, 3\}")]
+    [InlineData("DejaVuSans", @"\left\{ \frac{1}{2} \right\}")]
+    [InlineData("DejaVuSans", @"\left\{ " + NestedFraction + @" \right\}")]
+    [InlineData("BabelStone", @"\left\{ \frac{1}{2} \right\}")]
+    [InlineData("BabelStone", @"\left\{ " + NestedFraction + @" \right\}")]
+    public void BoxPath_Set_EachBraceReadsAsABrace(string font, string latex)
+    {
+        var style = StyleFor(font);
+        var bracket = BuildBox(latex, style).ShouldBeOfType<BracketBox>();
+        var image = BoxRasterizer.RenderToRgba(bracket, style);
+        var runs = InkColumnRuns(image);
+        var spine = !IsSizeVariant(bracket, style);
+        BraceShapeFault(image, runs[0], outerIsLeft: true, spine).ShouldBeNull($"the left brace of '{latex}' in {font}");
+        BraceShapeFault(image, runs[^1], outerIsLeft: false, spine).ShouldBeNull($"the right brace of '{latex}' in {font}");
+    }
+
+    /// <summary>Whether <paramref name="bracket"/>'s left delimiter is one of the
+    /// font's MATH size variants: neither its unstretched glyph nor an assembly
+    /// (which reports the unstretched glyph's id), nor the parametric fallback.</summary>
+    private static bool IsSizeVariant(BracketBox bracket, BoxStyle style)
+    {
+        var left = (StretchyVerticalBox?)typeof(BracketBox)
+            .GetField("_leftFont", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(bracket);
+        if (left is null) return false;
+        BoxStyle.SharedRasterizer.RasterizeStretchyVertical(style.FontPath, style.FontSize, new Rune('{'), 1f, out var baseGid);
+        return left.VariantGlyphId != baseGid;
+    }
+
+    /// <summary>
+    /// The shape check tells a brace from a paren, whether the font draws
+    /// the paren or <see cref="BracketBox"/>'s parametric fallback does: a
+    /// paren's outer edge stays at its extreme over a broad band.
+    /// </summary>
+    [Theory]
+    [InlineData("STIX2Math", @"\left( \frac{1}{2} \right)")]
+    [InlineData("STIX2Math", @"\left( " + NestedFraction + @" \right)")]
+    [InlineData("DejaVuSans", @"\left( " + NestedFraction + @" \right)")]
+    [InlineData("BabelStone", @"\left( \frac{1}{2} \right)")]
+    [InlineData("BabelStone", @"\left( " + NestedFraction + @" \right)")]
+    public void BraceShape_TellsAParenFromABrace(string font, string latex)
+    {
+        var style = StyleFor(font);
+        var image = BoxRasterizer.RenderToRgba(BuildBox(latex, style).ShouldBeOfType<BracketBox>(), style);
+        var runs = InkColumnRuns(image);
+        BraceShapeFault(image, runs[0], outerIsLeft: true).ShouldNotBeNull($"the left paren of '{latex}' in {font}");
+        BraceShapeFault(image, runs[^1], outerIsLeft: false).ShouldNotBeNull($"the right paren of '{latex}' in {font}");
+    }
+
+    /// <summary>
+    /// The shape check tells a brace from an angle bracket, STIX Two Math's
+    /// stretchy U+27E8 at two heights: its outer edge moves at an even rate,
+    /// with no straight spine.
+    /// </summary>
+    [Theory]
+    [InlineData(60f)]
+    [InlineData(110f)]
+    public void BraceShape_TellsAnAngleBracketFromABrace(float height)
+    {
+        var image = BoxRasterizer.RenderToRgba(new StretchyVerticalBox(0x27E8, height, Stix), Stix);
+        BraceShapeFault(image, InkColumnRuns(image)[0], outerIsLeft: true).ShouldNotBeNull();
+    }
+
+    /// <summary>
+    /// Renders written to <c>obj/</c> for a look by eye, in both fonts.
+    /// Asserts that they have ink and that none of it reaches the raster's
+    /// outermost rows or columns, which are margin: ink there was cut off at
+    /// the edge. The PNGs are not baselines.
+    /// </summary>
+    [Theory]
+    [InlineData("STIX2Math", @"\{1, 2, 3\}", "set-1-2-3")]
+    [InlineData("STIX2Math", @"\left\{ \frac{1}{2} \right\}", "set-half")]
+    [InlineData("DejaVuSans", @"\{1, 2, 3\}", "set-1-2-3")]
+    [InlineData("DejaVuSans", @"\left\{ \frac{1}{2} \right\}", "set-half")]
+    [InlineData("BabelStone", @"\left\{ \frac{1}{2} \right\}", "set-half")]
+    [InlineData("STIX2Math", @"\left\{ " + NestedFraction + @" \right\}", "set-nested")]
+    [InlineData("BabelStone", @"\left\{ " + NestedFraction + @" \right\}", "set-nested")]
+    public void BoxPath_WritesPngForInspection(string font, string latex, string name)
+    {
+        var style = StyleFor(font);
+        var box = BuildBox(latex, style).ShouldBeOfType<BracketBox>();
+        var image = BoxRasterizer.RenderToRgba(box, style);
+        InkPixels(image).ShouldBeGreaterThan(0);
+        EdgeInkPixels(image).ShouldBe(0, $"'{latex}' in {font} has ink on the raster's edge");
+
+        Directory.CreateDirectory(OutputDir);
+        File.WriteAllBytes(Path.Combine(OutputDir, $"{font}-{name}.png"),
+            PngWriter.Encode(image.Pixels, image.Width, image.Height));
+    }
+
+    // ── The preparation helper ─────────────────────────────────────────
+
+    /// <summary>
+    /// Environments have no box yet, so the helper turns them away, before or
+    /// after the <c>\boxed</c> and <c>\ce</c> expansions.
+    /// </summary>
+    [Theory]
+    [InlineData(@"\begin{pmatrix} a & b \\ c & d \end{pmatrix}")]
+    [InlineData(@"f(x) = \left\{ \begin{array}{ll} x & x > 0 \\ 0 & \text{otherwise} \end{array} \right.")]
+    public void Helper_DeclinesEnvironments(string latex)
+        => MarkdownMacros.TryPrepareMathBoxSource(latex, out _).ShouldBeFalse();
+
+    /// <summary>
+    /// <c>\text{X}</c> reaches the grammar as <c>\textrm{X}</c>, a text run
+    /// with its blanks, where the helper used to turn the formula away, which
+    /// sent nearly every display formula a document wrote for KaTeX to the
+    /// Unicode path. X is resolved as the Unicode path resolves it, with its
+    /// braces escaped so the token keeps them.
+    /// </summary>
+    [Theory]
+    [InlineData(@"\text{if } x > 0", @"\textrm{if } x > 0")]
+    [InlineData(@"x + \text{y}", @"x + \textrm{y}")]
+    [InlineData(@"\boxed{\text{done}}", @"\textrm{done}")]
+    [InlineData(@"\text{a\ b\_c}", @"\textrm{a b_c}")]
+    [InlineData(@"\text{\{x\}}", @"\textrm{\{x\}}")]
+    public void Helper_SpellsTextAsTextrm(string latex, string expected)
+    {
+        MarkdownMacros.TryPrepareMathBoxSource(latex, out var prepared).ShouldBeTrue();
+        prepared.ShouldBe(expected);
+    }
+
+    /// <summary>
+    /// For any formula without an escaped brace, the helper prepares exactly
+    /// what Console.Lib's own sequence prepared (<see cref="ConsoleLibPrepare"/>),
+    /// or turns away exactly what it turned away, so moving that sequence into
+    /// DIR.Lib changes nothing a brace-free formula renders.
+    ///
+    /// <para>The corpus is every string argument of every <c>[InlineData]</c>
+    /// in <see cref="BracketMathTests"/>, <see cref="MathItalicTests"/> and
+    /// <see cref="RadicalJoinTests"/>, the formulas behind the radical
+    /// scenes, and <see cref="BoxedAndChemCorpus"/>. Left out are the
+    /// formulas this branch changes on purpose: one the old sequence turned
+    /// away for its braces, and one with whitespace between <c>\left</c> or
+    /// <c>\right</c> and its delimiter, which the old aliases did not
+    /// match. Also left out are those with a math space (<c>\,</c> <c>\:</c>
+    /// <c>\;</c> <c>\!</c>), which the helper now keeps for the grammar to
+    /// lex as space where the old sequence made each a blank
+    /// (<see cref="MathSpacingTests"/> pins that). Left out too are those
+    /// with <c>\text</c>, which the helper now prepares as <c>\textrm</c>
+    /// where the old sequence turned it away (<see cref="Helper_SpellsTextAsTextrm"/>),
+    /// and those with an operator missing an operand, which it now supplies
+    /// (<see cref="VsCodeParityTests"/>).</para>
+    /// </summary>
+    [Fact]
+    public void Helper_MatchesConsoleLibSequence_WithoutEscapedBraces()
+    {
+        var corpus = new[] { typeof(BracketMathTests), typeof(MathItalicTests), typeof(RadicalJoinTests) }
+            .SelectMany(InlineDataStrings)
+            .Concat(RadicalScenes)
+            .Concat(BoxedAndChemCorpus)
+            .Where(latex => !ConsoleLibTurnsAwayBraces(latex) && !SpacedLeftOrRight.IsMatch(latex)
+                            && !MathSpaceEscape.IsMatch(latex)
+                            && !MarkdownMacros.ContainsMacro(latex, "text")
+                            && MarkdownMacros.SupplyMissingOperands(MarkdownMacros.NormalizeLatexAliases(latex)) == MarkdownMacros.NormalizeLatexAliases(latex))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+
+        corpus.Count.ShouldBeGreaterThan(150);
+        corpus.ShouldContain(latex => latex.Contains(@"\boxed"));
+        corpus.ShouldContain(latex => latex.Contains(@"\ce"));
+        corpus.ShouldContain(latex => ConsoleLibPrepare(latex) == null);
+
+        var mismatches = new List<string>();
+        foreach (var latex in corpus)
+        {
+            var expected = ConsoleLibPrepare(latex);
+            var actual = MarkdownMacros.TryPrepareMathBoxSource(latex, out var prepared) ? prepared : null;
+            if (!string.Equals(actual, expected, StringComparison.Ordinal))
+                mismatches.Add($"'{latex}': helper '{actual ?? "<declined>"}', Console.Lib '{expected ?? "<declined>"}'");
+        }
+        mismatches.ShouldBeEmpty();
+    }
+
+    /// <summary><c>\boxed</c> and <c>\ce</c> formulas, and a few that reach the
+    /// other steps (the aliases, a <c>\\</c> before a group).</summary>
+    private static readonly string[] BoxedAndChemCorpus =
+    [
+        @"\boxed{x^2 + 1}",
+        @"\boxed{\frac{a}{b}}",
+        @"x = \boxed{42}",
+        @"\boxed{\boxed{x}}",
+        @"\boxed {\sqrt{2}}",
+        @"\boxed{\ce{H2O}}",
+        @"\boxed{\begin{matrix} a \end{matrix}}",
+        @"\ce{H2O}",
+        @"\ce{NaCl}",
+        @"\ce{Fe^{3+}}",
+        @"\ce{Fe^3+}",
+        @"\ce{SO4^{2-}}",
+        @"\ce{Ca(OH)2}",
+        @"\ce{2H2 + O2 -> 2H2O}",
+        @"\ce{^{238}U -> ^{234}Th + ^{4}_{2}He}",
+        @"\ce{HCl(aq) + NaOH(aq) -> NaCl(aq) + H2O(l)}",
+        @"\ce{Fe^{3+} + e^- -> Fe^{2+}}",
+        @"\ce{\frac{H2O}{2}}",
+        @"\ce{H2O(\text {aq})}",
+        @"\ce{H+}",
+        @"\ce{CO2 + C -> 2CO}",
+        @"\ce{A <=> B}",
+        @"\dfrac{1}{2} + \tfrac{3}{4}",
+        @"\bigl( x \bigr) + \Biggl[ y \Biggr]",
+        @"\left( \frac{a}{b} \right)",
+        @"a \\{b}",
+        @"x\,y\;z\!w",
+        @"\textbf{x}",
+        @"\beginning",
+    ];
+
+    /// <summary><c>\left</c> or <c>\right</c>, whole, then whitespace.</summary>
+    private static readonly Regex SpacedLeftOrRight = new(@"\\(left|right)\s");
+
+    /// <summary>A math space, <c>\,</c> <c>\:</c> <c>\;</c> or <c>\!</c>, its
+    /// backslash not the second half of a <c>\\</c>.</summary>
+    private static readonly Regex MathSpaceEscape = new(@"(?<!\\)(\\\\)*\\[,:;!]");
+
+    /// <summary>The formulas <see cref="RadicalJoinTests"/>'s scenes parse.</summary>
+    private static readonly string[] RadicalScenes =
+    [
+        @"\sqrt{x^2+y^2}",
+        @"\sqrt{2}",
+        @"\sqrt{x}",
+        @"\sqrt{\frac{a}{b}}",
+        @"\frac{-b \pm \sqrt{b^2-4ac}}{2a}",
+        @"\sqrt{\left(\frac{a}{b}\right)}",
+        @"\sqrt{\frac{\frac{a}{b}}{\frac{c}{d}}}",
+    ];
+
+    private static IEnumerable<string> InlineDataStrings(Type type) =>
+        type.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static)
+            .SelectMany(method => method.GetCustomAttributes<InlineDataAttribute>())
+            .SelectMany(data => data.Data)
+            .OfType<string>();
+
+    // ── Console.Lib's sequence, as it stood ────────────────────────────
+
+    /// <summary>
+    /// Console.Lib's box-path preparation as it stood before this helper,
+    /// copied from <c>src/Console.Lib/MarkdownRenderer.cs</c> on Console.Lib
+    /// main at 29489ca (<c>TryRenderMathBox</c>, from its first
+    /// <c>CanBuildBox</c> to its <c>ResolveBackslashEscapes</c>). Null where it
+    /// turned the formula away to the Unicode path.
+    ///
+    /// <para>The two DIR.Lib calls in it that this branch changes are frozen
+    /// below as they stood at fe09d4a, the branch's base:
+    /// <see cref="BaseNormalizeLatexAliases"/> and
+    /// <see cref="BaseExpandBalancedMacro"/>. Calling the live ones would
+    /// compare the helper with itself. The others (<c>ContainsMacro</c>,
+    /// <c>ResolveBackslashEscapes(string)</c>, <c>Mhchem.ToLatex</c>) are
+    /// unchanged here.</para>
+    /// </summary>
+    private static string? ConsoleLibPrepare(string source)
+    {
+        if (!CanBuildBox(source)) return null;
+
+        source = BaseNormalizeLatexAliases(source);
+        source = BaseExpandBalancedMacro(source, "boxed", inner => inner);
+        source = BaseExpandBalancedMacro(source, "ce", inner => Mhchem.ToLatex(inner));
+        if (!CanBuildBox(source)) return null;
+        return MarkdownMacros.ResolveBackslashEscapes(source);
+    }
+
+    /// <summary><c>MarkdownMacros.NormalizeLatexAliases</c> at fe09d4a: the
+    /// alias table's entries verbatim, applied in order with no whole-name
+    /// match.</summary>
+    private static string BaseNormalizeLatexAliases(string source)
+    {
+        foreach (var (from, to) in BaseLatexAliases)
+            source = source.Replace(from, to);
+        return source;
+    }
+
+    private static readonly (string From, string To)[] BaseLatexAliases =
+    [
+        // Fraction-style aliases.
+        (@"\dfrac",   @"\frac"),
+        (@"\tfrac",   @"\frac"),
+        // Auto-sizing delimiter pairs collapse to the bare delimiter.
+        (@"\left[",   "["),
+        (@"\right]",  "]"),
+        (@"\left(",   "("),
+        (@"\right)",  ")"),
+        (@"\left\{",  "{"),
+        (@"\right\}", "}"),
+        (@"\left|",   "|"),
+        (@"\right|",  "|"),
+        (@"\left.",   ""),   // null delimiter
+        (@"\right.",  ""),
+        // Manual size prefixes: strip, keep the delimiter that follows.
+        (@"\biggl",   ""),
+        (@"\biggr",   ""),
+        (@"\Biggl",   ""),
+        (@"\Biggr",   ""),
+        (@"\bigl",    ""),
+        (@"\bigr",    ""),
+        (@"\Bigl",    ""),
+        (@"\Bigr",    ""),
+    ];
+
+    /// <summary><c>MarkdownMacros.ExpandBalancedMacro</c> at fe09d4a, with its
+    /// brace matcher, which counted every brace, escaped or not.</summary>
+    private static string BaseExpandBalancedMacro(string source, string commandName, Func<string, string> onMatch)
+    {
+        var sb = new StringBuilder(source.Length);
+        var marker = "\\" + commandName;
+        int i = 0;
+        while (i < source.Length)
+        {
+            if (i + marker.Length <= source.Length
+                && string.CompareOrdinal(source, i, marker, 0, marker.Length) == 0
+                && (i + marker.Length == source.Length
+                    || !BaseIsAsciiLetter(source[i + marker.Length])))
+            {
+                int afterCmd = i + marker.Length;
+                int j = afterCmd;
+                while (j < source.Length && (source[j] == ' ' || source[j] == '\t' || source[j] == '\r' || source[j] == '\n'))
+                    j++;
+                if (j < source.Length && source[j] == '{')
+                {
+                    int braceEnd = BaseFindMatchingBrace(source, j);
+                    if (braceEnd > j)
+                    {
+                        var inner = source.Substring(j + 1, braceEnd - j - 1);
+                        sb.Append(onMatch(inner));
+                        i = braceEnd + 1;
+                        continue;
+                    }
+                }
+            }
+            sb.Append(source[i]);
+            i++;
+        }
+        return sb.ToString();
+    }
+
+    private static int BaseFindMatchingBrace(string s, int openPos)
+    {
+        int depth = 1;
+        for (int i = openPos + 1; i < s.Length; i++)
+        {
+            if (s[i] == '{') depth++;
+            else if (s[i] == '}')
+            {
+                depth--;
+                if (depth == 0) return i;
+            }
+        }
+        return -1;
+    }
+
+    private static bool BaseIsAsciiLetter(char c) =>
+        (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+
+    private static bool CanBuildBox(string source)
+        => !MarkdownMacros.ContainsMacro(source, "text")
+            && !source.Contains(@"\begin", StringComparison.Ordinal)
+            && !ConsoleLibTurnsAwayBraces(source);
+
+    /// <summary>The part of Console.Lib's <c>CanBuildBox</c> that this change
+    /// retires: a brace meant as a glyph.</summary>
+    private static bool ConsoleLibTurnsAwayBraces(string source)
+        => MarkdownMacros.ContainsMacro(source, "lbrace")
+            || MarkdownMacros.ContainsMacro(source, "rbrace")
+            || HasEscapedBrace(source);
+
+    private static bool HasEscapedBrace(string source)
+    {
+        for (var i = 0; i < source.Length - 1; i++)
+        {
+            if (source[i] != '\\') continue;
+            var next = source[i + 1];
+            if (next is '{' or '}') return true;
+            i++; // the escaped character, which for \\ is the second backslash
+        }
+        return false;
+    }
+
+    // ── Helpers ────────────────────────────────────────────────────────
+
+    private static BoxStyle StyleFor(string font) => new(font switch
+    {
+        "STIX2Math" => Path.Combine(AppContext.BaseDirectory, "Fonts", "STIX2Math.otf"),
+        "DejaVuSans" => Path.Combine(AppContext.BaseDirectory, "Fonts", "DejaVuSans.ttf"),
+        "BabelStone" => Path.Combine(AppContext.BaseDirectory, "Fonts", "BabelStoneXiangqiColour.ttf"),
+        _ => throw new ArgumentException($"unknown font '{font}'"),
+    }, FontSize, Ink);
+
+    /// <summary>
+    /// Prepares <paramref name="latex"/> with
+    /// <see cref="MarkdownMacros.TryPrepareMathBoxSource"/>, then parses and
+    /// builds it at <paramref name="style"/>. Null when the helper turns it
+    /// away or it does not lex or parse, which is where the terminal falls
+    /// back to the Unicode path. LALR.CC throws for both (<c>LexerException</c>,
+    /// <c>ParseErrorException</c>), and both are
+    /// <see cref="InvalidOperationException"/>s.
+    /// </summary>
+    private static Box? BuildBox(string latex, BoxStyle style)
+    {
+        if (!MarkdownMacros.TryPrepareMathBoxSource(latex, out var source)) return null;
+        var parser = Latex.BuildParser(new BoxBuildingVisitor(style));
+        try
+        {
+            using var lexer = BytesLexer.FromString(source, MarkdownMacros.MathLexerTable);
+            using var tokens = new SyncLATokenIterator(lexer);
+            var item = parser.ParseInput(tokens, debugger: null);
+            return item.IsError || item.Content is not Func<BoxStyle, Box> builder ? null : builder(style);
+        }
+        catch (InvalidOperationException)
+        {
+            return null;
+        }
+    }
+
+    private static byte[] Render(Box box, BoxStyle style) => BoxRasterizer.RenderToRgba(box, style).Pixels;
+
+    private static int InkPixels(RgbaImage image)
+    {
+        var ink = 0;
+        for (var i = 3; i < image.Pixels.Length; i += 4)
+            if (image.Pixels[i] > 0) ink++;
+        return ink;
+    }
+
+    /// <summary>The stretchy delimiters a <see cref="BracketBox"/> of
+    /// <paramref name="kind"/> asks the font for, at <paramref name="requiredHeight"/>.</summary>
+    private static (StretchyVerticalBox Left, StretchyVerticalBox Right) Delimiters(
+        BracketKind kind, float requiredHeight, BoxStyle style)
+    {
+        var (open, close) = kind switch
+        {
+            BracketKind.Paren => ('(', ')'),
+            BracketKind.Square => ('[', ']'),
+            _ => ('{', '}'),
+        };
+        var left = new StretchyVerticalBox(open, requiredHeight, style);
+        var right = new StretchyVerticalBox(close, requiredHeight, style);
+        left.IsAvailable.ShouldBeTrue($"the font has no {open}");
+        right.IsAvailable.ShouldBeTrue($"the font has no {close}");
+        return (left, right);
+    }
+
+    /// <summary>Every <see cref="BracketBox"/> in <paramref name="root"/>'s tree.
+    /// Boxes keep their children in private fields, so this walks those, as
+    /// <see cref="RadicalJoinTests"/>' probe does.</summary>
+    private static List<BracketBox> BracketBoxesIn(Box root)
+    {
+        var found = new List<BracketBox>();
+        var seen = new HashSet<object>(ReferenceEqualityComparer.Instance);
+        var pending = new Stack<object>();
+        pending.Push(root);
+        while (pending.TryPop(out var node))
+        {
+            if (!seen.Add(node)) continue;
+            if (node is BracketBox bracket)
+            {
+                found.Add(bracket);
+                continue;
+            }
+            for (var type = node.GetType(); type is not null && type != typeof(object); type = type.BaseType)
+            {
+                foreach (var field in type.GetFields(BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public | BindingFlags.DeclaredOnly))
+                {
+                    switch (field.GetValue(node))
+                    {
+                        case Box child:
+                            pending.Push(child);
+                            break;
+                        case System.Collections.IEnumerable items and not string:
+                            foreach (var item in items)
+                                if (item is Box b) pending.Push(b);
+                            break;
+                    }
+                }
+            }
+        }
+        return found;
+    }
+
+    private static bool Inked(RgbaImage image, int x, int y) => image.Pixels[(y * image.Width + x) * 4 + 3] > 0;
+
+    /// <summary>The image's inked columns as runs of adjacent columns, left to
+    /// right; a column with no ink at all ends a run.</summary>
+    private static List<(int Start, int End)> InkColumnRuns(RgbaImage image)
+    {
+        var runs = new List<(int Start, int End)>();
+        var start = -1;
+        for (var x = 0; x <= image.Width; x++)
+        {
+            var inked = false;
+            for (var y = 0; x < image.Width && y < image.Height && !inked; y++)
+                inked = Inked(image, x, y);
+            if (inked && start < 0) start = x;
+            else if (!inked && start >= 0)
+            {
+                runs.Add((start, x - 1));
+                start = -1;
+            }
+        }
+        return runs;
+    }
+
+    /// <summary>The first and last rows with ink in columns
+    /// <paramref name="x0"/> to <paramref name="x1"/>.</summary>
+    private static (int Top, int Bottom) InkRows(RgbaImage image, int x0, int x1)
+    {
+        var (top, bottom) = (-1, -1);
+        for (var y = 0; y < image.Height; y++)
+        {
+            for (var x = x0; x <= x1; x++)
+            {
+                if (!Inked(image, x, y)) continue;
+                if (top < 0) top = y;
+                bottom = y;
+                break;
+            }
+        }
+        top.ShouldBeGreaterThanOrEqualTo(0, $"columns {x0}..{x1} have no ink");
+        return (top, bottom);
+    }
+
+    /// <summary>The leftmost (or rightmost) column of <paramref name="run"/> with
+    /// ink in rows <paramref name="y0"/> to <paramref name="y1"/>.</summary>
+    private static int ExtremeInkX(RgbaImage image, (int Start, int End) run, int y0, int y1, bool leftmost)
+    {
+        var found = -1;
+        for (var y = y0; y <= y1; y++)
+        {
+            for (var x = run.Start; x <= run.End; x++)
+            {
+                if (!Inked(image, x, y)) continue;
+                if (found < 0 || (leftmost ? x < found : x > found)) found = x;
+            }
+        }
+        found.ShouldBeGreaterThanOrEqualTo(0, $"rows {y0}..{y1} of columns {run.Start}..{run.End} have no ink");
+        return found;
+    }
+
+    /// <summary>
+    /// Null when the delimiter in <paramref name="run"/> reads as a brace,
+    /// else what does not. Read off two edges per row, taking ink as alpha
+    /// of at least half: the outer edge, the delimiter's outermost ink (on
+    /// the left for a left delimiter), and the inner edge, its innermost.
+    /// A brace has all three of:
+    /// <list type="bullet">
+    ///   <item>A sharp cusp. The outer edge comes within a pixel of its
+    ///   extreme only within max(2, 3% of the height) rows of mid-height. A
+    ///   paren's bulge holds its extreme over a broad band.</item>
+    ///   <item>A straight spine. Over the middle third of each half the outer
+    ///   edge moves at most a pixel, though over the half it moves at least
+    ///   three. An angle bracket's edge moves at an even rate.</item>
+    ///   <item>Hooked ends. In its first two rows at each end the inner edge
+    ///   reaches at least two pixels further towards the content than it does
+    ///   a quarter of the way in.</item>
+    /// </list>
+    /// The limits come from measuring at 32 px. STIX Two Math's and DejaVu
+    /// Sans's own braces, around text, a fraction and a nested fraction, have
+    /// cusps of at most 2.5 rows, spines that do not move, and ends that turn
+    /// in by 3 to 8 pixels. Their parens hold the extreme for 12 to 62 rows
+    /// from mid-height, the parametric paren for 22 and 46. STIX Two Math's
+    /// stretchy angle bracket at 60 and 110 px has a cusp of 5 and 4 rows and
+    /// moves 3 and 5 pixels across the middle third. The four-stroke
+    /// parametric brace this replaced had a cusp of 8 and 16 rows and moved 2
+    /// pixels there.
+    /// <para>The spine is checked only where <paramref name="spine"/> says so:
+    /// an assembled brace, the unstretched glyph and the parametric fallback
+    /// all have one. A size variant the font designed may curve all the way to
+    /// its cusp (STIX Two Math's largest brace moves 2 px over the middle third
+    /// of its top half), and is a brace by its cusp and its hooks.</para>
+    /// </summary>
+    private static string? BraceShapeFault(RgbaImage image, (int Start, int End) run, bool outerIsLeft, bool spine = true)
+    {
+        // Per row: how far the outer edge and the inner edge lie from the run's outer side.
+        var rows = new List<(int Y, int Outer, int Inner)>();
+        for (var y = 0; y < image.Height; y++)
+        {
+            var (first, last) = (-1, -1);
+            for (var x = run.Start; x <= run.End; x++)
+            {
+                if (image.Pixels[(y * image.Width + x) * 4 + 3] < 128) continue;
+                if (first < 0) first = x;
+                last = x;
+            }
+            if (first < 0) continue;
+            rows.Add(outerIsLeft
+                ? (y, first - run.Start, last - run.Start)
+                : (y, run.End - last, run.End - first));
+        }
+        if (rows.Count < 8) return $"only {rows.Count} inked rows";
+
+        var (top, bottom) = (rows[0].Y, rows[^1].Y);
+        var mid = (top + bottom) / 2.0;
+        var extreme = rows.Min(r => r.Outer);
+        var cuspSpan = rows.Where(r => r.Outer <= extreme + 1).Max(r => Math.Abs(r.Y - mid));
+        var cuspLimit = Math.Max(2.0, 0.03 * (bottom - top + 1));
+        if (cuspSpan > cuspLimit)
+            return $"no sharp cusp: the outer edge is within a pixel of its extreme {cuspSpan:F1} rows from mid-height (at most {cuspLimit:F1})";
+
+        // Each half from its end to the cusp.
+        foreach (var (name, half) in new[]
+                 {
+                     ("top", rows.Where(r => r.Y <= mid).ToList()),
+                     ("bottom", rows.Where(r => r.Y >= mid).Reverse().ToList()),
+                 })
+        {
+            var third = half.Count / 3;
+            var middle = half.Skip(third).Take(third).ToList();
+            var spineMove = middle.Max(r => r.Outer) - middle.Min(r => r.Outer);
+            var halfMove = half.Max(r => r.Outer) - half.Min(r => r.Outer);
+            if (spine && (halfMove < 3 || spineMove > 1))
+                return $"no straight spine in the {name} half: the outer edge moves {spineMove} px over its middle third and {halfMove} px over the half";
+
+            var turnIn = half.Take(2).Max(r => r.Inner) - half[half.Count / 2].Inner;
+            if (turnIn < 2)
+                return $"the {name} end does not turn towards the content: its inner edge reaches {turnIn} px further in than a quarter of the way in";
+        }
+        return null;
+    }
+
+    /// <summary>Inked pixels in the image's outermost rows and columns.</summary>
+    private static int EdgeInkPixels(RgbaImage image)
+    {
+        var ink = 0;
+        for (var y = 0; y < image.Height; y++)
+        {
+            for (var x = 0; x < image.Width; x++)
+            {
+                if (y != 0 && y != image.Height - 1 && x != 0 && x != image.Width - 1) continue;
+                if (image.Pixels[(y * image.Width + x) * 4 + 3] > 0) ink++;
+            }
+        }
+        return ink;
+    }
+}

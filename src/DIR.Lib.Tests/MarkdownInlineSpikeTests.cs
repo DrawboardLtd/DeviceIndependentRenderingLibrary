@@ -169,13 +169,22 @@ public sealed class MarkdownInlineSpikeTests
     }
 
     [Fact]
-    public void Backticks_EmptyBody_ParseFailsCleanly()
+    public void GrammarError_ParseFailsCleanly()
     {
-        // `` (two adjacent backticks) is degenerate — the grammar requires
-        // a non-empty codebody. Fail-closed matches the rest of the
-        // error-recovery posture; CommonMark's escape-for-empty-code
-        // (`<code></code>`) isn't supported here.
-        _visitor.Parse("`` foo").ShouldBeEmpty();
+        // A grammar error fails closed with an empty list, and the block
+        // visitor falls back to the source text. The pairing pass turns
+        // every ordinary stray delimiter into text first, so this goes
+        // through the seam that skips it: a link URL that never closes has
+        // no rule in the grammar. (This used `` foo, then the same URL
+        // through Parse, until each became text.)
+        _visitor.ParseWithoutPairing("see [a](b foo").ShouldBeEmpty();
+    }
+
+    [Fact]
+    public void Backticks_UnclosedFence_IsText()
+    {
+        // A backtick run with no closing run is literal, as in CommonMark.
+        _visitor.Parse("`` foo").ShouldHaveSingleItem().ShouldBeOfType<MdLiteral>().Text.ShouldBe("`` foo");
     }
 
     // ── Backslash escapes ────────────────────────────────────────────
@@ -261,6 +270,23 @@ public sealed class MarkdownInlineSpikeTests
         italic.Level.ShouldBe(1);
         italic.Content[0].ShouldBeOfType<MdLiteral>().Text.ShouldBe("b");
         bold.Content[2].ShouldBeOfType<MdLiteral>().Text.ShouldBe(" c");
+    }
+
+    /// <summary>
+    /// An unpaired marker inside a paired one is text too. Pairing used to
+    /// drop it from the open stack and leave it in the emphasis's content,
+    /// where the rewrite of leftover markers (top level only) never saw it,
+    /// so a transient <see cref="MdStarMarker"/> reached the public AST:
+    /// <c>*a **b*</c> gave <c>E1[L(a ) MdStarMarker L(b)]</c> (PR #125 R2 N2).
+    /// </summary>
+    [Theory]
+    [InlineData("*a **b*", "a **b")]
+    [InlineData("**a *b**", "a *b")]
+    [InlineData("*a [b**] c*", "a [b**] c")]
+    public void AnUnpairedMarkerInsideAPairedOne_IsText(string source, string inner)
+    {
+        var em = _visitor.Parse(source).ShouldHaveSingleItem().ShouldBeOfType<MdEmphasis>();
+        em.Content.ShouldHaveSingleItem().ShouldBeOfType<MdLiteral>().Text.ShouldBe(inner);
     }
 
     [Fact]
