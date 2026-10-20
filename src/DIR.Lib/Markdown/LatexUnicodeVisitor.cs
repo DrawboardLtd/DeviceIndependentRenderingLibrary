@@ -1,9 +1,29 @@
+using System;
 using System.Collections.Generic;
+using System.Runtime.CompilerServices;
 using System.Text;
 using LALR.CC.LexicalGrammar;
+using SharpAstro.Fonts;
 using static DIR.Lib.Latex;
 
 namespace DIR.Lib.Markdown;
+
+/// <summary>
+/// A piece of a formula as <see cref="LatexUnicodeVisitor"/> renders it: the
+/// Unicode <see cref="Text"/>, and the TeX atom class of its first and last
+/// atom, which the visitor reads where it juxtaposes two pieces, so that
+/// <c>\sin x</c> reads <c>sin x</c> and <c>\sin(x)</c> stays tight.
+/// </summary>
+internal sealed record UnicodeMath(string Text)
+{
+    public MathAtomClass First { get; init; }
+    public MathAtomClass Last { get; init; }
+
+    /// <summary>The text without the spaces an operator name put in it, where
+    /// it has any; a script whose Unicode form those spaces stop takes this
+    /// instead.</summary>
+    public string? Tight { get; init; }
+}
 
 /// <summary>
 /// IVisitor&lt;string&gt; for the math-mode LaTeX grammar: walks each AST node
@@ -20,51 +40,307 @@ namespace DIR.Lib.Markdown;
 /// back to caret/underscore notation, so e.g. <c>x^{a+b}</c> reads as
 /// <c>x^(a + b)</c> rather than mangling into broken super/subscript runs.
 ///
+/// <para>Each visit returns the piece's text, and keeps the piece itself
+/// (<see cref="UnicodeMath"/>, the text with its atom class at each end) where
+/// the parent's visit finds it: <see cref="Kept"/> and <see cref="Of"/>.</para>
+///
 /// Lifted from the LALR.CC Examples.Latex renderer.
 /// </summary>
 public sealed class LatexUnicodeVisitor : IVisitor<string>
 {
-    public string Visit(Add node)      => $"{node.Arg0.Content} + {node.Arg2.Content}";
-    public string Visit(Subtract node) => $"{node.Arg0.Content} − {node.Arg2.Content}";
-    public string Visit(Eq node)       => $"{node.Arg0.Content} = {node.Arg2.Content}";
-    public string Visit(Mul node)      => $"{node.Arg0.Content}·{node.Arg2.Content}";
-    public string Visit(Div node)      => $"{node.Arg0.Content}/{node.Arg2.Content}";
-    public string Visit(Juxt node)     => $"{node.Arg0.Content}{node.Arg1.Content}";
-    public string Visit(Neg node)      => $"−{node.Arg1.Content}";
+    public string Visit(Add node)      => Kept(Joined(node.Arg0, " + ", node.Arg2, binary: true));
+    public string Visit(Subtract node) => Kept(Joined(node.Arg0, " − ", node.Arg2, binary: true));
+    public string Visit(Eq node)       => Kept(Joined(node.Arg0, " = ", node.Arg2, binary: false));
+    public string Visit(Div node)      => Kept(Joined(node.Arg0, "/", node.Arg2, binary: true));
+
+    // \times is ×, spaced as a binary operator, as KaTeX sets it: 7 × 7. It
+    // used to share * and \cdot's tight middle dot, so 7 \times 7 read 7·7.
+    // A * with nothing on a side is an asterisk, TeX's \ast (x^{*}, an
+    // optimum or an adjoint), not the dot of a product.
+    public string Visit(Mul node)
+    {
+        var raw = (string)node.Arg1.Content;
+        var op = raw == @"\times" ? " × "
+            : raw == "*" && (Of(node.Arg0).Text.Length == 0 || Of(node.Arg2).Text.Length == 0) ? "∗"
+            : "·";
+        return Kept(Joined(node.Arg0, op, node.Arg2, binary: true));
+    }
+
+    public string Visit(Neg node)
+    {
+        var inner = Of(node.Arg1);
+        return Kept(new UnicodeMath($"−{inner.Text}") { Last = inner.Last, Tight = inner.Tight is { } t ? $"−{t}" : null });
+    }
+
+    /// <summary>
+    /// Juxtaposition, with a space where TeX puts its thin space
+    /// (<see cref="MarkdownMacros.ThinSpaceBetween"/>): <c>\sin x</c> is
+    /// <c>sin x</c>, where it used to run together as <c>sinx</c>, and
+    /// <c>\sin(x)</c> stays <c>sin(x)</c>. An empty side (<c>\null</c>) takes
+    /// no space and leaves the other side's ends as they are.
+    /// </summary>
+    public string Visit(Juxt node)
+    {
+        var left = Of(node.Arg0);
+        var right = Of(node.Arg1);
+        if (left.Text.Length == 0) return Kept(right);
+        if (right.Text.Length == 0) return Kept(left);
+        // A comma takes a space after it, as TeX's thin space after punctuation
+        // (the box path's Punct carries it): max(0, x), not max(0,x).
+        var space = MarkdownMacros.ThinSpaceBetween(left.Last, right.First) || left.Last == MathAtomClass.Punct ? " " : "";
+        return Kept(new UnicodeMath($"{left.Text}{space}{right.Text}")
+        {
+            First = left.First,
+            Last = right.Last,
+            Tight = space.Length > 0 || left.Tight is not null || right.Tight is not null
+                ? $"{left.Tight ?? left.Text}{right.Tight ?? right.Text}"
+                : null,
+        });
+    }
+
+    /// <summary>
+    /// The pieces visits have rendered, each keyed by the string its visit
+    /// returned to the parser. The parser hands that same object to the
+    /// parent's visit as the child's content, so a parent finds its child's
+    /// piece by reference, whatever else is parsing: each key is a copy made
+    /// for its visit (<see cref="Kept"/>), so an equal string from another
+    /// visit, another parse or the intern pool is another key, and no scope
+    /// at any entry point is needed, which a caller's own parser would not
+    /// have. It used to be keyed by the node's source offset, which every
+    /// parse on the thread shares, so a parse run inside another replaced the
+    /// outer one's pieces with its own (R1 P1c). An entry goes with its string.
+    /// </summary>
+    private static readonly ConditionalWeakTable<string, UnicodeMath> s_pieces = new();
+
+    /// <summary>Keeps <paramref name="piece"/> under a copy of its text made
+    /// for this visit, and returns that copy for the parser. An empty text has
+    /// one instance, so it is not kept: an empty piece reads back as an
+    /// ordinary atom, and no visit reads more of one than its emptiness.</summary>
+    private static string Kept(UnicodeMath piece)
+    {
+        if (piece.Text.Length == 0) return string.Empty;
+        var key = new string(piece.Text.AsSpan());
+        s_pieces.AddOrUpdate(key, piece);
+        return key;
+    }
+
+    /// <summary>The piece behind a child item: the one its visit kept, else
+    /// the text as an ordinary atom.</summary>
+    private static UnicodeMath Of(Item item)
+    {
+        var text = (string)item.Content;
+        return s_pieces.TryGetValue(text, out var piece) ? piece : new UnicodeMath(text);
+    }
+
+    private static string TextOf(Item item) => (string)item.Content;
+
+    /// <summary>Left, <paramref name="op"/>, right: the ends are the
+    /// operands' outer ones. Against an empty side (an operand
+    /// <see cref="MarkdownMacros.SupplyMissingOperands"/> supplied) a
+    /// <paramref name="binary"/> operator loses its spaces, being ordinary
+    /// there in TeX (<c>8×</c>), and a relation its space on that side only
+    /// (<c>= x</c>, and <c>→</c> alone).</summary>
+    private static UnicodeMath Joined(Item leftItem, string op, Item rightItem, bool binary)
+    {
+        var left = Of(leftItem);
+        var right = Of(rightItem);
+        if (left.Text.Length == 0 || right.Text.Length == 0)
+        {
+            if (binary) op = op.Trim();
+            else if (left.Text.Length == 0) op = op.TrimStart();
+            if (right.Text.Length == 0) op = op.TrimEnd();
+        }
+        return new UnicodeMath($"{left.Text}{op}{right.Text}")
+        {
+            First = left.First,
+            Last = right.Last,
+            Tight = left.Tight is not null || right.Tight is not null
+                ? $"{left.Tight ?? left.Text}{op}{right.Tight ?? right.Text}"
+                : null,
+        };
+    }
+
+    /// <summary>A piece with the same class at both ends.</summary>
+    private static UnicodeMath Atom(string text, MathAtomClass atomClass)
+        => new(text) { First = atomClass, Last = atomClass };
 
     // Binary relations (\approx \leq \geq \neq \equiv \ll \gg \in \notin
     // \subset \to \leftarrow \rightarrow \pm \mp). Arg1 is the rel token's
     // raw bytes; RenderCommand looks up the bare glyph and the format
     // string places the outer spaces structurally.
-    public string Visit(Rel node) =>
-        $"{node.Arg0.Content} {RenderCommand((string)node.Arg1.Content)} {node.Arg2.Content}";
+    public string Visit(Rel node)
+    {
+        // \pm and \mp lex as relations but are binary operators in TeX: ±0.2.
+        var raw = (string)node.Arg1.Content;
+        return Kept(Joined(node.Arg0, $" {RenderCommand(raw)} ", node.Arg2, binary: raw is @"\pm" or @"\mp"));
+    }
 
-    public string Visit(Sup node) =>
-        TryUnicodeScript((string)node.Arg2.Content, Superscripts, out var sup)
-            ? $"{node.Arg0.Content}{sup}"
-            : $"{node.Arg0.Content}^{Wrap((string)node.Arg2.Content)}";
+    public string Visit(Sup node) => Kept(Scripted(node.Arg0, node.Arg2, Superscripts, '^'));
+    public string Visit(Subscript node) => Kept(Scripted(node.Arg0, node.Arg2, Subscripts, '_'));
 
-    public string Visit(Subscript node) =>
-        TryUnicodeScript((string)node.Arg2.Content, Subscripts, out var sub)
-            ? $"{node.Arg0.Content}{sub}"
-            : $"{node.Arg0.Content}_{Wrap((string)node.Arg2.Content)}";
+    /// <summary>
+    /// A base and its script: the script in its Unicode form where every
+    /// character has one, else after <paramref name="mark"/>. An operator
+    /// name's space does not stop the Unicode form, so <c>x_{\sin x}</c> is
+    /// <c>xₛᵢₙₓ</c>; where the script's letters themselves have none, the
+    /// space stays. A script leaves its base's class alone, as in TeX:
+    /// <c>\sin^2 x</c> is <c>sin² x</c>.
+    /// </summary>
+    private static UnicodeMath Scripted(Item baseItem, Item scriptItem, IReadOnlyDictionary<char, char> table, char mark)
+    {
+        var @base = Of(baseItem);
+        var script = Of(scriptItem);
+        // A script is set tight, the space after its commas included: x_{i,j} is x_i,j.
+        var text = script.Text.Replace(", ", ",", StringComparison.Ordinal);
+        var suffix = TryUnicodeScript(text, table, out var mapped)
+                     || (script.Tight is { } tight && TryUnicodeScript(tight.Replace(", ", ",", StringComparison.Ordinal), table, out mapped))
+            ? mapped
+            : $"{mark}{Wrap(text)}";
+        return @base with { Text = $"{@base.Text}{suffix}", Tight = @base.Tight is { } t ? $"{t}{suffix}" : null };
+    }
 
-    public string Visit(Number node)   => (string)node.Arg0.Content;
-    public string Visit(Variable node) => (string)node.Arg0.Content;
-    public string Visit(Command node)  => RenderCommand((string)node.Arg0.Content);
+    public string Visit(Number node)   => Kept(new UnicodeMath((string)node.Arg0.Content));
+    public string Visit(Variable node) => Kept(new UnicodeMath((string)node.Arg0.Content));
 
-    public string Visit(Paren node) => $"({node.Arg1.Content})";
-    public string Visit(Group node) => (string)node.Arg1.Content;
+    // An operator name is an Op; a spacing macro is space, which takes no
+    // further space round it; everything else is an ordinary atom.
+    public string Visit(Command node)
+    {
+        var raw = (string)node.Arg0.Content;
+        var name = raw.TrimStart('\\');
+        var atomClass = MarkdownMacros.OperatorNames.ContainsKey(name) ? MathAtomClass.Op
+            : name is "quad" or "qquad" ? MathAtomClass.Glue
+            : MathAtomClass.Ord;
+        return Kept(Atom(RenderCommand(raw), atomClass));
+    }
+
+    // \operatorname{X} is X, spaced as an operator name. X is math, as in
+    // amsmath, so its blanks are dropped and a command in it renders; a
+    // placeholder in it (\, as a blank) is spliced back after the parse.
+    public string Visit(OperatorName node) => Kept(Atom(TextOf(node.Arg1), MathAtomClass.Op));
+
+    // A math space, \, \: \; or \!, as RenderBackslashEscape renders it. The
+    // Unicode path's preparation turns each into a placeholder before the
+    // lexer, so only a parse of unprepared source gets here.
+    public string Visit(MathSpace node)
+        => Kept(Atom(((string)node.Arg0.Content)[1] == '!' ? "" : " ", MathAtomClass.Glue));
+
+    // \textrm{X} is X, blanks and all.
+    public string Visit(TextRm node)
+        => Kept(new UnicodeMath(MarkdownMacros.BracedArgument((string)node.Arg0.Content)));
+
+    // \mathbb{X}: X's Latin letters and digits double-struck, ℝ for R, from
+    // wherever Unicode put each (Letterlike Symbols for ℂ ℍ ℕ ℙ ℚ ℝ ℤ). The
+    // letters of a \name in X (a placeholder still to be spliced back) stay.
+    public string Visit(MathBb node) => Kept(new UnicodeMath(InAlphabet(TextOf(node.Arg1), MathStyle.DoubleStruck)));
+
+    // \mathbf{X}: X's Latin letters and digits in Unicode's mathematical
+    // bold, as \mathbb's are double-struck: 𝟏𝟎𝟐𝟒.
+    public string Visit(MathBf node) => Kept(new UnicodeMath(InAlphabet(TextOf(node.Arg1), MathStyle.Bold)));
+
+    private static string InAlphabet(string text, MathStyle style)
+    {
+        var sb = new StringBuilder(text.Length * 2);
+        var inName = false;
+        foreach (var c in text)
+        {
+            inName = c == '\\' || (inName && char.IsAsciiLetter(c));
+            if (!inName && char.IsAsciiLetterOrDigit(c) && MathAlphanumerics.MapCodepoint(c, style) is { } mapped)
+                sb.Append(char.ConvertFromUtf32((int)mapped));
+            else
+                sb.Append(c);
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// <c>BShat{x}</c> is x̂: the accent's combining mark after the argument's
+    /// last character, or after every character for <c>\overline</c>, whose
+    /// line runs the argument's width. It used to print the command's name.
+    /// A <c>\name</c> run in the argument is a placeholder still to be spliced
+    /// back (a <c>\text</c>, a math space, a character the lexer has no rule
+    /// for), so it takes no mark: one inside it broke its name, and
+    /// <c>\overline{\text{abc}}</c> printed the placeholder.
+    /// A letter written straight after a placeholder lexes into the
+    /// placeholder's own command, so it is part of the run and takes none.
+    /// </summary>
+    public string Visit(Accented node)
+    {
+        var mark = MarkdownMacros.Accents[((string)node.Arg0.Content).TrimStart('\\')].Mark;
+        var everyCharacter = mark == '\u0305';
+        var text = TextOf(node.Arg1);
+        var sb = new StringBuilder(text.Length * 2);
+        var inName = false;
+        var afterLastMarkable = -1;
+        foreach (var c in text)
+        {
+            inName = c == '\\' || (inName && char.IsAsciiLetter(c));
+            sb.Append(c);
+            if (inName || char.IsWhiteSpace(c) || char.IsHighSurrogate(c)) continue;
+            if (everyCharacter) sb.Append(mark);
+            else afterLastMarkable = sb.Length;
+        }
+        if (afterLastMarkable >= 0) sb.Insert(afterLastMarkable, mark);
+        return Kept(new UnicodeMath(sb.ToString()));
+    }
+
+    // \lfloor E \rfloor, \lceil E \rceil and \langle E \rangle: E between the
+    // pair's glyphs, as (E) between parens.
+    public string Visit(NamedPair node) => Kept(Delimited(
+        MarkdownMacros.NamedDelimiters[((string)node.Arg0.Content).TrimStart('\\')].ToString(),
+        node.Arg1,
+        MarkdownMacros.NamedDelimiters[((string)node.Arg2.Content).TrimStart('\\')].ToString()));
+
+    // x' is x′, x'' is x″: a prime is part of the atom it follows, as a
+    // script is, so it keeps the atom's class.
+    public string Visit(Primed node)
+    {
+        var @base = Of(node.Arg0);
+        var primes = MarkdownMacros.Primes(((string)node.Arg1.Content).Length);
+        return Kept(@base with { Text = @base.Text + primes, Tight = @base.Tight is { } t ? t + primes : null });
+    }
+
+    public string Visit(Paren node) => Kept(Delimited("(", node.Arg1, ")"));
+
+    // { E } is E, and to its neighbours one ordinary atom, as in TeX and on
+    // the box path, whatever E's own ends are: {\sin} x is sinx, and
+    // \sin{(x)} is sin (x).
+    public string Visit(Group node)
+    {
+        var inner = Of(node.Arg1);
+        return Kept(new UnicodeMath(inner.Text) { Tight = inner.Tight });
+    }
+
+    // \{E\}, a set, keeps its braces. MarkdownMacros.RenderMathUnicode lexes
+    // a balanced pair, so it gets here; an unbalanced one ("\{x") does not
+    // parse, and is rendered again with each brace a placeholder atom.
+    public string Visit(Brace node) => Kept(Delimited("{", node.Arg1, "}"));
+
+    // (), [] or \{\} as written, an escaped brace without its backslash.
+    public string Visit(EmptyPair node) => Kept(new UnicodeMath(
+        ((string)node.Arg0.Content).TrimStart('\\') + ((string)node.Arg1.Content).TrimStart('\\'))
+    {
+        First = MathAtomClass.Open,
+        Last = MathAtomClass.Close,
+    });
+
+    // \mathrm{X} is X: a terminal row has no italic to switch off, so the
+    // argument renders exactly as it would bare.
+    public string Visit(MathRm node) => Kept(Of(node.Arg1));
 
     // [E], [E) and (E]: Arg0 and Arg2 are the delimiters as written.
-    public string Visit(Bracket node) => $"{node.Arg0.Content}{node.Arg1.Content}{node.Arg2.Content}";
+    public string Visit(Bracket node)
+        => Kept(Delimited((string)node.Arg0.Content, node.Arg1, (string)node.Arg2.Content));
+
+    private static UnicodeMath Delimited(string open, Item inner, string close)
+        => new($"{open}{TextOf(inner)}{close}") { First = MathAtomClass.Open, Last = MathAtomClass.Close };
 
     // `,` as written. Before the grammar lexed it, a comma reached the parser
     // as a placeholder atom and came back verbatim, so this keeps every
     // formula with a comma rendering exactly as it did.
-    public string Visit(Punct node) => (string)node.Arg0.Content;
+    public string Visit(Punct node) => Kept(Atom((string)node.Arg0.Content, MathAtomClass.Punct));
 
-    public string Visit(Sqrt node) => $"√{Wrap((string)node.Arg1.Content)}";
+    public string Visit(Sqrt node) => Kept(new UnicodeMath($"√{Wrap(TextOf(node.Arg1))}"));
 
     /// <summary>
     /// <c>\sqrt[n]{x}</c>. Unicode has dedicated cube and fourth roots
@@ -75,29 +351,45 @@ public sealed class LatexUnicodeVisitor : IVisitor<string>
     /// </summary>
     public string Visit(NthRoot node)
     {
-        var index = (string)node.Arg2.Content;
-        var radicand = Wrap((string)node.Arg4.Content);
-        return index switch
+        var index = TextOf(node.Arg2);
+        var radicand = Wrap(TextOf(node.Arg4));
+        return Kept(new UnicodeMath(index switch
         {
             "3" => $"∛{radicand}",
             "4" => $"∜{radicand}",
             _ when TryUnicodeScript(index, Superscripts, out var sup) => $"{sup}√{radicand}",
             _ => $"√[{index}]{radicand}",
-        };
+        }));
     }
 
-    public string Visit(Frac node) => $"{Wrap((string)node.Arg1.Content)}⁄{Wrap((string)node.Arg2.Content)}";
+    public string Visit(Frac node)
+        => Kept(new UnicodeMath($"{Wrap(TextOf(node.Arg1))}⁄{Wrap(TextOf(node.Arg2))}"));
 
     private static string Wrap(string s)
     {
         if (string.IsNullOrEmpty(s)) return s;
         if (s.Length == 1) return s;
+        if (IsOneDelimitedGroup(s)) return s;   // [a, b] needs no parens round it
         foreach (var c in s)
         {
             if (c == ' ' || c == '+' || c == '−' || c == '=' || c == '/' || c == '·' || c == '⁄')
                 return $"({s})";
         }
         return s;
+    }
+
+    /// <summary>Whether <paramref name="s"/> is one bracketed group: it opens
+    /// with ( [ { ⌊ ⌈ or ⟨ and that delimiter's partner is its last character.</summary>
+    private static bool IsOneDelimitedGroup(string s)
+    {
+        if (s[0] is not ('(' or '[' or '{' or '⌊' or '⌈' or '⟨')) return false;
+        var depth = 0;
+        for (var i = 0; i < s.Length; i++)
+        {
+            if (s[i] is '(' or '[' or '{' or '⌊' or '⌈' or '⟨') depth++;
+            else if (s[i] is ')' or ']' or '}' or '⌋' or '⌉' or '⟩' && --depth == 0) return i == s.Length - 1;
+        }
+        return false;
     }
 
     private static bool TryUnicodeScript(string s, IReadOnlyDictionary<char, char> table, out string? mapped)
@@ -125,7 +417,8 @@ public sealed class LatexUnicodeVisitor : IVisitor<string>
     {
         if (raw.Length < 2 || raw[0] != '\\') return raw;
         var name = raw.Substring(1);
-        return Commands.TryGetValue(name, out var glyph) ? glyph : raw;
+        return MarkdownMacros.OperatorNames.TryGetValue(name, out var text) ? text
+            : Commands.TryGetValue(name, out var glyph) ? glyph : raw;
     }
 
     private static readonly Dictionary<string, string> Commands = new(System.StringComparer.Ordinal)
@@ -141,14 +434,8 @@ public sealed class LatexUnicodeVisitor : IVisitor<string>
         ["Gamma"] = "Γ", ["Delta"] = "Δ", ["Theta"] = "Θ", ["Lambda"] = "Λ",
         ["Xi"] = "Ξ", ["Pi"] = "Π", ["Sigma"] = "Σ", ["Phi"] = "Φ",
         ["Psi"] = "Ψ", ["Omega"] = "Ω",
-        // Function names — kept as letters, render upright in fixed-width fonts.
-        ["sin"] = "sin", ["cos"] = "cos", ["tan"] = "tan",
-        ["sec"] = "sec", ["csc"] = "csc", ["cot"] = "cot",
-        ["arcsin"] = "arcsin", ["arccos"] = "arccos", ["arctan"] = "arctan",
-        ["sinh"] = "sinh", ["cosh"] = "cosh", ["tanh"] = "tanh",
-        ["log"] = "log", ["ln"] = "ln", ["exp"] = "exp",
-        ["lim"] = "lim", ["max"] = "max", ["min"] = "min",
-        ["det"] = "det", ["dim"] = "dim", ["gcd"] = "gcd",
+        // Function names (\sin, \log, \lim, ...) are in
+        // MarkdownMacros.OperatorNames, which both visitors share.
         // Big operators
         ["sum"] = "∑", ["prod"] = "∏", ["int"] = "∫", ["oint"] = "∮",
         ["bigcup"] = "⋃", ["bigcap"] = "⋂",
@@ -172,6 +459,8 @@ public sealed class LatexUnicodeVisitor : IVisitor<string>
         ["leq"] = "≤", ["geq"] = "≥", ["neq"] = "≠",
         ["approx"] = "≈", ["equiv"] = "≡",
         ["in"] = "∈", ["notin"] = "∉", ["subset"] = "⊂",
+        // Set-builder's bar: U+2223 DIVIDES, the relation, not a plain |.
+        ["mid"] = "∣",
         // Arithmetic operators that the model often emits as commands inside
         // math (\cdot and \times are also lexer-aliased to '*' but the model
         // may end up here too).
@@ -191,6 +480,9 @@ public sealed class LatexUnicodeVisitor : IVisitor<string>
         // (juxt) `U` = `²³⁸U` — the same single-row layout Phase-1
         // produced.
         ["null"] = "",
+        // The empty operand MarkdownMacros.SupplyMissingOperands adds where an
+        // operator has none on a side, drawn as nothing, like null.
+        ["nulloperand"] = "",
         // Spacing macros — render as plain spaces so juxtaposed atoms don't
         // run together when the model used them as visual separators.
         ["quad"] = "  ", ["qquad"] = "    ",

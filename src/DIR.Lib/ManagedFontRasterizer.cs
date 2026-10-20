@@ -46,6 +46,105 @@ public sealed class ManagedFontRasterizer : IDisposable
     // and may be registered after a glyph was already resolved.
     private readonly ConcurrentDictionary<(string Font, int Codepoint, int CharCode, GlyphMapHint Hint), GlyphIdentity> _identityMemo = new();
 
+    /// <summary>
+    /// Glyphs rasterized by <see cref="RasterizeGlyph"/> and <see cref="RasterizeGlyphTopSnapped"/>, kept
+    /// across calls; null unless this rasterizer was made with <c>cacheRasters</c>, as only
+    /// <see cref="MathLayout.BoxStyle.SharedRasterizer"/> is. Keyed by everything the bitmap depends on: the
+    /// font, the exact size asked for (not rounded: a caller that rounds asks for the rounded size), the
+    /// code point, and whether the glyph was moved by the sub-pixel shift that puts its top on a pixel row
+    /// (<see cref="TopSnap"/>), which with the rest of the key fixes that shift. At most
+    /// <see cref="GlyphRastersKept"/> entries and <see cref="GlyphRasterBytesKept"/> bytes, evicted by
+    /// generation (<see cref="BoundedCache{TKey, TValue}"/>).
+    /// </summary>
+    private readonly BoundedCache<GlyphRasterKey, GlyphRaster>? _glyphRasters;
+
+    /// <summary>
+    /// Stretched glyphs (radicals, <c>\left..\right</c> delimiters, big operators) from
+    /// <see cref="RasterizeStretchyVerticalCore"/>, kept across calls on the same terms as
+    /// <see cref="_glyphRasters"/>: at most <see cref="StretchyRastersKept"/> entries and
+    /// <see cref="StretchyRasterBytesKept"/> bytes. The key carries every argument the choice and the
+    /// composition read (<see cref="StretchyRasterKey"/>).
+    /// </summary>
+    private readonly BoundedCache<StretchyRasterKey, StretchyRaster>? _stretchyRasters;
+
+    /// <summary>The most glyph rasters a caching rasterizer keeps (see <see cref="_glyphRasters"/>).</summary>
+    internal const int GlyphRastersKept = 4096;
+
+    /// <summary>The most bytes of glyph rasters a caching rasterizer keeps: 8 MiB.</summary>
+    internal const long GlyphRasterBytesKept = 8L << 20;
+
+    /// <summary>The most stretched-glyph rasters a caching rasterizer keeps (see <see cref="_stretchyRasters"/>).</summary>
+    internal const int StretchyRastersKept = 512;
+
+    /// <summary>The most bytes of stretched-glyph rasters a caching rasterizer keeps: 8 MiB.</summary>
+    internal const long StretchyRasterBytesKept = 8L << 20;
+
+    // The keys and values are classes, not structs, on purpose: over reference types the cache runs
+    // generic code the runtime shares between them (the font table's ConcurrentDictionary has compiled
+    // most of it already), where a struct key or value has the dictionary compiled anew for it. On the
+    // first formula's tree build, struct keys cost a cold start about 7 ms and classes about 4; the key
+    // allocated per lookup is small beside the rasters a render allocates.
+
+    /// <summary>A glyph raster's key (see <see cref="_glyphRasters"/>).</summary>
+    private sealed record GlyphRasterKey(string FontPath, float FontSize, int Codepoint, bool SnapTop);
+
+    /// <summary>A kept glyph raster, and what its top snap learned (<see cref="TopSnap.None"/> where none
+    /// was asked for).</summary>
+    private sealed record GlyphRaster(GlyphBitmap Bitmap, TopSnap Snap);
+
+    /// <summary>
+    /// A stretched glyph's key: the font, the size, the code point, the height requested, the least height
+    /// that counts as covering it (the request, or less for a delimiter), the exact height asked for where
+    /// one was (a pair's other side), and whether the glyph is moved by the radical's sub-pixel shift that
+    /// puts its top on a pixel row. That shift is a function of the glyph chosen and composed, which the
+    /// rest of the key fixes, so the flag is what the key needs; without it the radical
+    /// <see cref="MathLayout.SqrtBox"/> measures unsnapped and then draws snapped would be one entry.
+    /// </summary>
+    private sealed record StretchyRasterKey(string FontPath, float FontSize, int Codepoint, float RequestPx,
+        float CoversFromPx, float? ExactPx, bool SnapTop);
+
+    /// <summary>What <see cref="RasterizeStretchyVerticalCore"/> returns, kept whole.</summary>
+    private sealed record StretchyRaster(GlyphBitmap Bitmap, uint VariantGlyphId, TopSnap Snap, AssemblyPart[]? Parts);
+
+    public ManagedFontRasterizer() { }
+
+    /// <summary>
+    /// A rasterizer that, with <paramref name="cacheRasters"/>, keeps the glyphs and stretched glyphs it
+    /// rasterizes across calls (see <see cref="_glyphRasters"/> and <see cref="_stretchyRasters"/>). The
+    /// bitmaps it hands out are then shared between callers, which must not write to them.
+    /// </summary>
+    internal ManagedFontRasterizer(bool cacheRasters)
+    {
+        if (!cacheRasters) return;
+        _glyphRasters = new(GlyphRastersKept, GlyphRasterBytesKept, entry => entry.Bitmap.Rgba?.Length ?? 0);
+        _stretchyRasters = new(StretchyRastersKept, StretchyRasterBytesKept,
+            entry => (entry.Bitmap.Rgba?.Length ?? 0) + (entry.Parts?.Length ?? 0) * 16L);
+    }
+
+    /// <summary>A test's switch: while it is true on the current flow, the raster caches are neither read
+    /// nor written, so a test can compare a render with them against one without them, byte for byte. An
+    /// <see cref="AsyncLocal{T}"/>, so a test that sets it changes nothing for tests running beside it.</summary>
+    internal static readonly AsyncLocal<bool> BypassRasterCaches = new();
+
+    /// <summary>Empty the raster caches.</summary>
+    internal void ClearRasterCaches()
+    {
+        _glyphRasters?.Clear();
+        _stretchyRasters?.Clear();
+    }
+
+    /// <summary>Entries the glyph and stretched-glyph caches hold (both zero for a rasterizer without them).</summary>
+    internal (int Glyphs, long GlyphBytes, int Stretchy, long StretchyBytes) RasterCacheSize =>
+        (_glyphRasters?.Count ?? 0, _glyphRasters?.Bytes ?? 0, _stretchyRasters?.Count ?? 0, _stretchyRasters?.Bytes ?? 0);
+
+    /// <summary><see cref="_glyphRasters"/>, or null where there is none or the test switch bypasses it.</summary>
+    private BoundedCache<GlyphRasterKey, GlyphRaster>? GlyphRasters =>
+        _glyphRasters is { } cache && !BypassRasterCaches.Value ? cache : null;
+
+    /// <summary><see cref="_stretchyRasters"/>, or null where there is none or the test switch bypasses it.</summary>
+    private BoundedCache<StretchyRasterKey, StretchyRaster>? StretchyRasters =>
+        _stretchyRasters is { } cache && !BypassRasterCaches.Value ? cache : null;
+
     // Char-code → gid for a loaded OpenType face, the PDF's named glyph first: a registered
     // /Encoding designates glyphs BY NAME (code → name → glyph), that designation is
     // authoritative over any cmap strategy, and for a bare name-keyed CFF with no cmap it is
@@ -89,10 +188,20 @@ public sealed class ManagedFontRasterizer : IDisposable
         // is enough for the resolver's "render 'A'" probe and any Unicode-keyed draw of basic Latin.
         if (_type1Fonts.TryGetValue(fontPath, out var t1))
             return RenderType1(t1, ResolveType1Name(fontPath, t1, (uint)codepoint.Value), fontSize);
+        if (GlyphRasters is not { } cache) return RenderCodepoint(fontPath, fontSize, codepoint);
+        var key = new GlyphRasterKey(fontPath, fontSize, codepoint.Value, SnapTop: false);
+        if (cache.TryGet(key, out var kept)) return kept.Bitmap;
+        var bitmap = RenderCodepoint(fontPath, fontSize, codepoint);
+        cache.Add(key, new GlyphRaster(bitmap, TopSnap.None));
+        return bitmap;
+    }
+
+    /// <summary><see cref="RasterizeGlyph"/> of an OpenType face, without the cache.</summary>
+    private GlyphBitmap RenderCodepoint(string fontPath, float fontSize, Rune codepoint)
+    {
         var font = GetOrLoad(fontPath);
         var gid = font.GetGlyphId((uint)codepoint.Value);
-        if (gid == 0) return default;
-        return Render(font, gid, fontSize);
+        return gid == 0 ? default : Render(font, gid, fontSize);
     }
 
     /// <summary>
@@ -106,6 +215,41 @@ public sealed class ManagedFontRasterizer : IDisposable
         if (gid == 0) return default;
         var font = GetOrLoad(fontPath);
         return Render(font, gid, fontSize);
+    }
+
+    /// <summary>
+    /// <see cref="RasterizeGlyph"/> with the glyph moved vertically, by at most half a pixel, so the top of
+    /// its outline lands exactly on a pixel row and the bitmap's first row is fully covered rather than
+    /// antialiased. Opt-in, and used only by <see cref="MathLayout.SqrtBox"/>: the radical's flag is the
+    /// topmost part of the glyph, and the vinculum continuing it can only share a crisp top edge with it if
+    /// that edge is on a row (see <see cref="RenderTopSnapped"/>).
+    /// </summary>
+    /// <param name="snap">Where the outline's top begins in the bitmap (row 0 after a snap) and how many
+    /// rows the stroke at its top-right touches; <see cref="TopSnap.None"/> when nothing was snapped: a
+    /// colour glyph, or an embedded Type 1 face.</param>
+    internal GlyphBitmap RasterizeGlyphTopSnapped(string fontPath, float fontSize, Rune codepoint, out TopSnap snap)
+    {
+        snap = TopSnap.None;
+        if (_type1Fonts.ContainsKey(fontPath)) return RasterizeGlyph(fontPath, fontSize, codepoint);
+        if (GlyphRasters is not { } cache) return RenderCodepointTopSnapped(fontPath, fontSize, codepoint, out snap);
+        var key = new GlyphRasterKey(fontPath, fontSize, codepoint.Value, SnapTop: true);
+        if (cache.TryGet(key, out var kept))
+        {
+            snap = kept.Snap;
+            return kept.Bitmap;
+        }
+        var bitmap = RenderCodepointTopSnapped(fontPath, fontSize, codepoint, out snap);
+        cache.Add(key, new GlyphRaster(bitmap, snap));
+        return bitmap;
+    }
+
+    /// <summary><see cref="RasterizeGlyphTopSnapped"/> of an OpenType face, without the cache.</summary>
+    private GlyphBitmap RenderCodepointTopSnapped(string fontPath, float fontSize, Rune codepoint, out TopSnap snap)
+    {
+        snap = TopSnap.None;
+        var font = GetOrLoad(fontPath);
+        var gid = font.GetGlyphId((uint)codepoint.Value);
+        return gid == 0 ? default : RenderTopSnapped(font, gid, fontSize, out snap);
     }
 
     /// <summary>
@@ -296,17 +440,28 @@ public sealed class ManagedFontRasterizer : IDisposable
 
     /// <summary>
     /// Rasterize a stretchy delimiter (paren, bracket, brace, radical, etc.)
-    /// at a height that covers <paramref name="requiredHeightPx"/> using the
-    /// font's OpenType MATH vertical-construction recipe. Algorithm:
+    /// at about <paramref name="requiredHeightPx"/> using the font's OpenType
+    /// MATH vertical-construction recipe. The candidates are, in order, the
+    /// unstretched base glyph, the construction's pre-drawn size variants, and
+    /// its assembly with each count of extender copies.
     /// <list type="number">
-    /// <item>If the unstretched base glyph is already tall enough, use it.</item>
-    /// <item>Else walk the construction's pre-drawn variants and pick the
-    /// smallest whose advance covers the request.</item>
-    /// <item>Else compose the assembly: each non-extender part appears once,
-    /// extender parts repeat as many times as needed to reach the request.</item>
+    /// <item>If the base glyph is already tall enough, use it as it is.</item>
+    /// <item>Else the smallest variant whose advance covers the request, as it
+    /// is.</item>
+    /// <item>Else compose the assembly with the fewest extender copies (none
+    /// counts) that can reach the request, spread to land on it; where its
+    /// shortest is taller, at that. It is used as it is unless it overshoots
+    /// <see cref="StretchyBound"/>, the larger of 1.25 times the request and
+    /// the request plus half an em.</item>
+    /// <item>Else, where it overshoots (or reaches its copy cap short of the
+    /// request), the candidate that needs the least scaling to fit is scaled
+    /// vertically to the nearest whole row from the request to that bound
+    /// (see <see cref="ChooseAndComposeStretchyVertical"/>).</item>
+    /// <item>A construction with no assembly gives its largest variant, as it
+    /// is, where none covers.</item>
     /// </list>
     /// Returns a default <see cref="GlyphBitmap"/> (Rgba == null, Width == 0)
-    /// when the result wouldn't be useful — codepoint not in the font, or the
+    /// when the result wouldn't be useful: codepoint not in the font, or the
     /// font has no MATH data and the unstretched base glyph isn't tall
     /// enough to cover the request. Callers must handle this by falling back
     /// to a non-MATH path (e.g. parametric drawing in SqrtBox / BracketBox).
@@ -321,216 +476,549 @@ public sealed class ManagedFontRasterizer : IDisposable
     /// Same as <see cref="RasterizeStretchyVertical(string, float, Rune, float)"/>
     /// but also returns the glyph id of the variant that was rendered.
     /// <list type="bullet">
-    /// <item>Variant path or "base already tall enough" path → the
+    /// <item>Variant path or "base already tall enough" path: the
     /// chosen single glyph's id (caller can look up its
-    /// <c>MathItalicsCorrection</c>, corner kerns, etc.).</item>
-    /// <item>Assembly path → the BASE glyph's id (assembly-composed
+    /// <c>MathItalicsCorrection</c>, corner kerns, etc.), also where it was
+    /// scaled to fit.</item>
+    /// <item>Assembly path: the BASE glyph's id (assembly-composed
     /// glyphs don't have a single glyph id, so the base is the only
     /// reasonable fallback for metric lookup).</item>
-    /// <item>No coverage → 0 (caller should use base codepoint).</item>
+    /// <item>No coverage: 0 (caller should use base codepoint).</item>
     /// </list>
     /// </summary>
     public GlyphBitmap RasterizeStretchyVertical(string fontPath, float fontSize,
         Rune codepoint, float requiredHeightPx, out uint variantGlyphId)
+        => RasterizeStretchyVertical(fontPath, fontSize, codepoint, requiredHeightPx,
+            snapTop: false, out variantGlyphId, out _);
+
+    /// <summary>
+    /// <see cref="RasterizeStretchyVertical(string, float, Rune, float, out uint)"/> with an opt-in
+    /// <paramref name="snapTop"/>: the chosen glyph is moved vertically by at most half a pixel so the top
+    /// of its outline lands on a pixel row, as <see cref="RasterizeGlyphTopSnapped"/> does. An assembly is
+    /// moved whole, every part by the one shift, so its joins stay where they were (see
+    /// <see cref="ComposeVerticalAssembly"/>). Which glyph is chosen does not depend on
+    /// <paramref name="snapTop"/>; with it false the result is the public method's, byte for byte, which is
+    /// what every caller but the radical gets.
+    /// </summary>
+    /// <param name="snap">Where the outline's top begins in the bitmap and how many rows the stroke at
+    /// its top-right touches; <see cref="TopSnap.None"/> when nothing was snapped
+    /// (<paramref name="snapTop"/> false, or a colour glyph).</param>
+    internal GlyphBitmap RasterizeStretchyVertical(string fontPath, float fontSize,
+        Rune codepoint, float requiredHeightPx, bool snapTop, out uint variantGlyphId, out TopSnap snap)
+        => RasterizeStretchyVerticalCore(fontPath, fontSize, codepoint, requiredHeightPx, requiredHeightPx, snapTop,
+            out variantGlyphId, out snap, out _);
+
+    /// <summary>
+    /// <see cref="RasterizeStretchyVertical(string, float, Rune, float)"/>, also saying where each part of an
+    /// assembly landed in the composed bitmap; <paramref name="parts"/> is null when no assembly was built
+    /// (the base glyph or a size variant was drawn, as it is or scaled to fit).
+    /// </summary>
+    internal GlyphBitmap RasterizeStretchyVerticalWithParts(string fontPath, float fontSize,
+        Rune codepoint, float requiredHeightPx, out AssemblyPart[]? parts)
+        => RasterizeStretchyVerticalCore(fontPath, fontSize, codepoint, requiredHeightPx, requiredHeightPx, snapTop: false,
+            out _, out _, out parts);
+
+    /// <summary>
+    /// The least height a <c>\left..\right</c> delimiter may be for a request of <paramref name="requestPx"/>:
+    /// max(0.901 x request, request - 0.5 em), TeX's <c>\delimiterfactor</c> 901 and <c>\delimitershortfall</c>
+    /// 5 pt at a 10 pt design size.
+    /// </summary>
+    internal static float DelimiterCovers(float requestPx, float fontSize) =>
+        MathF.Max(0.901f * requestPx, requestPx - 0.5f * fontSize);
+
+    /// <summary>
+    /// The most a stretchy glyph is drawn for a request of <paramref name="requestPx"/>: the larger of 1.25
+    /// times the request and the request plus half an em. An assembly taller than this is not drawn as it
+    /// is (see <see cref="ChooseAndComposeStretchyVertical"/>).
+    /// </summary>
+    internal static float StretchyBound(float requestPx, float fontSize) =>
+        MathF.Max(1.25f * requestPx, requestPx + 0.5f * fontSize);
+
+    /// <summary>
+    /// <see cref="RasterizeStretchyVertical(string, float, Rune, float, out uint)"/> for a <c>\left..\right</c>
+    /// delimiter, which may fall short of its request by TeX's rule (<see cref="DelimiterCovers"/>): the
+    /// unstretched glyph or a size variant covers it from that height, and so does the assembly with a copy
+    /// fewer where the one built to the request overshoots the bound. An assembly that fits is still built
+    /// to the whole request, since it can reach it.
+    /// </summary>
+    internal GlyphBitmap RasterizeStretchyDelimiter(string fontPath, float fontSize,
+        Rune codepoint, float requiredHeightPx, out uint variantGlyphId, out AssemblyPart[]? parts)
+        => RasterizeStretchyVerticalCore(fontPath, fontSize, codepoint, requiredHeightPx,
+            DelimiterCovers(requiredHeightPx, fontSize), snapTop: false, out variantGlyphId, out _, out parts);
+
+    /// <summary>One part of a composed assembly as drawn: its glyph, and the rows of the composed bitmap its
+    /// ink box spans, Y down, as fractions of a pixel.</summary>
+    internal readonly record struct AssemblyPart(uint GlyphId, bool IsExtender, float Top, float Bottom);
+
+    /// <summary>A candidate for a stretchy glyph: one glyph (<see cref="Sequence"/> null), the base or a size
+    /// variant, or an assembly's parts bottom-up with each join's overlap in font units; and the height in
+    /// pixels it is drawn at unscaled: a glyph's rows (the base) or advance (a variant), an assembly's ink.</summary>
+    private sealed record StretchyCandidate(uint GlyphId, Tables.OpenTypeMath.MathGlyphPart[]? Sequence, float[]? Overlaps,
+        float HeightPx);
+
+    /// <summary>
+    /// <see cref="ChooseAndComposeStretchyVertical"/>, kept across calls where this rasterizer keeps its
+    /// rasters (see <see cref="_stretchyRasters"/>): every argument but the out parameters is the key.
+    /// </summary>
+    private GlyphBitmap RasterizeStretchyVerticalCore(string fontPath, float fontSize,
+        Rune codepoint, float requiredHeightPx, float coversFromPx, bool snapTop, out uint variantGlyphId,
+        out TopSnap snap, out AssemblyPart[]? parts, float? exactPx = null)
+    {
+        var cache = StretchyRasters;
+        if (cache is null)
+            return ChooseAndComposeStretchyVertical(fontPath, fontSize, codepoint, requiredHeightPx, coversFromPx, snapTop,
+                out variantGlyphId, out snap, out parts, exactPx);
+
+        var key = new StretchyRasterKey(fontPath, fontSize, codepoint.Value, requiredHeightPx, coversFromPx, exactPx, snapTop);
+        if (!cache.TryGet(key, out var kept))
+        {
+            var bitmap = ChooseAndComposeStretchyVertical(fontPath, fontSize, codepoint, requiredHeightPx, coversFromPx,
+                snapTop, out var glyphId, out var topSnap, out var placed, exactPx);
+            kept = new StretchyRaster(bitmap, glyphId, topSnap, placed);
+            cache.Add(key, kept);
+        }
+        (variantGlyphId, snap, parts) = (kept.VariantGlyphId, kept.Snap, kept.Parts);
+        return kept.Bitmap;
+    }
+
+    /// <summary>
+    /// The choice (see <see cref="RasterizeStretchyVertical(string, float, Rune, float)"/>). Where nothing
+    /// fits as it is (the assembly built to the request overshoots <see cref="StretchyBound"/>, or stops at
+    /// its copy cap short of the request), every candidate is a height it would be scaled from to fit: to
+    /// the nearest whole row from <paramref name="coversFromPx"/> to the bound. The candidates are the base
+    /// glyph, each size variant, the assembly built to the request and the one with a copy fewer (every
+    /// other copy count is further from fitting than one of those two). The one scaled by the factor
+    /// nearest 1 is drawn, a glyph twice as tall as it may be counting as far off as one half as tall as it
+    /// must be; one that already fits, such as a delimiter's assembly a copy short but within its
+    /// shortfall, is drawn as it is.
+    /// <para>This replaces squashing the assembly to the request, which DejaVu Sans reached for every
+    /// delimiter taller than its base glyph: its parts are 1.2 em tall and its joins have no room, so its
+    /// two-part parenthesis is 2.4 em at the least. Squashed to the request it thinned the horizontal strokes
+    /// of ordinary text (<c>(b)</c> at 96 px drew a 227 px assembly at 98 px, where the base parenthesis is
+    /// 86 rows), and it jumped where the assembly started to fit (a 32 px parenthesis drew 61 rows for a 60.7
+    /// px request and 77 for 60.9 px). Scaled to the nearest height that fits, the least it must be, the
+    /// glyph meets its own height where it starts to fit. Only a construction with an assembly gets here,
+    /// where the squash was. A base glyph or a variant that covers is drawn as designed even past the
+    /// bound (STIX Two Math's radical variants step by up to two thirds of an em, and
+    /// <see cref="MathLayout.SqrtBox"/> scales its own base glyph for those), and so is the largest variant
+    /// of a construction with no assembly, short of the request.</para>
+    /// </summary>
+    /// <param name="coversFromPx">The least height at which a glyph counts as covering the request: the
+    /// request itself, or less for a delimiter (<see cref="DelimiterCovers"/>).</param>
+    /// <param name="exactPx">Draw the glyph exactly this many rows tall instead: the candidate scaled by the
+    /// factor nearest 1 to that height, the assemblies built toward it, and nothing drawn as it is. A
+    /// pair's other delimiter is drawn this way (<see cref="RasterizeStretchyDelimiterPair"/>).</param>
+    private GlyphBitmap ChooseAndComposeStretchyVertical(string fontPath, float fontSize,
+        Rune codepoint, float requiredHeightPx, float coversFromPx, bool snapTop, out uint variantGlyphId,
+        out TopSnap snap, out AssemblyPart[]? parts, float? exactPx)
     {
         variantGlyphId = 0;
+        snap = TopSnap.None;
+        parts = null;
         var font = GetOrLoad(fontPath);
         var baseGid = font.GetGlyphId((uint)codepoint.Value);
         if (baseGid == 0) return default;
+        var exact = exactPx is not null;
 
-        // 0) Base glyph already covers the request — no stretching needed.
+        // 0) The base glyph already covers the request: no stretching needed.
         //    This branch fires for short content even on math-less fonts and
         //    is the cheap path: just render the unstretched glyph and return.
+        //    The decision is taken on the unsnapped bitmap, so snapping never
+        //    changes which glyph a request gets.
         var baseGlyph = Render(font, baseGid, fontSize);
-        if (baseGlyph.Height >= requiredHeightPx)
+        if (!exact && baseGlyph.Height >= coversFromPx)
         {
             variantGlyphId = baseGid;
-            return baseGlyph;
+            return snapTop ? RenderTopSnapped(font, baseGid, fontSize, out snap) : baseGlyph;
         }
 
-        // The base glyph isn't tall enough. From here we need MATH data — if
+        // The base glyph isn't tall enough. From here we need MATH data. If
         // the font has none (or doesn't cover this codepoint vertically),
         // return empty so the caller can pick a non-MATH fallback (e.g.
         // parametric drawing in SqrtBox / BracketBox). Returning the too-
         // short base glyph would silently produce visually wrong output for
-        // tall content like matrices and big radicands.
+        // tall content like matrices and big radicands. Drawn to an exact
+        // height, the base glyph alone is a candidate.
         var math = font.Math;
-        if (math is null) return default;
+        var construction = math?.GetVerticalConstruction((ushort)baseGid);
+        if (!exact && construction is null) return default;
 
-        var construction = math.GetVerticalConstruction((ushort)baseGid);
-        if (construction is null) return default;
-
-        // 1) Variants — pick smallest whose AdvanceMeasurement (FUnits) covers the request.
+        // 1) Variants: the smallest whose AdvanceMeasurement (FUnits) covers the request.
         var unitsPerEm = font.UnitsPerEm;
-        var requiredFUnits = (int)Math.Ceiling(requiredHeightPx * unitsPerEm / fontSize);
-        foreach (var v in construction.Variants)
+        var pxPerUnit = fontSize / unitsPerEm;
+        var variants = construction?.Variants ?? [];
+        var requiredFUnits = (int)Math.Ceiling(coversFromPx * unitsPerEm / fontSize);
+        foreach (var v in variants)
         {
-            if (v.AdvanceMeasurement >= requiredFUnits)
+            if (!exact && v.AdvanceMeasurement >= requiredFUnits)
             {
                 variantGlyphId = v.GlyphId;
-                return Render(font, v.GlyphId, fontSize);
+                return RenderMaybeTopSnapped(font, v.GlyphId, fontSize, snapTop, out snap);
             }
         }
 
-        // 2) Assembly path — composed from multiple parts; no single glyph
-        //    id. Report the base glyph id so callers can still look up
-        //    metrics (italic correction, etc.) against something sensible.
-        if (construction.Assembly is { } asm)
+        // 2) No assembly: the largest variant, still short of the request but closer than the base, as it
+        //    is. A font that draws a largest size and no assembly (STIX Two Math's summation) means it as the
+        //    biggest the glyph gets, and stretching a designed glyph past it would distort it.
+        var asm = construction?.Assembly is { Parts.Count: > 0 } a ? a : null;
+        if (!exact && asm is null)
         {
-            variantGlyphId = baseGid;
-            return ComposeVerticalAssembly(font, asm, math.MinConnectorOverlap, unitsPerEm, fontSize, requiredFUnits);
+            if (variants.Count == 0) return default;
+            variantGlyphId = variants[^1].GlyphId;
+            return RenderMaybeTopSnapped(font, variantGlyphId, fontSize, snapTop, out snap);
         }
 
-        // 3) Largest variant if any (still possibly short of the request, but
-        //    closer than the base). If the construction has neither variants
-        //    nor assembly we already returned default above.
-        if (construction.Variants.Count > 0)
+        // 3) The assembly, built to the whole request: drawn as it is where it fits. It has no single glyph
+        //    id, so the base glyph's is reported, for callers to look up metrics (italic correction, etc.).
+        var bound = StretchyBound(requiredHeightPx, fontSize);
+        var candidates = new List<StretchyCandidate> { new(baseGid, null, null, baseGlyph.Height) };
+        foreach (var v in variants)
+            candidates.Add(new(v.GlyphId, null, null, v.AdvanceMeasurement * pxPerUnit));
+        if (asm is not null)
         {
-            variantGlyphId = construction.Variants[^1].GlyphId;
-            return Render(font, construction.Variants[^1].GlyphId, fontSize);
+            var minOverlap = math!.MinConnectorOverlap;
+            var requiredUnits = (exactPx ?? requiredHeightPx) * unitsPerEm / fontSize;
+            var copies = AssemblyCopies(asm, minOverlap, requiredUnits);
+            var built = AssemblyCandidate(font, asm, copies, minOverlap, requiredUnits, pxPerUnit);
+            if (!exact && MostUnits(built.Sequence!, minOverlap) >= requiredUnits && built.HeightPx <= bound)
+            {
+                variantGlyphId = baseGid;
+                return ComposeVerticalAssembly(font, built.Sequence!, built.Overlaps!, unitsPerEm, fontSize, null,
+                    snapTop, out snap, out parts);
+            }
+            candidates.Add(built);
+            if (copies > 0) candidates.Add(AssemblyCandidate(font, asm, copies - 1, minOverlap, requiredUnits, pxPerUnit));
         }
-        return default;
+
+        // 4) Nothing fits as it is: the candidate scaled by the factor nearest 1, the first on a tie.
+        var low = exactPx ?? MathF.Ceiling(coversFromPx);
+        var high = exactPx ?? MathF.Max(low, MathF.Floor(bound));
+        StretchyCandidate? best = null;
+        var bestCost = float.PositiveInfinity;
+        foreach (var c in candidates)
+        {
+            if (!(c.HeightPx > 0f)) continue;
+            var cost = MathF.Abs(MathF.Log(Math.Clamp(c.HeightPx, low, high) / c.HeightPx));
+            if (cost < bestCost) (best, bestCost) = (c, cost);
+        }
+        if (best is null) return default;
+
+        var fits = !exact && best.HeightPx >= coversFromPx && best.HeightPx <= bound;
+        float? target = fits ? null : Math.Clamp(best.HeightPx, low, high);
+        if (best.Sequence is { } sequence)
+        {
+            variantGlyphId = baseGid;
+            return ComposeVerticalAssembly(font, sequence, best.Overlaps!, unitsPerEm, fontSize, target,
+                snapTop, out snap, out parts);
+        }
+
+        variantGlyphId = best.GlyphId;
+        if (target is null) return RenderMaybeTopSnapped(font, best.GlyphId, fontSize, snapTop, out snap);
+        // One glyph scaled: drawn as an assembly of that one part, its ink its whole height.
+        var ink = InkBounds(font, (ushort)best.GlyphId, fallbackHeight: 0);
+        if (!(ink.YMax > ink.YMin)) return RenderMaybeTopSnapped(font, best.GlyphId, fontSize, snapTop, out snap);
+        var part = new Tables.OpenTypeMath.MathGlyphPart((ushort)best.GlyphId, 0, 0,
+            (ushort)Math.Clamp(MathF.Round(ink.YMax - ink.YMin), 1, ushort.MaxValue), false);
+        return ComposeVerticalAssembly(font, [part], [], unitsPerEm, fontSize, target, snapTop, out snap, out _);
     }
 
     /// <summary>
-    /// Compose a stretchy vertical glyph from an OT MATH assembly recipe.
-    /// Stacks the parts (extenders repeated as needed) into a single RGBA
-    /// bitmap, using the maximum permissible overlap between adjacent pieces
-    /// — clamped to the table's <c>MinConnectorOverlap</c>. Parts are listed
-    /// bottom-up by spec; we draw from the bottom of the canvas upward.
-    ///
-    /// <para>This is a pragmatic "stack the rasterized bitmaps with FUnit-derived
-    /// overlap" implementation. Visible seams between extender repeats may
-    /// occur because the part bitmaps are positioned by their visible-ink
-    /// extents rather than by FullAdvance + bearings — the parts were designed
-    /// to mate seamlessly, but the math depends on subpixel-precise placement.
-    /// Adequate for renderer-grade output at typical math sizes.</para>
+    /// A <c>\left..\right</c> pair's two delimiters, at one height. Each is chosen as
+    /// <see cref="RasterizeStretchyDelimiter"/> chooses it; where the two come out a different number of rows
+    /// tall (DejaVu Sans's <c>[</c> and <c>]</c> have parts of different advances, so one request can take
+    /// a different copy count on each side), the one nearer the request is kept, the taller on a tie, and
+    /// the other is drawn exactly that tall: its candidate scaled by the factor nearest 1 to that height,
+    /// an assembly built toward it first. The rows counted are the inked ones: a bitmap can open a row its
+    /// outline reaches by less than one level of alpha (DejaVu Sans's <c>]</c> at 12 px), and where the two
+    /// differ such a row is dropped from both, so each is centred by its ink; a pair whose bitmaps frame
+    /// the same rows of ink alike is returned as each side was drawn. Either is a default bitmap where the font cannot draw it, as
+    /// <see cref="RasterizeStretchyDelimiter"/>'s would be.
     /// </summary>
-    private static GlyphBitmap ComposeVerticalAssembly(
-        OpenTypeFont font, Tables.OpenTypeMath.MathGlyphAssembly asm,
-        ushort minOverlap, ushort unitsPerEm, float fontSize, int requiredFUnits)
+    internal (GlyphBitmap Open, GlyphBitmap Close) RasterizeStretchyDelimiterPair(string fontPath, float fontSize,
+        Rune open, Rune close, float requiredHeightPx, out uint openGlyphId, out uint closeGlyphId)
     {
-        if (asm.Parts.Count == 0) return default;
-
-        // Compute the total FUnit-space advance with one copy of each part
-        // and max overlap between adjacent pairs.
-        var advanceWithOnce = 0;
-        for (var i = 0; i < asm.Parts.Count; i++) advanceWithOnce += asm.Parts[i].FullAdvance;
-
-        var startOverlap = 0;
-        for (var i = 0; i < asm.Parts.Count - 1; i++)
-            startOverlap += ClampedOverlap(asm.Parts[i], asm.Parts[i + 1], minOverlap);
-        var totalFUnits = advanceWithOnce - startOverlap;
-
-        // Repeat the first extender until we reach the target.
-        var extenderRepeats = new int[asm.Parts.Count];
-        for (var i = 0; i < asm.Parts.Count; i++) extenderRepeats[i] = 1;
-
-        var firstExtender = -1;
-        for (var i = 0; i < asm.Parts.Count; i++)
-            if (asm.Parts[i].IsExtender) { firstExtender = i; break; }
-
-        if (firstExtender >= 0)
+        var covers = DelimiterCovers(requiredHeightPx, fontSize);
+        var opening = RasterizeStretchyVerticalCore(fontPath, fontSize, open, requiredHeightPx, covers, snapTop: false,
+            out openGlyphId, out _, out _);
+        var closing = RasterizeStretchyVerticalCore(fontPath, fontSize, close, requiredHeightPx, covers, snapTop: false,
+            out closeGlyphId, out _, out _);
+        if (opening.Rgba is null || closing.Rgba is null) return (opening, closing);
+        var (trimmedOpening, trimmedClosing) = (TrimEmptyRows(opening), TrimEmptyRows(closing));
+        if (trimmedOpening.Height == trimmedClosing.Height)
         {
-            const int safetyCap = 64;  // assemblies of >64 extenders are pathological
-            while (totalFUnits < requiredFUnits && extenderRepeats[firstExtender] < safetyCap)
-            {
-                var p = asm.Parts[firstExtender];
-                var selfOv = ClampedOverlap(p, p, minOverlap);
-                totalFUnits += p.FullAdvance - selfOv;
-                extenderRepeats[firstExtender]++;
-            }
+            // Inked alike: as drawn where their bitmaps also frame the ink alike, else centred by the ink.
+            var framedAlike = opening.Height == closing.Height &&
+                              opening.BearingY - trimmedOpening.BearingY == closing.BearingY - trimmedClosing.BearingY;
+            return framedAlike ? (opening, closing) : (trimmedOpening, trimmedClosing);
+        }
+        (opening, closing) = (trimmedOpening, trimmedClosing);
+
+        var openOff = MathF.Abs(opening.Height - requiredHeightPx);
+        var closeOff = MathF.Abs(closing.Height - requiredHeightPx);
+        if (openOff < closeOff || (openOff == closeOff && opening.Height > closing.Height))
+            closing = TrimEmptyRows(RasterizeStretchyVerticalCore(fontPath, fontSize, close, requiredHeightPx, covers,
+                snapTop: false, out closeGlyphId, out _, out _, exactPx: opening.Height));
+        else
+            opening = TrimEmptyRows(RasterizeStretchyVerticalCore(fontPath, fontSize, open, requiredHeightPx, covers,
+                snapTop: false, out openGlyphId, out _, out _, exactPx: closing.Height));
+        return (opening, closing);
+    }
+
+    /// <summary><paramref name="bitmap"/> without the rows at its top and bottom that hold no ink, its
+    /// <see cref="GlyphBitmap.BearingY"/> moved down by those dropped from the top.</summary>
+    private static GlyphBitmap TrimEmptyRows(GlyphBitmap bitmap)
+    {
+        if (bitmap.Rgba is null || bitmap.Width == 0) return bitmap;
+        bool Empty(int y)
+        {
+            for (var x = 0; x < bitmap.Width; x++)
+                if (bitmap.Rgba[(y * bitmap.Width + x) * 4 + 3] != 0) return false;
+            return true;
+        }
+        int top = 0, bottom = bitmap.Height;
+        while (top < bottom && Empty(top)) top++;
+        while (bottom > top && Empty(bottom - 1)) bottom--;
+        if (top == 0 && bottom == bitmap.Height) return bitmap;
+        if (top == bottom) return bitmap;
+        var rowBytes = bitmap.Width * 4;
+        var rgba = new byte[(bottom - top) * rowBytes];
+        Array.Copy(bitmap.Rgba, top * rowBytes, rgba, 0, rgba.Length);
+        return bitmap with { Rgba = rgba, Height = bottom - top, BearingY = bitmap.BearingY - top };
+    }
+
+    private static GlyphBitmap RenderMaybeTopSnapped(OpenTypeFont font, uint gid, float pixelsPerEm, bool snapTop, out TopSnap snap)
+    {
+        if (snapTop) return RenderTopSnapped(font, gid, pixelsPerEm, out snap);
+        snap = TopSnap.None;
+        return Render(font, gid, pixelsPerEm);
+    }
+
+    /// <summary>The assembly with <paramref name="copies"/> of every extender, its joins spread toward
+    /// <paramref name="requiredUnits"/>, as a candidate whose height is its ink's.</summary>
+    private static StretchyCandidate AssemblyCandidate(OpenTypeFont font, Tables.OpenTypeMath.MathGlyphAssembly asm,
+        int copies, ushort minOverlap, float requiredUnits, float pxPerUnit)
+    {
+        var sequence = AssemblySequence(asm, copies);
+        var overlaps = SpreadOverlaps(sequence, minOverlap, requiredUnits);
+        return new(0, sequence, overlaps, Stack(font, sequence, overlaps).Top * pxPerUnit);
+    }
+
+    /// <summary>
+    /// Compose a stretchy vertical glyph from an OpenType MATH assembly recipe, as the specification (and
+    /// MathML Core after it) lays one out. Parts are listed bottom-up.
+    /// <list type="number">
+    /// <item>Every extender appears the same number of times, r, from none upward: the fewest whose height
+    /// reaches the request with every join at the table's <c>MinConnectorOverlap</c>, the least it may
+    /// overlap (<see cref="AssemblyCopies"/>). Taking the most the connectors allow instead (what this did)
+    /// lets an extender whose connectors are as long as itself add next to nothing a copy: STIX Two Math's
+    /// radical extender (FullAdvance 651, connectors 650) added one font unit, so the loop met its cap a
+    /// little over two em tall and the radical came out shorter than its radicand. And always one copy of
+    /// each extender put DejaVu Sans's parenthesis at 3.5 em where the two ends alone make 2.4.</item>
+    /// <item>The overlap left over, the height past the request, is spread evenly across the joins, each
+    /// held between <c>MinConnectorOverlap</c> and what its two connectors allow (<see cref="SpreadOverlaps"/>),
+    /// so the glyph lands on the request. Where the joins have too little room it does not: it is taller
+    /// where even the most overlap leaves r copies past the request (the request falls between what r - 1
+    /// copies reach at the least overlap and r copies at the most, or below what none reach), and shorter
+    /// only at the copy cap. A copy count a caller passes on its own (one short, to scale up) is spread
+    /// the same way.</item>
+    /// <item>The parts are placed in font units, each one's ink box starting where the one below ends less
+    /// the join's overlap, and drawn as one outline at those fractional offsets. A join is then a union of
+    /// overlapping ink, never two antialiased edges stacked on whole pixels, so it shows no seam.</item>
+    /// </list>
+    /// The parts' design outlines are drawn, not hinted ones: a hinter fits each part to the pixel grid on
+    /// its own, which moves its ends, and they would no longer meet where the font units say.
+    /// <para>With <paramref name="heightPx"/> the whole outline is scaled vertically so its ink is that many
+    /// pixels tall, less a 256th so a whole number of pixels fills exactly that many rows; its X is not
+    /// scaled. Without it the ink is as tall as the font units make it.</para>
+    /// <para>With <paramref name="snapTop"/> the whole outline moves up by under half a pixel so the top of
+    /// the topmost part (the radical's flag) lands on a pixel row, and the stroke at its top-right is
+    /// measured on that part alone, as <see cref="RenderTopSnapped"/> does for a single glyph. Moving every
+    /// part by the one shift keeps the joins where they were.</para>
+    /// </summary>
+    /// <param name="overlaps">The overlap at each join, bottom-up, in font units.</param>
+    /// <param name="placed">Each part as drawn, bottom-up: its ink box in the bitmap's rows (Y down).</param>
+    private static GlyphBitmap ComposeVerticalAssembly(
+        OpenTypeFont font, Tables.OpenTypeMath.MathGlyphPart[] sequence, float[] overlaps,
+        ushort unitsPerEm, float fontSize, float? heightPx, bool snapTop, out TopSnap snap, out AssemblyPart[]? placed)
+    {
+        snap = TopSnap.None;
+        placed = null;
+        if (sequence.Length == 0) return default;
+
+        var (bottoms, inkBottom, topUnits) = Stack(font, sequence, overlaps);
+        var scale = fontSize / unitsPerEm;
+        var top = sequence.Length - 1;
+        var yScale = heightPx is { } h && topUnits > 0f ? (h - SnapInsetPx) / topUnits : scale;
+        void Walk(IGlyphSink sink, float shift)
+        {
+            for (var i = 0; i < sequence.Length; i++)
+                font.DrawGlyph(sequence[i].GlyphId,
+                    new ScaleShiftSink(sink, scale, (bottoms[i] - inkBottom[i]) * yScale + shift, yScale));
         }
 
-        // Materialise the runtime sequence (extenders unrolled) and rasterize each
-        // unique part once — extenders share a single bitmap across copies.
-        var totalParts = 0;
-        for (var i = 0; i < asm.Parts.Count; i++) totalParts += extenderRepeats[i];
-        var sequence = new Tables.OpenTypeMath.MathGlyphPart[totalParts];
-        var sIdx = 0;
-        for (var i = 0; i < asm.Parts.Count; i++)
-            for (var r = 0; r < extenderRepeats[i]; r++)
-                sequence[sIdx++] = asm.Parts[i];
+        // The bottom of the ink on a row boundary, or the top on one when snapping (see RenderTopSnapped).
+        var shiftPx = 0f;
+        float row = 0, strokeBottomPx = float.NaN;
+        if (snapTop)
+        {
+            var topPx = topUnits * yScale;
+            row = MathF.Round(topPx);
+            if (!(row - topPx is >= 0f and <= SnapInsetPx)) shiftPx = row - SnapInsetPx - topPx;
+            var stroke = new TopStrokeSink();
+            font.DrawGlyph(sequence[top].GlyphId, stroke);
+            var strokeUnits = stroke.TopRunBottom(stroke.XMax - 0.01f * unitsPerEm);
+            strokeBottomPx = (strokeUnits + bottoms[top] - inkBottom[top]) * yScale + shiftPx;
+        }
 
-        var bitmapCache = new Dictionary<ushort, GlyphBitmap>();
-        var bitmaps = new GlyphBitmap[sequence.Length];
+        var gray = Rast.SmoothRasterizer.Rasterize(sink => Walk(sink, shiftPx), pixelsPerEm: 1f, unitsPerEm: 1);
+        if (gray.IsEmpty) return default;
+        if (snapTop) snap = new TopSnap(gray.Top - (int)row, StrokeRows(row, strokeBottomPx));
+
+        placed = new AssemblyPart[sequence.Length];
         for (var i = 0; i < sequence.Length; i++)
         {
-            var gid = sequence[i].GlyphId;
-            if (!bitmapCache.TryGetValue(gid, out var bm))
-            {
-                bm = Render(font, gid, fontSize);
-                bitmapCache[gid] = bm;
-            }
-            bitmaps[i] = bm;
-        }
-
-        // Pixel-space overlaps between adjacent sequence positions.
-        var overlapPx = new int[Math.Max(0, sequence.Length - 1)];
-        for (var i = 0; i < sequence.Length - 1; i++)
-        {
-            var ovFunits = ClampedOverlap(sequence[i], sequence[i + 1], minOverlap);
-            overlapPx[i] = (int)Math.Round(ovFunits * fontSize / unitsPerEm);
-        }
-
-        // Canvas dimensions:
-        //   width  = the bbox spanning every part's inked extent — for each
-        //            part, its ink lives in [BearingX, BearingX + Width).
-        //            Different parts often have different BearingX values
-        //            (extender bitmaps are narrower than hook bitmaps), so
-        //            we take the union, not just the max width.
-        //   height = sum of part heights minus per-pair overlaps.
-        // Parts are positioned by their BearingX: the font designer assigned
-        // each part a BearingX that makes the parts mate seamlessly when
-        // drawn at the same glyph-origin. Centring bitmaps horizontally
-        // (the older bug) misaligned wider hooks against narrower extenders,
-        // producing two visible vertical strokes for paren assemblies — the
-        // hook's ink at canvas-x=0 and the extender's ink at canvas-x=~half-width.
-        var height = 0;
-        var minBearing = int.MaxValue;
-        var maxRight = int.MinValue;
-        for (var i = 0; i < bitmaps.Length; i++)
-        {
-            height += bitmaps[i].Height;
-            if (bitmaps[i].BearingX < minBearing) minBearing = bitmaps[i].BearingX;
-            var right = bitmaps[i].BearingX + bitmaps[i].Width;
-            if (right > maxRight) maxRight = right;
-        }
-        for (var i = 0; i < overlapPx.Length; i++) height -= overlapPx[i];
-        var width = maxRight - minBearing;
-        if (height <= 0) height = 1;
-        if (width <= 0) width = 1;
-
-        // Composite bottom-up: parts[0] sits at the bottom of the canvas.
-        var canvas = new RgbaImage(width, height);
-        canvas.Clear(new RGBAColor32(0, 0, 0, 0));
-
-        var pen = height;  // bottom edge
-        for (var i = 0; i < sequence.Length; i++)
-        {
-            var bm = bitmaps[i];
-            pen -= bm.Height;
-            // Translate by minBearing so the smallest BearingX lands at x=0.
-            var x = bm.BearingX - minBearing;
-            if (bm.Rgba is { Length: > 0 })
-                canvas.BlitRgba(x, pen, bm.Rgba, bm.Width, bm.Height);
-            // Slide back down by overlap so the next part sits inside this one's footprint.
-            if (i < overlapPx.Length) pen += overlapPx[i];
+            var bottomY = gray.Top - (bottoms[i] * yScale + shiftPx);
+            placed[i] = new AssemblyPart(sequence[i].GlyphId, sequence[i].IsExtender,
+                bottomY - sequence[i].FullAdvance * yScale, bottomY);
         }
 
         // BearingY = height keeps the whole thing above the baseline by default;
         // callers that want a math-axis-centred placement adjust their pen.
-        return new GlyphBitmap(canvas.Pixels, width, height, BearingX: 0, BearingY: height, AdvanceX: 0f);
+        var bitmap = FromGray(gray, advanceX: 0f);
+        return bitmap with { BearingY = bitmap.Height };
     }
 
     /// <summary>
-    /// Permissible overlap between part <paramref name="lower"/> (below) and
-    /// part <paramref name="upper"/> (above), in FUnits. Per OT MATH spec the
-    /// overlap may be in [MinConnectorOverlap, max], where
-    /// max = min(lower.EndConnectorLength, upper.StartConnectorLength). We
-    /// pick the maximum to keep the assembly compact.
+    /// Where each part of <paramref name="sequence"/> sits, in font units with Y up: <c>Bottoms[i]</c> the
+    /// bottom of its ink, each part's ink starting where the one below it ends less the join's overlap;
+    /// <c>InkBottom[i]</c> where its ink starts in its own outline; and <c>Top</c> the top of the topmost
+    /// part's ink, the whole stack's height. The parts are placed by where their ink starts, which for these
+    /// parts is their FullAdvance tall (STIX Two Math's to a unit; DejaVu Sans's top parts reach about 80
+    /// units past theirs).
     /// </summary>
-    private static int ClampedOverlap(
+    private static (float[] Bottoms, float[] InkBottom, float Top) Stack(
+        OpenTypeFont font, Tables.OpenTypeMath.MathGlyphPart[] sequence, float[] overlaps)
+    {
+        var inkBottom = new float[sequence.Length];
+        var bottoms = new float[sequence.Length];
+        var boundsCache = new Dictionary<ushort, (float YMin, float YMax)>();
+        (float YMin, float YMax) Bounds(int i)
+        {
+            var gid = sequence[i].GlyphId;
+            if (!boundsCache.TryGetValue(gid, out var bounds))
+                boundsCache[gid] = bounds = InkBounds(font, gid, sequence[i].FullAdvance);
+            return bounds;
+        }
+        for (var i = 0; i < sequence.Length; i++)
+        {
+            inkBottom[i] = Bounds(i).YMin;
+            bottoms[i] = i == 0 ? 0f : bottoms[i - 1] + sequence[i - 1].FullAdvance - overlaps[i - 1];
+        }
+        var top = sequence.Length - 1;
+        return (bottoms, inkBottom, top < 0 ? 0f : bottoms[top] + Bounds(top).YMax - inkBottom[top]);
+    }
+
+    /// <summary>The lowest and highest Y of <paramref name="gid"/>'s outline in font units, or 0 to
+    /// <paramref name="fallbackHeight"/> where it has none.</summary>
+    private static (float YMin, float YMax) InkBounds(OpenTypeFont font, ushort gid, float fallbackHeight)
+    {
+        var sink = new TopEdgeSink();
+        font.DrawGlyph(gid, sink);
+        return sink.HasPoints ? (sink.YMin, sink.YMax) : (0f, fallbackHeight);
+    }
+
+    /// <summary>The most copies of the extenders an assembly is given; past it the glyph is short of the
+    /// request. A hundred copies of the shortest extender in the fonts here is over 30 em.</summary>
+    private const int MaxExtenderRepeats = 100;
+
+    /// <summary>
+    /// How many times every extender of <paramref name="asm"/> repeats: the fewest, from none, whose height
+    /// with every join at <paramref name="minOverlap"/> (the most an assembly can be stretched to) reaches
+    /// <paramref name="requiredUnits"/>, up to <see cref="MaxExtenderRepeats"/>.
+    /// </summary>
+    private static int AssemblyCopies(Tables.OpenTypeMath.MathGlyphAssembly asm, ushort minOverlap, float requiredUnits)
+    {
+        int fixedAdvance = 0, fixedParts = 0, extenderAdvance = 0, extenderParts = 0;
+        foreach (var p in asm.Parts)
+        {
+            if (p.IsExtender) { extenderAdvance += p.FullAdvance; extenderParts++; }
+            else { fixedAdvance += p.FullAdvance; fixedParts++; }
+        }
+
+        if (extenderParts == 0) return 0;
+        // Height at r copies, least overlap: fixed + r * ext - minOverlap * (parts(r) - 1).
+        var perRepeat = extenderAdvance - minOverlap * extenderParts;
+        var atNone = fixedAdvance - minOverlap * (fixedParts - 1);
+        return perRepeat > 0 && requiredUnits > atNone
+            ? Math.Min(MaxExtenderRepeats, (int)Math.Ceiling((requiredUnits - atNone) / perRepeat))
+            : 0;
+    }
+
+    /// <summary>The assembly's parts bottom-up with every extender repeated <paramref name="copies"/> times.</summary>
+    private static Tables.OpenTypeMath.MathGlyphPart[] AssemblySequence(Tables.OpenTypeMath.MathGlyphAssembly asm, int copies)
+    {
+        var sequence = new List<Tables.OpenTypeMath.MathGlyphPart>(asm.Parts.Count + copies * asm.Parts.Count);
+        foreach (var p in asm.Parts)
+            for (var r = p.IsExtender ? copies : 1; r > 0; r--)
+                sequence.Add(p);
+        return [.. sequence];
+    }
+
+    /// <summary>The height of <paramref name="sequence"/>'s advances with every join at
+    /// <paramref name="minOverlap"/>, the most it can reach, in font units.</summary>
+    private static float MostUnits(Tables.OpenTypeMath.MathGlyphPart[] sequence, ushort minOverlap)
+    {
+        var advance = 0f;
+        foreach (var p in sequence) advance += p.FullAdvance;
+        return advance - minOverlap * Math.Max(0, sequence.Length - 1);
+    }
+
+    /// <summary>
+    /// The overlap at each join of <paramref name="sequence"/>, in font units, so that the parts' advances
+    /// less the overlaps come to <paramref name="requiredUnits"/>: the same at every join, each held between
+    /// <paramref name="minOverlap"/> and what its two connectors allow (<see cref="MaxOverlap"/>). Where even
+    /// the most overlap leaves the parts taller than the request, every join takes its most; where even the
+    /// least leaves them shorter (at the cap, or a copy short of the request), its least.
+    /// </summary>
+    private static float[] SpreadOverlaps(Tables.OpenTypeMath.MathGlyphPart[] sequence, ushort minOverlap, float requiredUnits)
+    {
+        var joins = Math.Max(0, sequence.Length - 1);
+        var overlaps = new float[joins];
+        if (joins == 0) return overlaps;
+
+        var advance = 0f;
+        foreach (var p in sequence) advance += p.FullAdvance;
+        var wanted = advance - requiredUnits;
+
+        // Every join at min(minOverlap + t, its most); find t by bisection, the total being monotonic in it.
+        float Total(float t)
+        {
+            var sum = 0f;
+            for (var i = 0; i < joins; i++) sum += MathF.Min(minOverlap + t, MaxOverlap(sequence[i], sequence[i + 1], minOverlap));
+            return sum;
+        }
+        var widest = 0f;
+        for (var i = 0; i < joins; i++) widest = MathF.Max(widest, MaxOverlap(sequence[i], sequence[i + 1], minOverlap) - minOverlap);
+        float lo = 0f, hi = widest;
+        if (Total(hi) <= wanted) lo = hi;
+        else if (Total(0f) < wanted)
+            for (var k = 0; k < 40; k++)
+            {
+                var mid = (lo + hi) / 2;
+                if (Total(mid) < wanted) lo = mid; else hi = mid;
+            }
+
+        for (var i = 0; i < joins; i++)
+            overlaps[i] = MathF.Min(minOverlap + lo, MaxOverlap(sequence[i], sequence[i + 1], minOverlap));
+        return overlaps;
+    }
+
+    /// <summary>
+    /// The most part <paramref name="lower"/> (below) and part <paramref name="upper"/> (above) may overlap,
+    /// in font units: the shorter of the two connectors that meet, by the OpenType MATH specification, and
+    /// never less than the table's <paramref name="minOverlap"/>.
+    /// </summary>
+    private static int MaxOverlap(
         Tables.OpenTypeMath.MathGlyphPart lower,
         Tables.OpenTypeMath.MathGlyphPart upper,
         ushort minOverlap)
@@ -818,6 +1306,7 @@ public sealed class ManagedFontRasterizer : IDisposable
         // sufficient. Method retained for API parity with FreeType path.
         _fonts.Clear();
         _identityMemo.Clear();
+        ClearRasterCaches();
     }
 
     // ---- Internals ---------------------------------------------------------
@@ -870,9 +1359,15 @@ public sealed class ManagedFontRasterizer : IDisposable
 
         var gray = font.RenderGlyphHinted(gid, pixelsPerEm);
         if (gray.IsEmpty) return Blank(advanceX);
+        return FromGray(gray, advanceX);
+    }
 
-        // Expand grayscale alpha to white-RGBA for compositing parity with
-        // FreeType's grayscale path in the existing renderer.
+    /// <summary>
+    /// Expand grayscale alpha to white-RGBA for compositing parity with
+    /// FreeType's grayscale path in the existing renderer.
+    /// </summary>
+    private static GlyphBitmap FromGray(Rast.GlyphBitmap gray, float advanceX)
+    {
         var rgba = new byte[gray.Width * gray.Height * 4];
         for (var i = 0; i < gray.Alpha.Length; i++)
         {
@@ -884,6 +1379,262 @@ public sealed class ManagedFontRasterizer : IDisposable
         }
         return new GlyphBitmap(rgba, gray.Width, gray.Height,
             gray.Left, gray.Top, advanceX, IsColored: false);
+    }
+
+    /// <summary>How far below a row boundary a snapped top is placed, in pixels. Exactly on the
+    /// boundary, float error in the shift can leave the top a hair above it, and the rasterizer then
+    /// opens an extra, empty row. 1/256 px is far inside the first of its four vertical subsamples
+    /// (at 1/8 px), so the row is still fully covered.</summary>
+    private const float SnapInsetPx = 1f / 256f;
+
+    /// <summary>
+    /// <see cref="Render"/>, with the outline moved vertically so its top lands on a pixel row.
+    /// <para>The outline is the one <see cref="Render"/> would rasterize: the hinted one where the face
+    /// hints this glyph (already in pixels), the design outline scaled to pixels otherwise. Its top is
+    /// the outline's own maximum Y, read with a bounds sink rather than scanned from a bitmap, so it is
+    /// exact. The shift moves that top to the nearest row, so it is never more than half a pixel, and a
+    /// top already on a row is rendered unshifted, which keeps a hinted glyph byte-identical to
+    /// <see cref="Render"/>.</para>
+    /// <para>It also measures, on the same outline, the stroke at the glyph's top-right: down a vertical
+    /// line just inside the outline's rightmost point, where the topmost run of ink ends. For the radical
+    /// that is its flag, and the count of rows it touches below the snapped top is exact at any size, where
+    /// the bitmap cannot tell a flag thinner than a pixel from the stem or the curve it runs into.</para>
+    /// <para>A colour glyph is returned unsnapped, with <paramref name="snap"/> <see cref="TopSnap.None"/>.</para>
+    /// </summary>
+    private static GlyphBitmap RenderTopSnapped(OpenTypeFont font, uint gid, float pixelsPerEm, out TopSnap snap)
+    {
+        snap = TopSnap.None;
+        if (font.RenderColor(gid, pixelsPerEm) is { IsEmpty: false })
+            return Render(font, gid, pixelsPerEm);
+
+        Action<IGlyphSink> walk;
+        float scale, em;
+        if (font.LoadHintedOutline(gid, pixelsPerEm) is { IsEmpty: false } hinted)
+        {
+            walk = hinted.Walk;
+            scale = 1f;
+            em = pixelsPerEm;
+        }
+        else
+        {
+            walk = sink => font.DrawGlyph(gid, sink);
+            scale = pixelsPerEm / font.UnitsPerEm;
+            em = font.UnitsPerEm;
+        }
+
+        var bounds = new TopEdgeSink();
+        walk(bounds);
+        if (!bounds.HasPoints) return Render(font, gid, pixelsPerEm);
+        var topPx = bounds.YMax * scale;
+
+        // A hundredth of an em inside the right end: on the flag, clear of any rounding at its corner.
+        var stroke = new TopStrokeSink();
+        walk(stroke);
+        var strokeBottomPx = stroke.TopRunBottom(stroke.XMax - 0.01f * em) * scale;
+
+        var row = MathF.Round(topPx);
+        if (row - topPx is >= 0f and <= SnapInsetPx)
+        {
+            // Already on a row (the hinter put it there): nothing to move.
+            var plain = Render(font, gid, pixelsPerEm);
+            snap = new TopSnap(plain.BearingY - (int)row, StrokeRows(row, strokeBottomPx));
+            return plain;
+        }
+        var shift = row - SnapInsetPx - topPx;
+
+        var gray = Rast.SmoothRasterizer.Rasterize(
+            sink => walk(new ScaleShiftSink(sink, scale, shift)), pixelsPerEm: 1f, unitsPerEm: 1);
+        var advanceX = AdvancePx(font, gid, pixelsPerEm);
+        if (gray.IsEmpty) return Blank(advanceX);
+
+        // The shifted top sits just under the row boundary `row`, so the bitmap's Top is that row.
+        snap = new TopSnap(gray.Top - (int)row, StrokeRows(row, strokeBottomPx + shift));
+        return FromGray(gray, advanceX);
+    }
+
+    /// <summary>Rows a stroke touches from the row boundary <paramref name="topRow"/> down to
+    /// <paramref name="bottomPx"/> (both Y-up pixels), or 0 when there was no stroke to measure.</summary>
+    private static int StrokeRows(float topRow, float bottomPx) =>
+        float.IsNaN(bottomPx) ? 0 : Math.Max(1, (int)MathF.Ceiling(topRow - bottomPx - 1e-3f));
+
+    /// <summary>
+    /// What a top-snapped rasterization learned from the outline: the bitmap row the outline's top begins
+    /// at, and how many rows from there the stroke at the glyph's top-right touches (the radical's flag),
+    /// 0 when the outline gave no measure.
+    /// </summary>
+    internal readonly record struct TopSnap(int InkTopRow, int TopStrokeRows)
+    {
+        /// <summary>Nothing was snapped: a colour glyph, an embedded Type 1 face, or no snap asked for.</summary>
+        public static TopSnap None => new(-1, 0);
+    }
+
+    /// <summary>Flattens an outline into line segments, to follow a vertical line through it: where the
+    /// topmost run of ink on that line ends tells how thick the stroke at the outline's top is there.</summary>
+    private sealed class TopStrokeSink : IGlyphSink
+    {
+        private const int CurveSteps = 16;
+        private readonly List<(float X0, float Y0, float X1, float Y1)> _segments = [];
+        private float _x, _y, _startX, _startY;
+
+        public float XMax { get; private set; } = float.NegativeInfinity;
+
+        public void MoveTo(float x, float y)
+        {
+            (_x, _y, _startX, _startY) = (x, y, x, y);
+            XMax = MathF.Max(XMax, x);
+        }
+
+        public void LineTo(float x, float y) => Segment(x, y);
+
+        public void QuadTo(float cx, float cy, float x, float y)
+        {
+            float x0 = _x, y0 = _y;
+            for (var i = 1; i <= CurveSteps; i++)
+            {
+                var t = i / (float)CurveSteps;
+                var u = 1f - t;
+                Segment(u * u * x0 + 2f * u * t * cx + t * t * x, u * u * y0 + 2f * u * t * cy + t * t * y);
+            }
+        }
+
+        public void CubicTo(float c1x, float c1y, float c2x, float c2y, float x, float y)
+        {
+            float x0 = _x, y0 = _y;
+            for (var i = 1; i <= CurveSteps; i++)
+            {
+                var t = i / (float)CurveSteps;
+                var u = 1f - t;
+                Segment(u * u * u * x0 + 3f * u * u * t * c1x + 3f * u * t * t * c2x + t * t * t * x,
+                    u * u * u * y0 + 3f * u * u * t * c1y + 3f * u * t * t * c2y + t * t * t * y);
+            }
+        }
+
+        public void Close()
+        {
+            if (_x != _startX || _y != _startY) Segment(_startX, _startY);
+        }
+
+        /// <summary>The Y where the topmost run of ink down the vertical line at <paramref name="x"/> ends,
+        /// by the non-zero winding rule the rasterizer fills with; NaN when the line meets no ink.</summary>
+        public float TopRunBottom(float x)
+        {
+            var crossings = new List<(float Y, int Wind)>();
+            foreach (var (x0, y0, x1, y1) in _segments)
+            {
+                if ((x0 <= x && x < x1) || (x1 <= x && x < x0))
+                    crossings.Add((y0 + (x - x0) * (y1 - y0) / (x1 - x0), x1 > x0 ? 1 : -1));
+            }
+            crossings.Sort((a, b) => b.Y.CompareTo(a.Y));
+            var winding = 0;
+            foreach (var (y, wind) in crossings)
+            {
+                var was = winding;
+                winding += wind;
+                if (was != 0 && winding == 0) return y;
+            }
+            return float.NaN;
+        }
+
+        private void Segment(float x, float y)
+        {
+            _segments.Add((_x, _y, x, y));
+            (_x, _y) = (x, y);
+            XMax = MathF.Max(XMax, x);
+        }
+    }
+
+    /// <summary>Collects the highest and lowest Y an outline reaches: its on-curve points and the interior
+    /// extrema of its curves (a control point above the curve is not ink).</summary>
+    internal sealed class TopEdgeSink : IGlyphSink
+    {
+        private float _y;
+
+        public float YMax { get; private set; } = float.NegativeInfinity;
+
+        /// <summary>The lowest Y, found the same way: an assembly part is placed by where its ink starts.</summary>
+        public float YMin { get; private set; } = float.PositiveInfinity;
+
+        public bool HasPoints => !float.IsNegativeInfinity(YMax);
+
+        public void MoveTo(float x, float y) => Note(y);
+
+        public void LineTo(float x, float y) => Note(y);
+
+        public void QuadTo(float cx, float cy, float x, float y)
+        {
+            // B'(t) = 0 at t = (p0 - p1) / (p0 - 2 p1 + p2).
+            var d = _y - 2f * cy + y;
+            if (d != 0f)
+            {
+                var t = (_y - cy) / d;
+                if (t is > 0f and < 1f)
+                {
+                    var u = 1f - t;
+                    Note(u * u * _y + 2f * u * t * cy + t * t * y, keepCurrent: true);
+                }
+            }
+            Note(y);
+        }
+
+        public void CubicTo(float c1x, float c1y, float c2x, float c2y, float x, float y)
+        {
+            // B'(t) / 3 = A t^2 + B t + C with a = c1 - p0, b = c2 - c1, c = p3 - c2.
+            var a = c1y - _y;
+            var b = c2y - c1y;
+            var c = y - c2y;
+            var qa = a - 2f * b + c;
+            var qb = 2f * (b - a);
+            if (MathF.Abs(qa) < 1e-6f)
+            {
+                if (qb != 0f) NoteCubic(-a / qb, c1y, c2y, y);
+            }
+            else
+            {
+                var disc = qb * qb - 4f * qa * a;
+                if (disc >= 0f)
+                {
+                    var sq = MathF.Sqrt(disc);
+                    NoteCubic((-qb + sq) / (2f * qa), c1y, c2y, y);
+                    NoteCubic((-qb - sq) / (2f * qa), c1y, c2y, y);
+                }
+            }
+            Note(y);
+        }
+
+        public void Close() { }
+
+        private void NoteCubic(float t, float c1y, float c2y, float y)
+        {
+            if (t is not (> 0f and < 1f)) return;
+            var u = 1f - t;
+            Note(u * u * u * _y + 3f * u * u * t * c1y + 3f * u * t * t * c2y + t * t * t * y, keepCurrent: true);
+        }
+
+        private void Note(float y, bool keepCurrent = false)
+        {
+            if (y > YMax) YMax = y;
+            if (y < YMin) YMin = y;
+            if (!keepCurrent) _y = y;
+        }
+    }
+
+    /// <summary>Scales an outline to pixels (its Y by <c>yScale</c>, the same as X unless the glyph is scaled to fit)
+    /// and moves it up by <c>dy</c> pixels (Y is up here), for the rasterizer to draw at identity scale.</summary>
+    private sealed class ScaleShiftSink(IGlyphSink inner, float scale, float dy, float yScale) : IGlyphSink
+    {
+        public ScaleShiftSink(IGlyphSink inner, float scale, float dy) : this(inner, scale, dy, scale) { }
+
+        public void MoveTo(float x, float y) => inner.MoveTo(x * scale, y * yScale + dy);
+
+        public void LineTo(float x, float y) => inner.LineTo(x * scale, y * yScale + dy);
+
+        public void QuadTo(float cx, float cy, float x, float y)
+            => inner.QuadTo(cx * scale, cy * yScale + dy, x * scale, y * yScale + dy);
+
+        public void CubicTo(float c1x, float c1y, float c2x, float c2y, float x, float y)
+            => inner.CubicTo(c1x * scale, c1y * yScale + dy, c2x * scale, c2y * yScale + dy, x * scale, y * yScale + dy);
+
+        public void Close() => inner.Close();
     }
 
     private static SdfGlyphBitmap RenderSdf(OpenTypeFont font, uint gid, float pixelsPerEm, float spread)

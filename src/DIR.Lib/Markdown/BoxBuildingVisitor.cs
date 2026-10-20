@@ -3,7 +3,9 @@ using System.Collections.Generic;
 using LALR.CC.LexicalGrammar;
 using DIR.Lib;
 using DIR.Lib.MathLayout;
+using SharpAstro.Fonts;
 using static DIR.Lib.Latex;
+using AtomClass = DIR.Lib.Markdown.MathAtomClass;
 
 namespace DIR.Lib.Markdown;
 
@@ -24,10 +26,12 @@ namespace DIR.Lib.Markdown;
 /// kern, <see cref="FracBox"/>, <see cref="BracketBox"/>, etc. inside the
 /// closure then picks up the smaller size automatically.</para>
 ///
-/// <para>Atoms (Number / Variable / Command) build a <see cref="GlyphBox"/> at
-/// the supplied style. Composites (Add / Sub / Eq / Mul / Div / Juxt) combine
+/// <para>Atoms build a glyph box at the supplied style: a Variable a
+/// math-italic <see cref="MathGlyphBox"/> (upright inside <c>\mathrm</c>),
+/// a Number or a Command an upright <see cref="GlyphBox"/>. Composites (Add / Sub / Eq / Mul / Div) combine
 /// child builders with <see cref="HBox"/> + small inter-token kerns sized off
-/// the supplied style. Scripts use <see cref="SupSubBox"/> with the script
+/// the supplied style; Juxt adds only the thin space TeX puts round an operator
+/// name. Scripts use <see cref="SupSubBox"/> with the script
 /// builder invoked at <c>style.Smaller()</c>. <see cref="Frac"/>, <see cref="Sqrt"/>,
 /// brackets, and the big-operator scaffold build the obvious dedicated boxes.</para>
 ///
@@ -62,19 +66,47 @@ public sealed class BoxBuildingVisitor : IVisitor<Func<BoxStyle, Box>>
 
     private static Func<BoxStyle, Box> Builder(Item item) => (Func<BoxStyle, Box>)item.Content;
 
+    /// <summary>
+    /// Left, the operator, right, with <paramref name="kernEm"/> either side.
+    /// Against an empty side (an operand
+    /// <see cref="MarkdownMacros.SupplyMissingOperands"/> supplied, which has
+    /// no width) a binary operator takes no space at all, being ordinary there
+    /// in TeX, and a relation none on that side. <paramref name="aloneOp"/>,
+    /// when given, is drawn instead of <paramref name="op"/> there.
+    /// </summary>
     private static Func<BoxStyle, Box> BinaryOp(
-        Func<BoxStyle, Box> left, string op, Func<BoxStyle, Box> right, float kernEm = 0.25f) =>
+        Func<BoxStyle, Box> left, string op, Func<BoxStyle, Box> right, float kernEm = 0.25f, bool binary = true,
+        string? aloneOp = null) =>
         style =>
         {
+            var l = left(style);
+            var r = right(style);
             var kern = new KernBox(style.FontSize * kernEm);
-            return new HBox(left(style), kern, new GlyphBox(op, style), kern, right(style));
+            var alone = l.Width <= 0 || r.Width <= 0;
+            var parts = new List<Box>(5);
+            if (l.Width > 0) parts.Add(l);
+            if (l.Width > 0 && !(binary && alone)) parts.Add(kern);
+            parts.Add(new GlyphBox(alone && aloneOp is not null ? aloneOp : op, style));
+            if (r.Width > 0 && !(binary && alone)) parts.Add(kern);
+            if (r.Width > 0) parts.Add(r);
+            return new HBox(parts.ToArray());
         };
 
     public Func<BoxStyle, Box> Visit(Add node)      => BinaryOp(Builder(node.Arg0), "+", Builder(node.Arg2));
     public Func<BoxStyle, Box> Visit(Subtract node) => BinaryOp(Builder(node.Arg0), "−", Builder(node.Arg2)); // U+2212 minus
-    public Func<BoxStyle, Box> Visit(Eq node)       => BinaryOp(Builder(node.Arg0), "=", Builder(node.Arg2), 0.35f);
-    public Func<BoxStyle, Box> Visit(Mul node)      => BinaryOp(Builder(node.Arg0), "·", Builder(node.Arg2), 0.15f); // U+00B7 dot
+    public Func<BoxStyle, Box> Visit(Eq node)       => BinaryOp(Builder(node.Arg0), "=", Builder(node.Arg2), 0.35f, binary: false);
     public Func<BoxStyle, Box> Visit(Div node)      => BinaryOp(Builder(node.Arg0), "/", Builder(node.Arg2));
+
+    /// <summary>\times is ×, with TeX's medium space (4 mu) either side, as
+    /// for any binary operator; * and \cdot stay the tight middle dot. \times
+    /// used to draw the dot too, so 7 \times 7 read 7·7. A * with nothing on a
+    /// side is an asterisk, TeX's \ast (x^{*}), not the dot of a product.</summary>
+    public Func<BoxStyle, Box> Visit(Mul node) => (string)node.Arg1.Content switch
+    {
+        @"\times" => BinaryOp(Builder(node.Arg0), "×", Builder(node.Arg2), 4f / 18f),
+        "*" => BinaryOp(Builder(node.Arg0), "·", Builder(node.Arg2), 0.15f, aloneOp: "∗"),
+        _ => BinaryOp(Builder(node.Arg0), "·", Builder(node.Arg2), 0.15f), // U+00B7 dot
+    };
 
     /// <summary>
     /// Binary relation (\approx \leq \geq \neq \equiv \ll \gg \in \notin
@@ -90,15 +122,72 @@ public sealed class BoxBuildingVisitor : IVisitor<Func<BoxStyle, Box>>
         var raw = (string)node.Arg1.Content;
         var name = raw.Length > 1 && raw[0] == '\\' ? raw.Substring(1) : raw;
         var glyph = Commands.TryGetValue(name, out var g) ? g : raw;
-        return BinaryOp(Builder(node.Arg0), glyph, Builder(node.Arg2), 0.35f);
+        // \pm and \mp lex as relations but are binary operators in TeX: ±0.2.
+        return BinaryOp(Builder(node.Arg0), glyph, Builder(node.Arg2), 0.35f, binary: name is "pm" or "mp");
     }
 
-    /// <summary>Implicit multiplication ("xy", "n(n+1)") — a tiny kern, no operator.</summary>
+    /// <summary>
+    /// Implicit multiplication ("xy", "n(n+1)", "\sin x"): the two sides
+    /// side by side, with the space TeX puts between the atoms that meet
+    /// there (<see cref="MarkdownMacros.ThinSpaceBetween"/>), which for two
+    /// ordinary atoms is none. It used to put 0.05 em before every
+    /// juxtaposition, and they nest to the left, so <c>1, 2, 3</c> carried
+    /// 0.2 em in front of its 1. Punctuation carries its own space
+    /// (<see cref="Visit(Punct)"/>).
+    /// </summary>
     public Func<BoxStyle, Box> Visit(Juxt node)
     {
         var left = Builder(node.Arg0);
         var right = Builder(node.Arg1);
-        return style => new HBox(new KernBox(style.FontSize * 0.05f), left(style), right(style));
+        return style =>
+        {
+            var l = left(style);
+            var r = right(style);
+            return MarkdownMacros.ThinSpaceBetween(RightClass(l), LeftClass(r))
+                ? new HBox(l, new KernBox(style.FontSize / 6f), r)
+                : new HBox(l, r);
+        };
+    }
+
+    /// <summary>The class of the first atom in <paramref name="box"/>. A
+    /// scripted atom keeps its nucleus's class, as in TeX.</summary>
+    private static AtomClass LeftClass(Box box) => box switch
+    {
+        AtomBox atom => atom.Class,
+        BigOpScaffold => AtomClass.Op,
+        SupSubBox scripted => LeftClass(scripted.Base),
+        BracketBox or DelimiterPairBox => AtomClass.Open,
+        HBox row => EdgeClass(row.Children, LeftClass, fromEnd: false),
+        KernBox => AtomClass.Glue,
+        _ => AtomClass.Ord,
+    };
+
+    /// <summary>The class of the last atom in <paramref name="box"/>.</summary>
+    private static AtomClass RightClass(Box box) => box switch
+    {
+        AtomBox atom => atom.Class,
+        BigOpScaffold => AtomClass.Op,
+        SupSubBox scripted => RightClass(scripted.Base),
+        BracketBox or DelimiterPairBox => AtomClass.Close,
+        HBox row => EdgeClass(row.Children, RightClass, fromEnd: true),
+        KernBox => AtomClass.Glue,
+        _ => AtomClass.Ord,
+    };
+
+    /// <summary>
+    /// The class of a row's first (or last) atom. Space is not an atom, so a
+    /// kern at that end is passed over, as TeX passes over glue: in
+    /// <c>\sin\,x</c> the x still follows an Op, and gets its thin space on
+    /// top of the <c>\,</c>. A row of nothing but space is space.
+    /// </summary>
+    private static AtomClass EdgeClass(IReadOnlyList<Box> children, Func<Box, AtomClass> classOf, bool fromEnd)
+    {
+        for (var i = 0; i < children.Count; i++)
+        {
+            var child = children[fromEnd ? children.Count - 1 - i : i];
+            if (child is not KernBox) return classOf(child);
+        }
+        return children.Count == 0 ? AtomClass.Ord : AtomClass.Glue;
     }
 
     public Func<BoxStyle, Box> Visit(Neg node)
@@ -165,33 +254,232 @@ public sealed class BoxBuildingVisitor : IVisitor<Func<BoxStyle, Box>>
         };
     }
 
+    /// <summary>
+    /// A number, upright. Inside <c>\mathbb{...}</c> its digits are
+    /// double-struck where the font has them, as unicode-math sets them.
+    /// </summary>
     public Func<BoxStyle, Box> Visit(Number node)
     {
         var text = (string)node.Arg0.Content;
-        return style => new GlyphBox(text, style);
+        return style => t_alphabet is { } alphabet and not MathStyle.Normal
+            ? new MathGlyphBox(text, style, alphabet)
+            : new GlyphBox(text, style);
     }
 
+    /// <summary>
+    /// A single-letter variable, set in math italic as TeX sets it: a
+    /// <see cref="MathGlyphBox"/> remaps the letter to its U+1D400-block
+    /// italic (or ℎ U+210E for h) when the font's cmap has it, and leaves it
+    /// upright in a font that lacks the block. Inside <c>\mathrm{...}</c>
+    /// (see <see cref="Visit(MathRm)"/>) the letter stays upright, and inside
+    /// <c>\mathbb{...}</c> it is double-struck, falling back the same way.
+    /// </summary>
     public Func<BoxStyle, Box> Visit(Variable node)
     {
         var text = (string)node.Arg0.Content;
+        return style => t_alphabet switch
+        {
+            null => new MathGlyphBox(text, style, MathStyle.Italic),
+            MathStyle.Normal => new GlyphBox(text, style),
+            { } alphabet => new MathGlyphBox(text, style, alphabet),
+        };
+    }
+
+    /// <summary>
+    /// The math alphabet a <c>\mathrm</c> or <c>\mathbb</c> argument is
+    /// being built in, or null outside one, where letters are math italic.
+    /// TeX's alphabet commands switch the math family for the rest of their
+    /// group, which is a dynamic scope, and so is this: it is set around the
+    /// argument builder's call, so every variable that builder reaches, at
+    /// any depth (<c>\mathrm{Na}</c>, <c>\mathrm{e^{x}}</c>), takes it, and
+    /// the innermost command wins. It is read only when a builder runs, never
+    /// while parsing, and it is per thread because a builder runs to
+    /// completion on the thread that calls it.
+    /// </summary>
+    [ThreadStatic]
+    private static MathStyle? t_alphabet;
+
+    /// <summary><paramref name="inner"/>, built with its letters in
+    /// <paramref name="alphabet"/> (see <see cref="t_alphabet"/>).</summary>
+    private static Func<BoxStyle, Box> InAlphabet(MathStyle alphabet, Func<BoxStyle, Box> inner) =>
+        style =>
+        {
+            var outer = t_alphabet;
+            t_alphabet = alphabet;
+            try
+            {
+                return inner(style);
+            }
+            finally
+            {
+                t_alphabet = outer;
+            }
+        };
+
+    /// <summary>
+    /// <c>\mathrm{...}</c>: the argument builds exactly as it would bare,
+    /// except that its variables stay upright. Digits, operator names and
+    /// Greek are untouched, since they never were italic here; that matches
+    /// TeX, whose <c>\mathrm</c> changes only the Latin letters.
+    /// </summary>
+    public Func<BoxStyle, Box> Visit(MathRm node) => InAlphabet(MathStyle.Normal, Builder(node.Arg1));
+
+    /// <summary>
+    /// <c>\mathbb{...}</c>: the argument's letters (and digits) in the
+    /// double-struck alphabet, ℝ for R. A <see cref="MathGlyphBox"/> finds
+    /// the letter where Unicode put it, so ℂ ℍ ℕ ℙ ℚ ℝ ℤ come from Letterlike
+    /// Symbols and the rest from U+1D538, and a font without the glyph gets
+    /// the plain letter, as math italic falls back.
+    /// </summary>
+    public Func<BoxStyle, Box> Visit(MathBb node) => InAlphabet(MathStyle.DoubleStruck, Builder(node.Arg1));
+
+    /// <summary><c>\mathbf{X}</c>: X's letters and digits in the font's
+    /// mathematical bold, as <c>\mathbb</c>'s are double-struck.</summary>
+    public Func<BoxStyle, Box> Visit(MathBf node) => InAlphabet(MathStyle.Bold, Builder(node.Arg1));
+
+    /// <summary>
+    /// <c>\hat{x}</c> and the other accents: the accent's spacing glyph set
+    /// over the argument by <see cref="AccentBox"/>, which centres it on the
+    /// base's top-accent attachment from the font's MATH table. AccentBox was
+    /// only reachable from code; the grammar had no accent, so <c>\hat</c>
+    /// drew its own name.
+    /// </summary>
+    public Func<BoxStyle, Box> Visit(Accented node)
+    {
+        var glyph = MarkdownMacros.Accents[((string)node.Arg0.Content).TrimStart('\\')].Glyph;
+        var @base = Builder(node.Arg1);
+        return style => new AccentBox(@base(style), new GlyphBox(glyph, style), style);
+    }
+
+    /// <summary>
+    /// <c>\lfloor E \rfloor</c>, <c>\lceil E \rceil</c> and
+    /// <c>\langle E \rangle</c>: the pair stretched to E as parens are, with or
+    /// without <c>\left</c> and <c>\right</c>
+    /// (<see cref="DelimiterPairBox"/>, which takes any two codepoints).
+    /// </summary>
+    public Func<BoxStyle, Box> Visit(NamedPair node)
+    {
+        var open = MarkdownMacros.NamedDelimiters[((string)node.Arg0.Content).TrimStart('\\')];
+        var close = MarkdownMacros.NamedDelimiters[((string)node.Arg2.Content).TrimStart('\\')];
+        var inner = Builder(node.Arg1);
+        return style => new DelimiterPairBox(inner(style), open, close, style);
+    }
+
+    /// <summary><c>x'</c>: the prime glyph after the atom. U+2032 is a
+    /// spacing prime, drawn raised by the font, so it is set at the body size,
+    /// as MathJax sets it with a Unicode math font.</summary>
+    public Func<BoxStyle, Box> Visit(Primed node)
+    {
+        var @base = Builder(node.Arg0);
+        var primes = MarkdownMacros.Primes(((string)node.Arg1.Content).Length);
+        return style => new HBox(@base(style), new GlyphBox(primes, style));
+    }
+
+    /// <summary>
+    /// <c>\operatorname{X}</c>: X as an operator name of the writer's own,
+    /// one Op atom, so it is spaced like <c>\sin</c> and its scripts go to
+    /// its right. <c>\operatorname*{X}</c> takes them as limits instead, as
+    /// <c>\lim</c> does. X is math, as amsmath sets it, built with its letters
+    /// upright: blanks in it are dropped, <c>arg\,max</c> keeps its thin
+    /// space, <c>\mathbb{E}</c> is 𝔼. A name of nothing but upright glyphs is
+    /// drawn as one run (<see cref="AsOneRun"/>), so <c>\operatorname{sin}</c>
+    /// is exactly <c>\sin</c>.
+    /// </summary>
+    public Func<BoxStyle, Box> Visit(OperatorName node)
+    {
+        var starred = ((string)node.Arg0.Content).EndsWith('*');
+        var argument = InAlphabet(MathStyle.Normal, Builder(node.Arg1));
+        return style =>
+        {
+            var name = AsOneRun(argument(style), style);
+            return starred ? new BigOpScaffold(name, null, null, style) : new AtomBox(name, AtomClass.Op);
+        };
+    }
+
+    /// <summary>
+    /// <paramref name="box"/> as one <see cref="GlyphBox"/> of its text when it
+    /// is nothing but a row of upright glyphs at the body size, which is how
+    /// a built-in name like <c>\sin</c> is drawn; anything else as it is.
+    /// </summary>
+    private static Box AsOneRun(Box box, BoxStyle style)
+    {
+        var text = new System.Text.StringBuilder();
+        return AppendRun(box, text, style.FontSize) ? new GlyphBox(text.ToString(), style) : box;
+    }
+
+    private static bool AppendRun(Box box, System.Text.StringBuilder text, float fontSize)
+    {
+        switch (box)
+        {
+            case GlyphBox glyph when glyph.FontSize == fontSize:
+                text.Append(glyph.Text);
+                return true;
+            case HBox row:
+                foreach (var child in row.Children)
+                    if (!AppendRun(child, text, fontSize)) return false;
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /// <summary>
+    /// TeX's math spaces, in mu (an eighteenth of an em at the current
+    /// style's size): <c>\,</c> 3, <c>\:</c> 4, <c>\;</c> 5 and <c>\!</c>
+    /// minus 3. A kern, which <see cref="LeftClass"/> and
+    /// <see cref="RightClass"/> pass over as space rather than an atom.
+    /// </summary>
+    public Func<BoxStyle, Box> Visit(MathSpace node)
+    {
+        var mu = ((string)node.Arg0.Content)[1] switch
+        {
+            ',' => 3,
+            ':' => 4,
+            ';' => 5,
+            _ => -3,
+        };
+        return style => new KernBox(style.FontSize * mu / 18f);
+    }
+
+    /// <summary>
+    /// <c>\textrm{X}</c>: X as upright text, an ordinary atom that keeps its
+    /// blanks. The token holds the braced text (see the grammar).
+    /// </summary>
+    public Func<BoxStyle, Box> Visit(TextRm node)
+    {
+        var text = MarkdownMacros.BracedArgument((string)node.Arg0.Content);
         return style => new GlyphBox(text, style);
     }
 
     /// <summary>
     /// \name commands. Greek + symbol lookups produce a single Unicode glyph;
-    /// function names like \sin become an upright-style multi-letter atom;
+    /// function names like \sin become an upright-style multi-letter atom,
+    /// an Op (see <see cref="MarkdownMacros.ThinSpaceBetween"/>), as are the big operators;
     /// unknown commands fall back to the raw \name text so it's debuggable.
     /// </summary>
     public Func<BoxStyle, Box> Visit(Command node)
     {
         var raw = (string)node.Arg0.Content;
         var name = raw.Length > 1 && raw[0] == '\\' ? raw.Substring(1) : raw;
+        if (MarkdownMacros.OperatorNames.TryGetValue(name, out var opName))
+        {
+            // A named limit operator (\lim, \max) wraps its name, at the body
+            // size as TeX draws it, in a scaffold so subsequent _/^ scripts
+            // fold into a LimitsBox (limits above/below) instead of a
+            // SupSubBox (right-of).
+            if (MarkdownMacros.LimitOperatorNames.Contains(name))
+                return style => new BigOpScaffold(new GlyphBox(opName, style), null, null, style);
+            return style => new AtomBox(new GlyphBox(opName, style), AtomClass.Op);
+        }
+        // \quad is an em of space and \qquad two, as in TeX; a space glyph is
+        // a third of that.
+        if (name is "quad" or "qquad")
+            return style => new KernBox(style.FontSize * (name == "quad" ? 1f : 2f));
         var glyph = Commands.TryGetValue(name, out var g) ? g : raw;
-        if (LimitOps.Contains(name))
+        if (BigOperators.Contains(name))
         {
             // Display-style big operator: render the glyph at 1.5x and wrap
-            // in a scaffold so subsequent _/^ scripts fold into a LimitsBox
-            // (limits above/below) instead of a SupSubBox (right-of).
+            // in a scaffold, as for a named limit operator.
             return style => new BigOpScaffold(new GlyphBox(glyph, style, style.FontSize * 1.5f), null, null, style);
         }
         return style => new GlyphBox(glyph, style);
@@ -204,8 +492,52 @@ public sealed class BoxBuildingVisitor : IVisitor<Func<BoxStyle, Box>>
         return style => new BracketBox(inner(style), BracketKind.Paren, style);
     }
 
-    /// <summary>{ E } in LaTeX is an invisible group — render the inner E unchanged.</summary>
-    public Func<BoxStyle, Box> Visit(Group node) => Builder(node.Arg1);
+    /// <summary>
+    /// { E } in LaTeX is an invisible group: render the inner E unchanged.
+    /// To its neighbours it is one Ord atom, as in TeX, whatever its own ends
+    /// are, so <c>{\sin} x</c> is set tight; a group whose ends are ordinary
+    /// already is returned as it is.
+    /// </summary>
+    public Func<BoxStyle, Box> Visit(Group node)
+    {
+        var inner = Builder(node.Arg1);
+        return style =>
+        {
+            var box = inner(style);
+            return LeftClass(box) == AtomClass.Ord && RightClass(box) == AtomClass.Ord
+                ? box
+                : new AtomBox(box, AtomClass.Ord);
+        };
+    }
+
+    /// <summary>
+    /// \{ E \}, a set: a curly <see cref="BracketBox"/>, stretchy like
+    /// <see cref="Visit(Paren)"/>'s parens. <c>\left\{ … \right\}</c> and
+    /// <c>\lbrace … \rbrace</c> arrive here too, since
+    /// <see cref="MarkdownMacros.NormalizeLatexAliases"/> reduces both to the
+    /// escaped braces.
+    /// </summary>
+    public Func<BoxStyle, Box> Visit(Brace node)
+    {
+        var inner = Builder(node.Arg1);
+        return style => new BracketBox(inner(style), BracketKind.Curly, style);
+    }
+
+    /// <summary>
+    /// (), [] or \{\}: a <see cref="BracketBox"/> around nothing, so the
+    /// font's delimiters at their normal height, side by side. Arg0 is the
+    /// opening delimiter as written.
+    /// </summary>
+    public Func<BoxStyle, Box> Visit(EmptyPair node)
+    {
+        var kind = (string)node.Arg0.Content switch
+        {
+            "(" => BracketKind.Paren,
+            "[" => BracketKind.Square,
+            _ => BracketKind.Curly,
+        };
+        return style => new BracketBox(new HBox(), kind, style);
+    }
 
     /// <summary>
     /// [E], and the half-open mixes [E) and (E]. A matched pair is a
@@ -233,7 +565,7 @@ public sealed class BoxBuildingVisitor : IVisitor<Func<BoxStyle, Box>>
     public Func<BoxStyle, Box> Visit(Punct node)
     {
         var text = (string)node.Arg0.Content;
-        return style => new HBox(new GlyphBox(text, style), new KernBox(style.FontSize / 6f));
+        return style => new AtomBox(new HBox(new GlyphBox(text, style), new KernBox(style.FontSize / 6f)), AtomClass.Punct);
     }
 
     public Func<BoxStyle, Box> Visit(Sqrt node)
@@ -276,14 +608,8 @@ public sealed class BoxBuildingVisitor : IVisitor<Func<BoxStyle, Box>>
         ["Gamma"] = "Γ", ["Delta"] = "Δ", ["Theta"] = "Θ", ["Lambda"] = "Λ",
         ["Xi"] = "Ξ", ["Pi"] = "Π", ["Sigma"] = "Σ", ["Phi"] = "Φ",
         ["Psi"] = "Ψ", ["Omega"] = "Ω",
-        // Function names — kept multi-letter; rendered as upright run.
-        ["sin"] = "sin", ["cos"] = "cos", ["tan"] = "tan",
-        ["sec"] = "sec", ["csc"] = "csc", ["cot"] = "cot",
-        ["arcsin"] = "arcsin", ["arccos"] = "arccos", ["arctan"] = "arctan",
-        ["sinh"] = "sinh", ["cosh"] = "cosh", ["tanh"] = "tanh",
-        ["log"] = "log", ["ln"] = "ln", ["exp"] = "exp",
-        ["lim"] = "lim", ["max"] = "max", ["min"] = "min",
-        ["det"] = "det", ["dim"] = "dim", ["gcd"] = "gcd",
+        // Function names (\sin, \log, \lim, ...) are in
+        // MarkdownMacros.OperatorNames, which both visitors share.
         // Big operators
         ["sum"] = "∑", ["prod"] = "∏", ["int"] = "∫", ["oint"] = "∮",
         ["bigcup"] = "⋃", ["bigcap"] = "⋂",
@@ -298,6 +624,8 @@ public sealed class BoxBuildingVisitor : IVisitor<Func<BoxStyle, Box>>
         ["leq"] = "≤", ["geq"] = "≥", ["neq"] = "≠",
         ["approx"] = "≈", ["equiv"] = "≡",
         ["in"] = "∈", ["notin"] = "∉", ["subset"] = "⊂",
+        // Set-builder's bar: U+2223 DIVIDES, the relation, not a plain |.
+        ["mid"] = "∣",
         ["cup"] = "∪", ["cap"] = "∩",
         // Arithmetic operators (\cdot / \times are also lexer-mapped to *).
         ["div"] = "÷", ["cdot"] = "·",
@@ -317,6 +645,9 @@ public sealed class BoxBuildingVisitor : IVisitor<Func<BoxStyle, Box>>
         // — laying out ¹⁴₆C with both scripts pre-attached to C, the
         // chemistry convention.
         ["null"] = "",
+        // The empty operand MarkdownMacros.SupplyMissingOperands adds where an
+        // operator has none on a side, drawn as nothing, like null.
+        ["nulloperand"] = "",
         // LaTeX spacing macros. Inside a box-rendered formula these become
         // invisible kerns rather than literal spaces — the layout system
         // already spaces atoms appropriately; just keep the glyph empty.
@@ -330,17 +661,35 @@ public sealed class BoxBuildingVisitor : IVisitor<Func<BoxStyle, Box>>
     };
 
     /// <summary>
-    /// Commands that take their <c>_</c>/<c>^</c> as below/above limits in
-    /// display style (the LimitsBox rendering) rather than as right-of
-    /// scripts. Big operators (∑ ∏ ∫ ∮ ⋃ ⋂) plus the limit-style functions
-    /// (lim sup inf max min etc.).
+    /// The symbol big operators (∑ ∏ ∫ ∮ ⋃ ⋂): drawn at 1.5 times the body
+    /// size, as TeX's display style draws them, with their <c>_</c>/<c>^</c>
+    /// as below/above limits (the LimitsBox rendering) rather than as
+    /// right-of scripts. The named ones that take limits (<c>\lim</c>,
+    /// <c>\max</c>, ...) are <see cref="MarkdownMacros.LimitOperatorNames"/>,
+    /// at the body size.
     /// </summary>
-    private static readonly HashSet<string> LimitOps = new(System.StringComparer.Ordinal)
+    private static readonly HashSet<string> BigOperators = new(System.StringComparer.Ordinal)
     {
         "sum", "prod", "int", "oint", "bigcup", "bigcap",
-        "lim", "limsup", "liminf", "max", "min", "sup", "inf",
-        "argmax", "argmin", "det", "gcd",
     };
+
+    /// <summary>
+    /// A box set as one atom of a class the box itself does not show: an
+    /// operator name, which is an Op, punctuation with its own space after
+    /// it, or a braced group, an Ord. It draws and measures exactly as the
+    /// box it wraps.
+    /// </summary>
+    private sealed class AtomBox(Box inner, AtomClass atomClass) : Box
+    {
+        public AtomClass Class => atomClass;
+
+        public override float Width => inner.Width;
+        public override float Height => inner.Height;
+        public override float Depth => inner.Depth;
+
+        public override void Draw(RgbaImageRenderer renderer, float penX, float baselineY, BoxStyle style)
+            => inner.Draw(renderer, penX, baselineY, style);
+    }
 
     /// <summary>
     /// Transient marker box: a big operator that hasn't yet absorbed its
@@ -390,11 +739,15 @@ public sealed class BoxBuildingVisitor : IVisitor<Func<BoxStyle, Box>>
 
     /// <summary>
     /// Two different delimiters around content, for the half-open intervals
-    /// <c>[a, b)</c> and <c>(a, b]</c>. Laid out like <see cref="BracketBox"/>'s
-    /// MATH-driven path: each side is a <see cref="StretchyVerticalBox"/> sized
-    /// to the content's extent, centred on the math axis, with the same 0.15 em
-    /// of padding either side of the content. A font with no MATH variant for
-    /// either codepoint gets the plain glyphs, unstretched.
+    /// <c>[a, b)</c> and <c>(a, b]</c> and the named pairs. Laid out like
+    /// <see cref="BracketBox"/>'s MATH-driven path and sized by the same rule:
+    /// the pair asks for <see cref="BracketBox.DelimiterRequest"/> (twice the
+    /// content's larger reach from the math axis), may fall short of it by
+    /// TeX's shortfall, and is drawn at one height
+    /// (<see cref="StretchyVerticalBox.DelimiterPair"/>), each side centred on
+    /// the math axis, with the same 0.15 em of padding either side of the
+    /// content. A font with no MATH variant for either codepoint gets the
+    /// plain glyphs, unstretched.
     /// </summary>
     private sealed class DelimiterPairBox : Box
     {
@@ -407,8 +760,7 @@ public sealed class BoxBuildingVisitor : IVisitor<Func<BoxStyle, Box>>
         {
             _inner = inner;
             _padding = style.FontSize * 0.15f;
-            var left = new StretchyVerticalBox(open, inner.TotalHeight, style);
-            var right = new StretchyVerticalBox(close, inner.TotalHeight, style);
+            var (left, right) = StretchyVerticalBox.DelimiterPair(open, close, BracketBox.DelimiterRequest(inner, style), style);
             if (left.IsAvailable && right.IsAvailable)
             {
                 _left = left;
