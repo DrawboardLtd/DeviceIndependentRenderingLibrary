@@ -9,6 +9,143 @@ this file disagrees with. Bump it there and add the entry here, in the same comm
 Breaking changes carry their migration steps in [MIGRATION.md](MIGRATION.md); this file says what
 changed and why.
 
+## 11.37
+
+SharpAstro.Fonts moves from 1.13 to 1.15, which brings SharpAstro.Png 3.23.
+SharpAstro.Fonts.Shaping moves with it, to 1.15, since the two always ship the same number.
+
+- **A colour-emoji glyph stored as a sub-byte PNG now draws.** Noto Color Emoji's U+1F6D1 is a 4-bit indexed PNG.
+  The old SharpAstro.Png could not decode it, so `ManagedFontRasterizer.Render` had no colour bitmap and fell back to
+  the outline.
+- **A glyph with no outline draws as nothing, not an exception.** The outline render of a bitmap-only font (CBDT and
+  nothing else) threw `NotSupportedException`, which took down the whole frame (pilot's GUI on Linux, 2026-10-25).
+  SharpAstro.Fonts 1.15 renders it empty.
+
+## 11.36
+
+**A `WithScroll` stack's interactive scrollbar takes thumb drags and track clicks (#150).** `ListScrollController.HandleInput`
+always did the thumb drag and the track paging, but for a layout-declared scroll `InputRouter` forwarded only the wheel
+(through `ScrollTargetAt`), so a press on the bar, the moves and the release never reached the controller: the bar was drawn
+and dead, unless a widget forwarded input by hand. The painter now registers the bar's column as a press region over the
+rows (after them, so it wins the hit test) for a controller whose `Mode` is `ScrollBarMode.Interactive` and which overflows,
+and a press there returns a `DragCapture` that feeds the press, each move and the release to `HandleInput`: the thumb drags
+proportionally, goes on dragging past the bar's edge, and a click on the track pages by a viewport. `Decorative` and `None`
+register nothing, so the row under the bar keeps the press. Additive: `ListScrollController.InteractiveScrollBarRect` (the
+column, or null) and `BeginScrollBarPress(PointerPress)` (the press entry, null when it missed). Pinned by
+`LayoutScrollBarDragTests`.
+
+## 11.35
+
+**A wheel notch over a scroll stack never moves more than a third of its viewport.** The layout engine states the
+controller's `LineExtentPx` (what one step of `WheelStepAtoms` moves) as the mean pitch of the stack's rows, which for a
+stack with one tall child (an `Overlay`, a `Wrap`) is the whole content: a notch moved `WheelStepAtoms` times the content
+and one click jumped from the top to the bottom (#146). The engine now caps that pitch at the viewport's main extent /
+(`WheelStepAtoms` * 3), so such a stack scrolls by readable lines, while a list of ordinary rows, whose pitch is well
+under the cap, is unchanged. A viewport shorter than three notch-sized rows now scrolls less than `WheelStepAtoms` rows a
+notch, since three rows would exceed a third of it. Pinned by
+`LayoutScrollTests.ANotchOverOneTallChildNeverMovesMoreThanAThirdOfTheViewport` and
+`AListOfOrdinaryRowsInATallViewportStillMovesThreeRowsANotch`.
+
+## 11.34
+
+**A table's columns can be resized by dragging the divider between two titles (#144).** `TableHeader` / `TableRow` gave
+every consumer a header and rows that agree on their widths, and no way for the reader to change them. The widths now
+live in a new consumer-kept `TableColumnWidths`, handed to both through new overloads
+(`TableHeader(columns, sort, onSort, style, widths, scale, fontSize, hitPrefix)` and `TableRow(columns, cells, style,
+widths)`), so a title and its values read one number. The header lays a second row of empty cells and gap-wide dividers
+over itself, so each divider registers after the cells and wins its few units: a `Pressable` with a `DragCapture` and
+`CursorKind.ResizeEW`, named `"{hitPrefix}divider:{i}"`. The drag is relative to the press, converted to design units by the
+`DesignScale`, and applied to the widths AT the press on every move, so it does not accumulate. Between two fixed columns
+one grows by what the other loses; beside a star column only the fixed side moves and the star stays the one that takes the
+slack; neither fixed column goes below its minimum (`TableColumnWidths.DefaultMinWidth`, or an init-only
+`TableColumn.MinWidth`). The rule is the pure `TableColumnWidths.Resolve`. `Save()` / `Restore()` / `From()` carry the widths
+as the plain record `TableColumnWidths.Saved`, tolerant of a column count that changed since it was saved. A style with no
+`Gap` has no room for a divider and gets none.
+
+**A double-click on a divider fits the column on its left.** `TableColumnWidths.FitWidth` (`Func<int, float?>`, settable, null by
+default) is the consumer's answer to "how wide must column `i` be to show its widest cell"; the consumer knows its rows and the
+header does not, so it must be cheap (typically a cached widest value). The divider declares the fit as its `DoubleClickable`, and
+its press handler declines a second press while a fit applies, so the router gives that press to the double-click and the first
+press still drags. Only the fixed column on the left is sized, to `max(minimum, FitWidth(i))`: its neighbour keeps its width and a
+star takes the difference. A star column is never fitted (it would turn fixed), so the divider on its right does nothing and drags
+as before; with no callback, or an answer of null, a double-click changes nothing. Pinned by
+`DoubleClickingADivider_FitsTheFixedColumnOnItsLeft_HeaderAndRowsTogether`, `ADoubleClickFit_NeverGoesBelowTheMinimum_AndIgnoresAnUnknownAnswer`,
+`WithoutAFitCallback_ADoubleClickChangesNothing_AndTheSecondPressStillDrags` and
+`ADoubleClickOnTheDividerRightOfAStarColumn_NeverTurnsTheStarFixed_AndTheDragStillWorks`.
+
+**Additive.** The old `TableHeader` and `TableRow` overloads keep their signatures and render exactly as before; a table
+built without a widths object is unchanged, and `TableColumn` gains an init-only property, not a constructor parameter.
+Pinned by `LayoutDataViewsTests`: `DraggingTheDividerBetweenTwoFixedColumns_WidensOneAndNarrowsItsNeighbour_HeaderAndRowsTogether`,
+`TheDragIsMeasuredFromThePress_NotAccumulatedAcrossMoves`, `TheDragIsConvertedToDesignUnits_ByTheScale`,
+`DraggingBesideAStarColumn_KeepsTheStarAStar_AndResizesOnlyTheFixedNeighbour`,
+`NoColumnGoesBelowItsMinimum_HoweverFarTheDragGoes`, `TheDividerShowsTheResizeCursor_AndTheDragKeepsIt`,
+`WidthsSavedToARecordAndRestoredIntoANewObject_LayOutTheSame` and `TheOldTableHeaderAndTableRowSignaturesStillExist`.
+
+## 11.33
+
+**The mouse's side buttons: `MouseButton.Back` and `MouseButton.Forward`, which never click a region.** The enum stopped
+at Right, so a host had no way to say "back" or "forward", and the router never looked at the button anyway (only
+Right + `OnContextMenu`), so whatever button arrived clicked whatever the pointer rested on. `Back = 3` and `Forward = 4`
+(SDL's X1/X2, the browser's buttons 3/4) are new values; Left, Middle, Right and None keep theirs. `InputRouter` now sends
+a side press and a side release straight to `Unhandled`, where the app navigates: no region dispatch (`OnClick`,
+`OnDoubleClick`, `OnPress`, `Opens`, a field press), no drag capture, no field blur, and a side release never ends a drag
+another button began. Additive -- enum values only, no constructor or signature change. SdlVulkan.Renderer maps X1/X2 onto
+these in its own issue. Pinned by `InputEventCompatibilityTests.MouseButtonNoneDidNotTakeZeroFromLeft` and the
+side-button tests in `InputRouterTests`.
+
+## 11.32
+
+**Nothing under an open popover shows its cursor through it.** A region stating no cursor is transparent to the cursor
+lookup, and a popover's backdrop stated none, so whatever lay under the popover answered for it: a slider under the
+viewer's toolbar menu showed its own cursor over the menu. The backdrop of `Layout.Builder.Popover` (and so of every
+`Dropdown`) now states the ordinary arrow (`CursorKind.Default`); the popover's content registers after it, so its own
+cursors still win. Pinned by `PopoverPointerClaimTests.NothingUnderAnOpenPopoverShowsItsCursorThroughIt`.
+
+## 11.31
+
+**Under an open popover only its own content lights.** The pointer claim (11.14) was read as "no claim, or the pointer
+inside the claim", which is true for every node under that point, so whatever lay under the popover lit where the
+pointer was over it: a file row under a toolbar menu lit, and the viewer's revealed full name for it, painted last, covered
+the menu's item. A declared node now lights under a claim only when it is painted inside the claimant's content
+(`BgHover`), and `PointerHovers` / `HoverAllowedAt`, which hand-painted chrome asks and which is never a popover's
+content, answer false while a popover claims the pointer, wherever the point is. No signature changed; a consumer whose
+chrome lit under a popover simply stops. Pinned by `PopoverPointerClaimTests.WithThePointerOverThePopoverOnlyItsOwnContentLights`.
+
+## 11.30
+
+**A Markdown document as a layout tree** (`Layout.Builder.Markdown(source, MarkdownStyle)`, or already-parsed blocks).
+Headings, paragraphs, lists, fenced code, tables and thematic breaks, with `**strong**`, `*emphasis*`, `` `code` `` and
+links set apart by the style's colours; a link is clickable when the style says how to open one (`OnLink`). The parser
+is `DIR.Lib.Markdown`'s, the one Console.Lib's terminal renderer reads, but until now nothing turned its blocks into a
+tree, so a GUI or a cell surface showing Markdown drew it as raw text. A text leaf is one line, so a paragraph is its
+words in a `WrapH`, a space apart, and follows its width on every surface; a word whose parts are styled differently
+(`**this**,`) is one unit, so its punctuation never wraps away. Additive.
+
+## 11.29
+
+**A tail-following list says whether it is following, and can be sent back to its end.** `ListScrollController.IsFollowingEnd`
+is true for a `ScrollAnchor.Bottom` list while it is pinned to its tail, false once the reader scrolls up into history;
+`ScrollToEnd()` scrolls to the end and pins it again, so the next appended rows are followed. A log's "jump to end" is
+both together: shown while `IsFollowingEnd` is false, `ScrollToEnd()` when pressed. Before, the pin was private, so a
+host could only guess it from `Offset` against `MaxOffset`, and getting it back meant replacing the controller (a new
+one pins on its first extent). Additive.
+
+## 11.28
+
+**A floating palette can declare its own gestures** (`FloatingPalette.Build` taking a `DesignScale`), so a host routes nothing
+by hand. The grip is `Pressable`: the press begins the drag where it landed and returns a `DragCapture`, so the moves and
+the release reach the palette through the host's `InputRouter` and never through its own pointer handlers. The overload
+taking `onGripPress` gave the grip a click with no position, so each host remembered the last move, called `DragTo` from
+its move handler and `ReleaseGrip` from its release, and kept a palette drag from also panning what was behind it
+(TianWen's sky map did all three, in two hosts). A double press collapses by the platform's click count
+(`DoubleClickable`), not by `PressGrip`'s own timing, through the new `FloatingPaletteState.BeginGripDrag` and
+`ToggleCollapsed`; where `AllowCollapse` is false the second press drags like the first. And the panel claims the
+pointer over its padding and the gaps between rows (a region with no handler and the arrow cursor,
+`gripAction + ":Panel"`), so a press there is swallowed and a host's `HitTest` under the panel answers it; a host that
+acts on every `ButtonHit` it hit-tests ignores that one.
+`onChanged` asks a host for a frame; `onReleased` is where a docking host snaps (`SnapOnRelease`). Additive: the
+`onGripPress` overload and `PressGrip` are unchanged.
+
 ## 11.27
 
 **`RgbaImage(width, height, pixels)` wraps an existing RGBA8 buffer without copying it.** The image takes ownership

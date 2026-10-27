@@ -107,6 +107,100 @@ public class PopoverPointerClaimTests
         widget.Hovers(new RectF32(100f, 100f, 10f, 10f)).ShouldBeFalse("the pointer is not there");
     }
 
+    /// <summary>A pane painted first, the whole surface, and a popover over it whose content lights on hover, as a file
+    /// list sits under a toolbar menu.</summary>
+    private sealed class PaneUnderPopoverWidget(Renderer<RgbaImage> renderer) : PixelWidgetBase<RgbaImage>(renderer)
+    {
+        public static readonly RectF32 Pane = new(0f, 0f, 200f, 200f);
+
+        public void Paint(PopoverState popover, (float X, float Y) pointer)
+        {
+            Pointer = pointer;
+            BeginFrame();
+            RenderLayout(Layout.Builder.Spacer().Stretch().Bg(Rest).BgHover(Hot), Pane, fontPath: "stub.ttf", scale: DesignScale.One);
+            RenderLayout(Layout.Builder.Popover(new RectF32(60f, 40f, 20f, 10f),
+                    Layout.Builder.Box(30f, 30f).Bg(Rest).BgHover(Hot), popover),
+                Pane, fontPath: "stub.ttf", scale: DesignScale.One);
+        }
+
+        public bool Hovers(RectF32 rect) => PointerHovers(rect);
+    }
+
+    private static RGBAColor32 PixelAt(DeclarationStubRenderer renderer, float x, float y)
+    {
+        var img = renderer.Surface;
+        var i = (((int)y * img.Width) + (int)x) * 4;
+        return new RGBAColor32(img.Pixels[i], img.Pixels[i + 1], img.Pixels[i + 2], img.Pixels[i + 3]);
+    }
+
+    /// <summary>
+    /// With the pointer OVER the popover, what is painted under it does not light: it is covered there. The claim used to
+    /// be read as "the pointer inside the claim", true for every node under that point, so the viewer's file row under its
+    /// stretch menu lit and its revealed name covered a menu item (2026-10-23). The popover's own content still lights.
+    /// </summary>
+    [Fact]
+    public void WithThePointerOverThePopoverOnlyItsOwnContentLights()
+    {
+        var renderer = new DeclarationStubRenderer(200, 200);
+        var widget = new PaneUnderPopoverWidget(renderer);
+        var popover = new PopoverState();
+        popover.Open();
+        widget.Paint(popover, (5f, 5f));
+        var claim = widget.Ui.PointerClaim ?? throw new InvalidOperationException("the open popover claimed nothing");
+        var overThePopover = (claim.X + (claim.Width / 2f), claim.Y + (claim.Height / 2f));
+
+        widget.Paint(popover, overThePopover);
+        widget.Paint(popover, overThePopover);
+
+        PixelAt(renderer, 5f, 5f).ShouldBe(Rest, "the pane under the popover lit where the popover covers it");
+        PixelAt(renderer, overThePopover.Item1, overThePopover.Item2).ShouldBe(Hot, "the popover's own content is what is pointed at");
+        widget.Hovers(PaneUnderPopoverWidget.Pane).ShouldBeFalse("hand-painted chrome under the popover answers as the pane does");
+    }
+
+    /// <summary>A pane that states a cursor painted first, the whole surface, and a popover over it whose content holds
+    /// one node stating a cursor of its own and one stating none.</summary>
+    private sealed class CursorUnderPopoverWidget(Renderer<RgbaImage> renderer) : PixelWidgetBase<RgbaImage>(renderer)
+    {
+        public void Paint(PopoverState popover)
+        {
+            BeginFrame();
+            RenderLayout(Layout.Builder.Spacer().Stretch().Clickable(new HitResult.ChromeHit(), cursor: CursorKind.ResizeEW),
+                PaneUnderPopoverWidget.Pane, fontPath: "stub.ttf", scale: DesignScale.One);
+            RenderLayout(Layout.Builder.Popover(new RectF32(60f, 40f, 20f, 10f),
+                    Layout.Builder.VStack(
+                        Layout.Builder.Box(30f, 15f).Clickable(new HitResult.ChromeHit(), cursor: CursorKind.Pointer),
+                        Layout.Builder.Box(30f, 15f)),
+                    popover),
+                PaneUnderPopoverWidget.Pane, fontPath: "stub.ttf", scale: DesignScale.One);
+        }
+    }
+
+    /// <summary>
+    /// What is under an open popover does not show its cursor through it, over the popover's content or over its backdrop:
+    /// a region with no cursor is transparent to the lookup, so a slider's cursor showed through the viewer's toolbar menu
+    /// (2026-10-23). The backdrop states the arrow; the content's own cursors, registered after it, still win.
+    /// </summary>
+    [Fact]
+    public void NothingUnderAnOpenPopoverShowsItsCursorThroughIt()
+    {
+        var widget = new CursorUnderPopoverWidget(new DeclarationStubRenderer(200, 200));
+        var popover = new PopoverState();
+        popover.Open();
+        widget.Paint(popover);
+        widget.Paint(popover);
+        var content = widget.Ui.PointerClaim ?? throw new InvalidOperationException("the open popover claimed nothing");
+        var midX = content.X + (content.Width / 2f);
+
+        widget.HitTestCursor(midX, content.Y + 4f).ShouldBe(CursorKind.Pointer, "the content's own cursor wins");
+        widget.HitTestCursor(midX, content.Y + content.Height - 4f).ShouldBe(CursorKind.Default,
+            "content stating no cursor shows the arrow, not the pane's cursor beneath");
+        widget.HitTestCursor(5f, 190f).ShouldBe(CursorKind.Default, "the backdrop shows the arrow, not the pane's cursor beneath");
+
+        popover.Close();
+        widget.Paint(popover);
+        widget.HitTestCursor(5f, 190f).ShouldBe(CursorKind.ResizeEW, "with the popover closed the pane's cursor is back");
+    }
+
     [Fact]
     public void WithNoPopoverTheButtonLightsAsEver()
     {
