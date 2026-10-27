@@ -162,7 +162,9 @@ public sealed class ListScrollController
     /// How long a row is, in surface units along the scroll axis, on a list that counts in surface units
     /// rather than rows: what one step of <see cref="WheelStepAtoms"/> moves there. Zero, the default,
     /// is one atom. Stated by the layout engine for a stack declared <see cref="Layout.Node.WithScroll"/>
-    /// (the mean pitch of its rows), and harmless to state by hand.
+    /// (the mean pitch of its rows, capped so that one notch never moves more than a third of the
+    /// viewport: a stack with one tall child has a mean pitch of the whole content), and harmless to state
+    /// by hand.
     /// </summary>
     /// <remarks>
     /// Without it a wheel notch over such a list moved three PIXELS: <see cref="WheelStepAtoms"/> counts
@@ -405,6 +407,37 @@ public sealed class ListScrollController
     }
 
     /// <summary>
+    /// Whether a <see cref="ScrollAnchor.Bottom"/> list is following its tail: true from the start, false once the
+    /// user scrolls up into history, and true again back at the end (or after <see cref="ScrollToEnd"/>). What a log
+    /// needs to know to offer "jump to end" only while it would do something. Always false for a
+    /// <see cref="ScrollAnchor.Top"/> list.
+    /// </summary>
+    public bool IsFollowingEnd => Anchor == ScrollAnchor.Bottom && (_pinnedToEnd || !_positioned);
+
+    /// <summary>
+    /// Scroll to the end, and for a <see cref="ScrollAnchor.Bottom"/> list follow it again: a log's "jump to end".
+    /// Called before the list's extent is known, the pin alone is set, and the next <see cref="SetExtent"/> lands at
+    /// the tail.
+    /// </summary>
+    public void ScrollToEnd()
+    {
+        var before = _offset;
+        _offset = MaxOffset;
+        if (Anchor == ScrollAnchor.Bottom && !_pinnedToEnd)
+        {
+            _pinnedToEnd = true;
+            if (_offset == before)
+            {
+                // Already at the end with the pin released (a jump to a row that was the last): nothing moved, but
+                // following did change.
+                Changed?.Invoke();
+                return;
+            }
+        }
+        RaiseIfMoved(before);
+    }
+
+    /// <summary>
     /// Scroll <paramref name="atom"/> into view with an optional margin, minimally (a no-op when it is
     /// already visible, so mouse scrolling and keyboard selection coexist without snapping to a center).
     /// </summary>
@@ -514,6 +547,50 @@ public sealed class ListScrollController
             fillRect(trackStart, colY, trackExtent, width, track ?? TrackColor);
             fillRect(thumbStart, colY + 1f, thumbExtent, width - 2f, thumb ?? ThumbColor);
         }
+    }
+
+    /// <summary>
+    /// Where the scrollbar column sits, in surface units, for a painter that registers it as a press region;
+    /// null when <see cref="Mode"/> is not <see cref="ScrollBarMode.Interactive"/> or there is nothing to
+    /// scroll. The same column <see cref="DrawScrollBar"/> fills, so what is drawn is what takes the press.
+    /// </summary>
+    public RectF32? InteractiveScrollBarRect
+    {
+        get
+        {
+            if (Mode != ScrollBarMode.Interactive || !HasScrollBar)
+            {
+                return null;
+            }
+
+            var width = ScrollBarWidthPx;
+            return Axis == ScrollAxis.Vertical
+                ? new RectF32(_viewport.Right - width, _viewport.Y, width, _viewport.Height)
+                : new RectF32(_viewport.X, _viewport.Bottom - width, _viewport.Width, width);
+        }
+    }
+
+    /// <summary>
+    /// The press half of <see cref="HandleInput"/> for a host that gets presses as a
+    /// <see cref="DragCapture"/> rather than as raw events (<see cref="ClickableRegion.OnPress"/>): a left
+    /// press on the bar column arms the thumb drag or pages the track, and the returned capture feeds the
+    /// moves and the release back to <see cref="HandleInput"/>, so the drag goes on past the bar's edge.
+    /// Null when the press is not a left press on the interactive bar, leaving it to whatever is beneath.
+    /// </summary>
+    public DragCapture? BeginScrollBarPress(PointerPress press)
+    {
+        if (press.Button != MouseButton.Left
+            || Mode != ScrollBarMode.Interactive
+            || MaxOffset <= 0f
+            || !PointInScrollBarColumn(press.X, press.Y)
+            || !HandleInput(new InputEvent.MouseDown(press.X, press.Y, press.Button, press.Modifiers, press.Clicks)))
+        {
+            return null;
+        }
+
+        return new DragCapture(
+            move => HandleInput(new InputEvent.MouseMove(move.X, move.Y, move.Button, move.Modifiers)),
+            release => HandleInput(new InputEvent.MouseUp(release.X, release.Y, press.Button, release.Modifiers)));
     }
 
     private void ApplyScrollDelta(float delta)
