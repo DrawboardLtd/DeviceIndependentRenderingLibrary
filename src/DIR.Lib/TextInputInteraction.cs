@@ -110,7 +110,7 @@ public static class TextInputInteraction
             return true;
         }
 
-        var textKey = key.ToTextInputKey(modifiers);
+        var textKey = KeyFor(activeInput, key, modifiers);
 
         // Tab cycling through the fields the surface painted.
         if (key == InputKey.Tab)
@@ -143,7 +143,7 @@ public static class TextInputInteraction
             var clipboardText = ctx.GetClipboardText?.Invoke();
             if (!string.IsNullOrEmpty(clipboardText))
             {
-                activeInput.InsertText(clipboardText);
+                activeInput.InsertPastedText(clipboardText);
                 activeInput.OnTextChanged?.Invoke(activeInput.Text);
             }
             ctx.RequestRedraw();
@@ -184,9 +184,13 @@ public static class TextInputInteraction
         // following, not a different motion. See TextInputState.HandleKey for which keys honour it.
         var extend = (modifiers & InputModifier.Shift) != 0;
 
+        var textBefore = activeInput.Text;
         if (textKey.HasValue && activeInput.HandleKey(textKey.Value, extend))
         {
-            if (textKey.Value is TextInputKey.Backspace or TextInputKey.Delete or TextInputKey.WordBackspace)
+            // The three delete keys always reported, even at the edge of the text where nothing was removed;
+            // a multi-line field also changes its text on Enter, undo and redo, so any change reports.
+            if (textKey.Value is TextInputKey.Backspace or TextInputKey.Delete or TextInputKey.WordBackspace
+                || !ReferenceEquals(activeInput.Text, textBefore))
             {
                 activeInput.OnTextChanged?.Invoke(activeInput.Text);
             }
@@ -255,6 +259,10 @@ public static class TextInputInteraction
 
         switch (clicks)
         {
+            case >= 3 when field is TextEditorState editor:
+                // A box of lines selects the line a third click is on; everything is Ctrl+A.
+                editor.SelectLineAt(caretIndex);
+                break;
             case >= 3:
                 field.SelectAll();
                 break;
@@ -274,6 +282,14 @@ public static class TextInputInteraction
     /// <param name="Focus">Who has the keyboard; the one way to move it.</param>
     /// <param name="RequestRedraw">Marks the surface dirty after the caret or selection moved.</param>
     public readonly record struct PointerContext(TextInputFocus Focus, Action RequestRedraw);
+
+    /// <summary>
+    /// The key <paramref name="field"/> is offered for a chord. An editor maps its own (the keys a multi-line
+    /// box adds, and its <see cref="TextEditorState.CommitChord"/>); a single-line field is offered
+    /// <see cref="InputKeyExtensions.ToTextInputKey"/>'s mapping, as it always was.
+    /// </summary>
+    private static TextInputKey? KeyFor(TextInputState field, InputKey key, InputModifier modifiers)
+        => field is TextEditorState editor ? editor.KeyFor(key, modifiers) : key.ToTextInputKey(modifiers);
 
     /// <summary>Reference position of <paramref name="input"/>, since <c>IReadOnlyList</c> has no IndexOf.</summary>
     private static int IndexOf(IReadOnlyList<TextInputState> inputs, TextInputState input)

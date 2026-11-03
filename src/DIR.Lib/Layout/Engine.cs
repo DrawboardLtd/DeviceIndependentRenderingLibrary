@@ -59,8 +59,20 @@ public static class Engine
     public static Size<T> Measure<T>(Node node, Size<T> available, IMeasureContext<T> ctx)
         where T : INumber<T>
     {
+        // Inner padding is measured as arrange lays it out: the children get the room inside it. They were measured
+        // in the whole of it, so wrapped text inside a padded box measured with twice the padding more width than it
+        // was arranged in, came out a line short, and ran out of its box (pilot's flight page cut its last report).
+        var padded = node is not Node.Dock and not Node.Split && (node.Padding != 0f || node.PadDown != 0f);
+        var padX = padded ? ctx.ToSurfaceX(node.Padding) : T.Zero;
+        var padY = padded ? ctx.ToSurfaceY(node.PadDown) : T.Zero;
+        if (padded)
+        {
+            available = new Size<T>(T.Max(T.Zero, available.Width - padX - padX), T.Max(T.Zero, available.Height - padY - padY));
+        }
+
         var intrinsic = node switch
         {
+            Node.Leaf { Content: Content.TextEditor editor } => MeasureTextEditor(editor, node, available, ctx),
             Node.Leaf leaf => MeasureContent(leaf.Content, ctx),
             Node.Stack stack => MeasureStack(stack, available, ctx),
             Node.Grid grid => MeasureGrid(grid, available, ctx),
@@ -79,12 +91,10 @@ public static class Engine
         };
 
         // Inner padding grows the intrinsic box (except a Dock / Split, which are already "fill").
-        if (node is not Node.Dock and not Node.Split && (node.Padding != 0f || node.PadDown != 0f))
+        // One design-unit scalar per axis, two surface extents: on an anisotropic surface the same inset is a
+        // different number of units across than it is down.
+        if (padded)
         {
-            // One design-unit scalar per axis, two surface extents: on an anisotropic surface the same
-            // inset is a different number of units across than it is down.
-            var padX = ctx.ToSurfaceX(node.Padding);
-            var padY = ctx.ToSurfaceY(node.PadDown);
             intrinsic = new Size<T>(intrinsic.Width + padX + padX, intrinsic.Height + padY + padY);
         }
 
@@ -403,9 +413,10 @@ public static class Engine
         Array.Fill(included, true);
         var includedCount = n;
         var mains = new T[n];
+        var measured = new Size<T>?[n];
         while (true)
         {
-            ResolveStackMains(children, included, includedCount, axis, layoutMain, gap, availSize, ctx, mains);
+            ResolveStackMains(children, included, includedCount, axis, layoutMain, gap, availSize, ctx, mains, measured);
 
             var anyCollapsed = false;
             for (var i = 0; i < n; i++)
@@ -507,8 +518,12 @@ public static class Engine
             {
                 SizeKind.Fixed => ToSurfaceOn(ctx, crossSizing.Value, CrossAxis(axis)),
                 SizeKind.Star when !crossSizing.UpToContent => crossAvail,     // stretch to fill cross axis
-                // Auto, and a content-capped Star: its content, never more than the axis holds.
-                _ => Min(crossAvail, CrossOf(axis, Measure(children[i], availSize, ctx))),
+                // Auto, and a content-capped Star: its content at the main extent it was given, never more than the
+                // axis holds. Measured at the stack's whole main, a wrapping text asked for fewer lines than it takes.
+                // The resolve already measured it at the whole main; when that is the main it was given, that is the answer.
+                _ => Min(crossAvail, CrossOf(axis, measured[i] is { } known && MainOf(axis, known) == mains[i]
+                    ? known
+                    : Measure(children[i], Compose(axis, mains[i], crossAvail), ctx))),
             };
             cross = Clamp(cross, crossSizing, ctx, CrossAxis(axis));
 
@@ -543,9 +558,13 @@ public static class Engine
     /// clamps honoured (<see cref="DistributeStars"/>). Content-capped Stars
     /// (<see cref="Sizing.UpToContent"/>) are served first, out of what the plain Stars' floors leave
     /// (<see cref="DistributeContentCappedStars"/>), and the plain Stars share whatever they do not take.
+    /// When <paramref name="measured"/> is given, the measure taken at <paramref name="availSize"/> of each Auto and
+    /// content-capped child is left in it, so a caller that needs that measure again reads it instead of repeating it:
+    /// a repeat recurses into the child's whole subtree, and nested stacks made that exponential.
     /// </summary>
     private static void ResolveStackMains<T>(ImmutableArray<Node> children, bool[] included, int includedCount,
-        Axis axis, T mainAvail, T gap, Size<T> availSize, IMeasureContext<T> ctx, T[] mains) where T : INumber<T>
+        Axis axis, T mainAvail, T gap, Size<T> availSize, IMeasureContext<T> ctx, T[] mains,
+        Size<T>?[]? measured = null) where T : INumber<T>
     {
         var n = children.Length;
         var starIndices = new List<int>();
@@ -568,7 +587,13 @@ public static class Engine
                 // Its cap is what an Auto child here would get: the measure, Min/Max clamps included.
                 (cappedIndices ??= []).Add(i);
                 (cappedWeights ??= []).Add(sizing.Value);
-                (cappedContent ??= []).Add(Clamp(MainOf(axis, Measure(children[i], availSize, ctx)), sizing, ctx, axis));
+                var contentSize = Measure(children[i], availSize, ctx);
+                if (measured is not null)
+                {
+                    measured[i] = contentSize;
+                }
+
+                (cappedContent ??= []).Add(Clamp(MainOf(axis, contentSize), sizing, ctx, axis));
                 continue;
             }
 
@@ -579,9 +604,22 @@ public static class Engine
                 continue;
             }
 
-            var size = sizing.IsFixed
-                ? ToSurfaceOn(ctx, sizing.Value, axis)
-                : Clamp(MainOf(axis, Measure(children[i], availSize, ctx)), sizing, ctx, axis);
+            T size;
+            if (sizing.IsFixed)
+            {
+                size = ToSurfaceOn(ctx, sizing.Value, axis);
+            }
+            else
+            {
+                var autoSize = Measure(children[i], availSize, ctx);
+                if (measured is not null)
+                {
+                    measured[i] = autoSize;
+                }
+
+                size = Clamp(MainOf(axis, autoSize), sizing, ctx, axis);
+            }
+
             mains[i] = size;
             usedMain += size;
         }
@@ -997,6 +1035,52 @@ public static class Engine
         return new Size<T>(text.Width + insets, text.Height);
     }
 
+    /// <summary>
+    /// A multi-line editor's intrinsic size: the width a field has (room for its sample between the insets), and a
+    /// height of as many wrapped lines as the text takes at the width it is offered, within the state's min and
+    /// max, plus the vertical padding. Grow, then scroll.
+    /// <para>
+    /// The wrap width is the node's own when it is fixed, else the room <paramref name="available"/> offers -- the
+    /// best the measure pass knows before the parent has decided. A parent that then arranges the box narrower
+    /// than that wraps to more lines than were measured, and the box scrolls inside the height it was given
+    /// rather than overflowing it. An empty box measures its placeholder, so focusing it (which hides the
+    /// placeholder) does not change its height under the pointer.
+    /// </para>
+    /// </summary>
+    private static Size<T> MeasureTextEditor<T>(Content.TextEditor editor, Node node, Size<T> available, IMeasureContext<T> ctx)
+        where T : INumber<T>
+    {
+        var state = editor.State;
+        var fontSize = editor.FontSize;
+        var sample = ctx.MeasureText((editor.WidthSample ?? state.Placeholder).AsSpan(), fontSize);
+        // The paint insets by WHOLE pixels (the paddings are truncated there), so the measure truncates the same
+        // way: a fractional inset here wraps to a width the paint does not have, and the box comes out a line off.
+        var insetX = ctx.ToSurfaceX(TextEditorRenderer.HorizontalPadding(fontSize));
+        var insetY = ctx.ToSurfaceY(TextEditorRenderer.VerticalPadding(fontSize));
+        insetX = T.CreateChecked(MathF.Floor(float.CreateChecked(insetX))) * T.CreateChecked(2);
+        insetY = T.CreateChecked(MathF.Floor(float.CreateChecked(insetY))) * T.CreateChecked(2);
+
+        // One line is what the context says a line is tall; every line of the box is that tall.
+        var line = ctx.MeasureText("Ag".AsSpan(), fontSize).Height;
+        var lineHeight = float.CreateChecked(line);
+        var width = node.Width.IsFixed ? ctx.ToSurfaceX(node.Width.Value) : available.Width;
+        var wrapWidth = float.CreateChecked(width - insetX);
+
+        var text = state.Text.Length > 0 ? state.Text : state.Placeholder;
+        var lines = 1;
+        if (lineHeight > 0f)
+        {
+            lines = new TextEditorLayout(text, wrapWidth,
+                span => float.CreateChecked(ctx.MeasureText(span, fontSize).Width), lineHeight)
+                .VisibleLines(state.MinLines, state.MaxLines);
+        }
+
+        // Whole pixels tall, rounded up, so the paint's text area (the box less its integer paddings) holds every
+        // line the measure counted instead of coming up a fraction short and growing a scroll thumb.
+        var height = float.CreateChecked(T.CreateChecked(lines) * line + insetY);
+        return new Size<T>(sample.Width + insetX, T.CreateChecked(MathF.Ceiling(height)));
+    }
+
     private static Size<T> MeasureStack<T>(Node.Stack stack, Size<T> available, IMeasureContext<T> ctx)
         where T : INumber<T>
     {
@@ -1004,16 +1088,37 @@ public static class Engine
         var n = stack.Children.Length;
         var main = T.Zero;
         var cross = T.Zero;
+
+        // The main extent each child will be GIVEN at arrange, resolved as the arrange does, so a child's cross
+        // extent is measured at that and not at the stack's whole main. Measured at the whole, a wrapping text
+        // beside a fixed label in a row asked for the height of the lines it would take at the row's full width,
+        // fewer than it took in its column, and its last line was drawn over the row below (pilot's chat, SE1,
+        // 2026-10-28). Collapse thresholds are left out: a collapsed sibling only widens the others.
+        // Each child is measured once where it can be: the resolve measures Auto and content-capped children at the whole
+        // main (to learn their main), and that measure is kept; a child given exactly that main needs no second one.
+        var mains = new T[n];
+        var measured = new Size<T>?[n];
+        if (n > 0)
+        {
+            var included = new bool[n];
+            Array.Fill(included, true);
+            ResolveStackMains(stack.Children, included, n, axis, MainOf(axis, available),
+                ToSurfaceOn(ctx, stack.Gap, axis), available, ctx, mains, measured);
+        }
+
         for (var i = 0; i < n; i++)
         {
             var child = stack.Children[i];
-            var size = Measure(child, available, ctx);
+            var size = measured[i] is { } known && MainOf(axis, known) == mains[i]
+                ? known
+                : Measure(child, Compose(axis, mains[i], CrossOf(axis, available)), ctx);
+
             // Star main contributes nothing to the natural size — it only claims leftover at arrange time.
             // A content-capped Star does: its content is the size it asks for while there is room.
             var mainSizing = MainSizing(axis, child);
             if (!mainSizing.IsStar || mainSizing.UpToContent)
             {
-                main += MainOf(axis, size);
+                main += MainOf(axis, measured[i] ?? size);
             }
 
             cross = Max(cross, CrossOf(axis, size));
