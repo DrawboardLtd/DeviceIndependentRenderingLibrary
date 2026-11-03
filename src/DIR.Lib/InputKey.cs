@@ -79,6 +79,13 @@ public static class InputKeyExtensions
         /// travels beside the key as <c>extend</c> (see <see cref="TextInputState.HandleKey"/>). Folding it
         /// in would double the word half of this enum to say one thing twice.
         /// <para>
+        /// This is the single-line field's mapping and has not changed: Up, Down, the Page keys, undo/redo and
+        /// Ctrl+Home/End/Enter are not in it (Ctrl+Enter and Ctrl+Home/End read as the Enter, Home and End they
+        /// always did). The keys a multi-line editor adds are mapped by <see cref="TextEditorState"/>, which
+        /// <see cref="TextInputInteraction.HandleKey"/> asks for an editor, so a host that feeds this result
+        /// straight to <see cref="TextInputState.HandleKey"/> sees no difference.
+        /// </para>
+        /// <para>
         /// The Ctrl'd arrows are matched BEFORE their plain forms, since a <c>switch</c> arm without a
         /// guard would otherwise claim Ctrl+Left as an ordinary Left and step one character.
         /// </para>
