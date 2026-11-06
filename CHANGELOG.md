@@ -9,6 +9,50 @@ this file disagrees with. Bump it there and add the entry here, in the same comm
 Breaking changes carry their migration steps in [MIGRATION.md](MIGRATION.md); this file says what
 changed and why.
 
+## 11.45
+
+Layout: a wrap capped by `WithMaxLines` can end its last kept line with an ellipsis when the cap drops
+children (#155). `Wrap.Ellipsis` (init-only) turns it on and `WithMaxLines(int, bool)` is the new overload
+that sets it, so `WithMaxLines(n, ellipsis: true)` is the whole opt-in. The ellipsis fits within the wrap's
+width and behaves the same on pixel and cell measure contexts. `ArrangedNode.Truncated` (init-only) reports
+that an arranged wrap was cut, so a host adds hover text only when there is something hidden. The case is
+pilot's For-you cards, whose text is capped to a few lines and needs both.
+
+The default is unchanged: it is opt-in because a capped toolbar of text buttons must not get an ellipsis
+appended to its last visible button. Nothing is a binary break: the new members are init-only properties
+and a new overload, and no constructor or `Deconstruct` changed arity (`InputEventCompatibilityTests` still
+passes).
+
+## 11.44
+
+A scrolled stack reserves its scrollbar column (#161). A VStack or HStack declared `WithScroll` now
+arranges its children within the controller's content area (the viewport less the bar column, when the
+bar shows), as the virtual list does, so a Star-width row or a right-aligned leaf no longer ends under
+the bar. A stack that fits, or whose controller is `ScrollBarMode.None`, arranges as before, and trailing
+padding at least as wide as the bar needs no further reserve. Rows are still measured at the full cross
+extent and arranged at the narrower one. pilot can drop `TranscriptEntryView.ScrollGutter`.
+
+## 11.43
+
+- `PaletteColors.Backing` (DIR.Lib #182): an opt-in opaque backing drawn under the whole `FloatingPalette`
+  panel (grip and rows) at its own alpha, not faded, so content panning beneath it (a map's labels under a
+  LAYERS menu) is not drawn through it. The idle fade still dims the panel's own colours on top. It is an
+  init-only property, so the primary constructor is unchanged; null keeps today's translucent panel. The
+  panel's arranged rect and click regions are the same with or without it. Pilot sets it and drops its
+  'flights canvas' allow-list entry in `src/Pilot.Gui.Tests/TextOverlapAllowList.cs`.
+
+## 11.42
+
+Inspector: a timed-out multi-pump operation no longer holds its slot (#178). Before, a screenshot (or any
+stepped verb) that never finished timed out only on the client side; the core kept it in its slot, so every
+later operation of that kind was refused "already in progress" until the app restarted.
+`DebugInspectorCore.Pump` now owns the deadline: an exclusive or background operation still running past its
+`Timeout`, counted from when it started, is cancelled, its slot cleared and its command failed with
+"'<method>' did not finish within Ns". An operation implementing `IDisposable` is disposed when cancelled
+(`IDebugInspectorOperation` gains no member, so compiled operations keep working). The socket client waits a
+short grace past the deadline so the pump's error is the one it sees, and a command whose client has given up
+is reaped by the pump as well. New `TimeProvider` property (default `TimeProvider.System`) lets tests step time.
+
 ## 11.41
 
 SharpAstro.Fonts and SharpAstro.Fonts.Shaping 1.16: an OpenType font that carries a CFF but no `head` or
