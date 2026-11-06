@@ -340,6 +340,95 @@ public class LayoutScrollTests
         (row.X + row.Width).ShouldBe(ViewportW - ListScrollController.ScrollBarBaseWidthPx);
     }
 
+    /// <summary>Ten 20-unit words (the stub measures half the font size per character) in a wrap: exactly
+    /// one line at the full 200 units, two in the 194 left beside the 6-unit bar.</summary>
+    private static Layout.Node WordRow(int index)
+    {
+        var words = new Layout.Node[10];
+        for (var i = 0; i < words.Length; i++)
+        {
+            words[i] = Layout.Builder.Text("abcd", 10f);
+        }
+
+        return Layout.Builder.WrapH(words).Clickable(new HitResult.ListItemHit("rows", index), _ => { });
+    }
+
+    private static Layout.Node WordRows(ListScrollController scroll, int rows)
+        => Wrap(Layout.Builder.VStack(Enumerable.Range(0, rows).Select(WordRow).ToArray())
+            .WStar().HClamp(0f, ViewportH).WithScroll(scroll));
+
+    [Fact]
+    public void AWrappingRowBesideTheBarKeepsItsLinesInsideItsOwnHeight()
+    {
+        // 11.44 reserved the bar column at arrange only: the row was measured at the full width (one
+        // line), laid out beside the bar (two lines), and its second line was drawn over the next row.
+        var widget = new DeclarationWidget(new DeclarationStubRenderer(200, 200));
+        var scroll = new ListScrollController { Mode = ScrollBarMode.Interactive };
+        widget.Render(WordRows(scroll, 8), new RectF32(0, 0, ViewportW, 200));
+
+        scroll.MaxOffset.ShouldBeGreaterThan(0f);
+        var row0 = Row(widget, 0)!.Value.Bounds;
+        var row1 = Row(widget, 1)!.Value.Bounds;
+        var words = widget.GetCapturedLayout().Cast<Layout.ArrangedNode<float>>()
+            .Where(n => n.Node is Layout.Node.Leaf { Content: Layout.Content.Text })
+            .Take(10).Select(n => n.Bounds).ToList();
+
+        words.Max(w => w.Y + w.Height).ShouldBeLessThanOrEqualTo(row0.Y + row0.Height);
+        row1.Y.ShouldBeGreaterThanOrEqualTo(row0.Y + row0.Height);
+        (row0.X + row0.Width).ShouldBeLessThanOrEqualTo(ViewportW - ListScrollController.ScrollBarBaseWidthPx);
+    }
+
+    [Fact]
+    public void TheScrollExtentCountsTheLinesTheBarsReserveAdds()
+    {
+        // The same rows at the full width (no bar: ScrollBarMode.None) take one line each; beside the bar
+        // they take two, and the controller must scroll over the taller total, or the last row is cut off.
+        var (w1, none) = Fixture();
+        w1.Render(WordRows(none, 8), new RectF32(0, 0, ViewportW, 200));
+        var w2 = new DeclarationWidget(new DeclarationStubRenderer(200, 200));
+        var barred = new ListScrollController { Mode = ScrollBarMode.Interactive };
+        w2.Render(WordRows(barred, 8), new RectF32(0, 0, ViewportW, 200));
+
+        var oneLine = Row(w1, 0)!.Value.Bounds.Height;
+        Row(w2, 0)!.Value.Bounds.Height.ShouldBe(oneLine * 2f);
+        barred.MaxOffset.ShouldBeGreaterThan(none.MaxOffset);
+    }
+
+    [Fact]
+    public void ScrollingToTheEndOfRowsThatWrapBesideTheBarReachesTheEnd()
+    {
+        // 11.46 regression (#192): pass 1 of the arrange clamped the offset to its shorter MaxOffset (rows
+        // at the full width, one line each) and pass 2 raised MaxOffset without putting the offset back,
+        // so a list scrolled to its end was pulled short of it on the next frame.
+        var widget = new DeclarationWidget(new DeclarationStubRenderer(200, 200));
+        var scroll = new ListScrollController { Mode = ScrollBarMode.Interactive };
+        widget.Render(WordRows(scroll, 8), new RectF32(0, 0, ViewportW, 200));
+        scroll.MaxOffset.ShouldBeGreaterThan(0f);
+
+        scroll.AtomOffset = (int)scroll.MaxOffset;
+        scroll.AtomOffset.ShouldBe((int)scroll.MaxOffset);
+        widget.Render(WordRows(scroll, 8), new RectF32(0, 0, ViewportW, 200));
+
+        scroll.Offset.ShouldBe(scroll.MaxOffset);
+    }
+
+    [Fact]
+    public void ABottomAnchoredStackOfWrappingRowsStartsAndStaysAtItsFinalEnd()
+    {
+        // A regression guard, not a proof of the 11.46 fix (#192): a Bottom list re-pins to its end in
+        // pass 2 whether or not the entry offset is restored, so this also passes without the restore.
+        // ScrollingToTheEndOfRowsThatWrapBesideTheBarReachesTheEnd is the test that fails without it.
+        var widget = new DeclarationWidget(new DeclarationStubRenderer(200, 200));
+        var scroll = new ListScrollController { Mode = ScrollBarMode.Interactive, Anchor = ScrollAnchor.Bottom };
+        widget.Render(WordRows(scroll, 8), new RectF32(0, 0, ViewportW, 200));
+
+        scroll.MaxOffset.ShouldBeGreaterThan(0f);
+        scroll.Offset.ShouldBe(scroll.MaxOffset);
+
+        widget.Render(WordRows(scroll, 8), new RectF32(0, 0, ViewportW, 200));
+        scroll.Offset.ShouldBe(scroll.MaxOffset);
+    }
+
     [Fact]
     public void AControllerOnTheOtherAxisReservesNothingFromTheStack()
     {
