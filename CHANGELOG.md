@@ -9,6 +9,82 @@ this file disagrees with. Bump it there and add the entry here, in the same comm
 Breaking changes carry their migration steps in [MIGRATION.md](MIGRATION.md); this file says what
 changed and why.
 
+## 11.55
+
+SharpAstro.Fonts 1.17, and the `.sdfg` glyph cache moves to format 8 so the glyphs it fixes are drawn again.
+
+- **SharpAstro.Fonts 1.16 → 1.17.** CFF glyphs that use flex now draw (they were displaced past the flex: a Manning
+  book's NewBaskerville came out as smears), accented composites draw (a German subset's ä, ö and ü were blank), and a
+  bare CFF's built-in encoding is read (a TeX math subset with no PDF `/Encoding` drew `bardbl` for every bullet and
+  nothing for `(`, `=` or `∈`).
+- **`SdfGlyphDiskCache` format 7 → 8.** Fields stored before 1.17 are wrong for those glyphs (CFF flex, Type 2 and Type 1 `seac`
+  composites, and any glyph a bare CFF's built-in encoding now selects differently), and a file keeps serving what it holds; a version mismatch truncates and rewrites it, so each glyph is rasterized once more.
+
+## 11.54
+
+Additive. A grouped tree table: groups nested to any depth over table columns, the tree keyboard, and folds that survive a
+refresh and a restart. Upstreamed from pilot's Pull requests page, and meant for tianwen as well. Two new source files,
+nothing existing edited, no record primary constructor changed.
+
+- **`GroupedTreeNode<TGroup, TRow>`** (`GroupedTreeGroup`, `GroupedTreeLeaf`): the consumer's tree, handed over each refresh.
+  `GroupedTreeNode<TGroup, TRow>.Group(key, payload, children)` and `.Leaf(key, payload)` build it without restating both
+  type arguments. Every item has a stable string key, unique among the items visible at once; the widget never reorders, so
+  sorting is applied to each group's children before the tree is handed over.
+- **`GroupedTreeState`**: the part that outlives the tree, held by key and never by object, so a tree rebuilt from fresh
+  objects keeps its folds and its selection. `Flatten` gives the visible rows (`GroupedTreeRow<TGroup, TRow>`, with its
+  `GroupedTreeRowKind`, `Depth`, `HasChildren`, `IsExpanded` and `ParentIndex`) depth first in the consumer's order.
+  Groups are open unless folded, so a group that appears later is open. `SelectedKey` follows its item across a refresh, a
+  re-sort and a fold, and when the item is gone `Reselect` moves it to the nearest row that survived (the folded group
+  that hides it, a sibling, the parent). `SyncCursor` puts an open `ListCursor` on that row every frame.
+- **The tree keyboard**: `HandleTableKey(key, widget.HandleListKey(key, mods), cursor, listId, rows, onActivate)` is the
+  whole key line. The list keeps Up, Down and Enter on a painted row and the selection follows its cursor; the state adds
+  Right (unfold, or onto the first child), Left (fold, or to the parent) and Enter on a group (toggle). `HandleKey` is the same
+  rule without the cursor, for a host that has its own.
+- **Folds a consumer can persist**: `Save()` returns a `GroupedTreeState.Saved` record (the folded keys, sorted, so an
+  unchanged state saves the same bytes) and `Restore` / `GroupedTreeState.From` are its inverse. Only folds are
+  recorded, and keys of groups not in the tree right now are kept, so filtering a group away does not unfold it. `Changed`
+  is raised on every fold change, which is the host's cue to ask for a frame and save.
+- **`Builder.GroupedTreeTable`** (with `GroupedTreeTableStyle`): one `TableHeader` over a span of `TableColumn`, then a
+  `VirtualList` of the visible rows, so only the window is built whatever the row count. A leaf is a `TableRow` in the same
+  columns, style and dragged widths as the header; a group header is a `TreeRow` that spans the whole row, with the
+  consumer's own content (name, counts, actions) after the caret. Every row is row `i` of one list id, so the click, the
+  cursor and the lit row are one list; a press on a header selects it and toggles its fold, a double-click on a leaf and Enter
+  are `onActivate`. `GroupedTreeTableStyle` fills the selected row and the row under the cursor, with an optional band
+  behind group headers.
+
+A table that never calls any of this sees no change.
+
+## 11.53
+
+Additive. The round-1 review notes on `CanvasViewport` (#198), which landed after 11.52 was published.
+
+- **`Changed` on pan begin and end**: `CanvasViewport.Changed` is now raised when `IsPanning` flips (and when `SpaceHeld`
+  flips), so a host that repaints on `Changed` shows the move cursor on the event that changes it rather than one event
+  late. `BeginPan` and `EndPan` raise it only when they change `IsPanning`: beginning again during a drag re-anchors it and
+  ending with no drag in flight raise nothing.
+- **A second pan button during a pan** takes the drag over (as in pilot's `MapViewport`): it re-anchors at that press, and
+  only the second button's release ends the pan, so releasing the first button first leaves it running. This was the
+  behaviour already; it is now documented on `HandleInput` and pinned by a test.
+- **`MaxFitScale` is not clamped to `MaxZoom`**: a fit can exceed the zoom ceiling when `MaxFitScale` is set above it, and
+  the next zoom snaps it back into range. Behaviour unchanged (pilot's `MapViewport` does the same); stated in the doc
+  comment of both properties.
+- **`InputEvent.Pinch.Scale`** is documented as the factor since the previous pinch event (what the SdlVulkan emitter
+  sends and what `HandleInput` applies), not an absolute scale from the pinch's start. A doc correction; no behaviour change.
+
+## 11.52
+
+- **`CanvasViewport` (#176)**: a public, reusable zoom, pan and fit viewport for canvases of design units, pilot's
+  `MapViewport` generalised. It sits BESIDE `PanZoomController` (composing one privately for the drag and cursor-anchored
+  zoom primitives) rather than extending it: the controller leaves the fit to the renderer, whereas the viewport owns the
+  content size and so computes the fit, the keep-in-view clamp and the design/view mapping.
+- **`HandleInput`**: the canvas gestures as one handler taking an `InputEvent` and the viewport's rect on the surface (and
+  an optional design scale). Ctrl+wheel zooms about the pointer, plain and Shift wheel pan, pinch zooms, Middle (or Space+Left,
+  or a host-chosen Left) drags to pan and only the same button's release ends it, and Ctrl+Plus/Minus/0/1 and the arrow keys
+  zoom, fit and pan. `IsPanning` and `SpaceHeld` let a host show the move cursor.
+- **`ZoomByWheel`** on `PanZoomController` and `CanvasViewport`: the factor is `ZoomStep^delta`, so a touchpad's small
+  deltas zoom a fraction of a notch and a delta of 1 matches the old step. `ZoomAtCursor` is unchanged.
+- Additive. pilot's `MapViewport` can now be replaced by `CanvasViewport` (a pilot flight, not this one).
+
 ## 11.51
 
 Additive. A raster host gets drag-select, highlight and copy of `.Selectable()` text runs with no per-app code.
