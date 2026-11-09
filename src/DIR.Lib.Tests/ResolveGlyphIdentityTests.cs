@@ -85,38 +85,43 @@ public class ResolveGlyphIdentityTests
     public void RegisteredPdfEncoding_ResolvesByName_ForBareCff()
     {
         // The Canon-manual Lithos-Bold subset: a bare name-keyed CFF with no cmap and no CFF
-        // Encoding operator. Without a registered PDF encoding the only strategy left is
-        // charCode-as-GID, which selects glyph 49 ('W') for code 0x31 ('1'). With the PDF's
-        // WinAnsi map registered, the name route (code -> /one -> charset) must win: gid 15.
+        // Encoding operator, which makes its built-in encoding StandardEncoding. Before
+        // SharpAstro.Fonts 1.17 the built-in encoding was never read and the only strategy left
+        // was charCode-as-GID, which selected glyph 49 ('W') for code 0x31 ('1'); now the code goes
+        // through StandardEncoding to /one, gid 15, as pdfium (FreeType) selects it. The registered
+        // map below DELIBERATELY differs from StandardEncoding (0x31 -> "two", not "one"), so only
+        // the name route can produce its answer and only a dropped memo can show it.
         using var rasterizer = new ManagedFontRasterizer();
         const string fontId = "mem:lithos-bold-subset";
         Assert.True(rasterizer.RegisterFontFromMemory(fontId,
             File.ReadAllBytes(Path.Combine("Fonts", "LithosBold_subset.cff"))));
 
         var bare = rasterizer.ResolveGlyphIdentity(fontId, new Rune('1'), charCode: 0x31, GlyphMapHint.EmbeddedSubset);
-        Assert.Equal(49u, bare.Gid); // documents the charCode-as-GID fallback, not endorses it
+        Assert.Equal(15u, bare.Gid); // the font's own (Standard) encoding, no longer charCode-as-GID
 
         rasterizer.RegisterPdfEncoding(fontId, new Dictionary<int, string>
         {
-            [0x31] = "one", [0x32] = "two", [0x33] = "three",
+            [0x31] = "two", [0x32] = "three", [0x33] = "one",
         });
 
-        // Registration must invalidate the memoized identity above, and the name route wins.
-        var one = rasterizer.ResolveGlyphIdentity(fontId, new Rune('1'), charCode: 0x31, GlyphMapHint.EmbeddedSubset);
-        Assert.Equal(15u, one.Gid);
-        Assert.Equal(16u, rasterizer.ResolveGlyphIdentity(fontId, new Rune('2'), charCode: 0x32, GlyphMapHint.EmbeddedSubset).Gid);
-        Assert.Equal(17u, rasterizer.ResolveGlyphIdentity(fontId, new Rune('3'), charCode: 0x33, GlyphMapHint.EmbeddedSubset).Gid);
+        // Registration must invalidate the memoized identity above, and the name route wins: every
+        // code now resolves to a different glyph than the built-in encoding gave it (15, 16, 17).
+        var named = rasterizer.ResolveGlyphIdentity(fontId, new Rune('1'), charCode: 0x31, GlyphMapHint.EmbeddedSubset);
+        Assert.Equal(16u, named.Gid);
+        Assert.Equal(17u, rasterizer.ResolveGlyphIdentity(fontId, new Rune('2'), charCode: 0x32, GlyphMapHint.EmbeddedSubset).Gid);
+        Assert.Equal(15u, rasterizer.ResolveGlyphIdentity(fontId, new Rune('3'), charCode: 0x33, GlyphMapHint.EmbeddedSubset).Gid);
 
         // And the identity actually rasterizes — the glyph exists and has ink.
-        var bmp = rasterizer.RasterizeGlyphMtsdfByGid(fontId, 48f, one.Gid);
+        var bmp = rasterizer.RasterizeGlyphMtsdfByGid(fontId, 48f, named.Gid);
         Assert.True(bmp.Width > 0 && bmp.Height > 0, "named glyph must produce ink");
     }
 
     [Fact]
-    public void RegisteredPdfEncoding_UnknownName_FallsBackToCharCodeStrategies()
+    public void RegisteredPdfEncoding_UnknownName_FallsBackToBuiltInEncoding()
     {
         // A name the font doesn't carry must not blank the glyph — resolution falls through to
-        // the cmap/char-code strategies as if no encoding were registered.
+        // the strategies used when no encoding is registered: the font's built-in encoding first
+        // (StandardEncoding here, /one, gid 15), and only then charCode-as-GID.
         using var rasterizer = new ManagedFontRasterizer();
         const string fontId = "mem:lithos-bold-unknown-name";
         Assert.True(rasterizer.RegisterFontFromMemory(fontId,
@@ -124,6 +129,6 @@ public class ResolveGlyphIdentityTests
         rasterizer.RegisterPdfEncoding(fontId, new Dictionary<int, string> { [0x31] = "nosuchglyph" });
 
         var id = rasterizer.ResolveGlyphIdentity(fontId, new Rune('1'), charCode: 0x31, GlyphMapHint.EmbeddedSubset);
-        Assert.Equal(49u, id.Gid); // the charCode-as-GID fallback again
+        Assert.Equal(15u, id.Gid); // the built-in encoding again
     }
 }
