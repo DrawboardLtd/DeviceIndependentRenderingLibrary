@@ -20,7 +20,7 @@ public readonly record struct TooltipRequest(string Text, RectF32 Anchor)
     /// <summary>
     /// Which side of <see cref="Anchor"/> the tooltip opens on: the region's
     /// <see cref="ClickableRegion.TooltipSide"/>, and below it where the region names none.
-    /// <see cref="Layout.Builder.Tooltip"/> places it there.
+    /// <see cref="Layout.Builder.Tooltip(TooltipRequest, Layout.TooltipStyle)"/> places it there.
     /// </summary>
     public Layout.DockSide Side { get; init; } = Layout.DockSide.Bottom;
 }
@@ -83,6 +83,12 @@ public sealed class InputRouter(WindowUiSettings ui, BackgroundTaskTracker track
     // Fields whose FocusOnOpen request has been honoured while they have stayed painted. Reference
     // identity, TextInputState being a plain class, which is the identity a field actually has.
     private readonly HashSet<TextInputState> _honouredFocusOnOpen = [];
+
+    // The press a text selection took over a region with a click of its own beneath the plain text (a list row under its
+    // tooltip-only cells): a release with nothing selected, a click with no drag, is that region's click. Without it a click
+    // on a row's text, or the blank part of a cell, started an empty selection and the row never heard of it (pilot, 2026-11-09:
+    // "clicks don't always register; arrow up/down do").
+    private (IPixelWidget Widget, ClickableRegion Region, PointerPress Press)? _clickUnderSelection;
 
     private DragCapture? _capture;
     private MouseButton _captureButton;
@@ -274,11 +280,34 @@ public sealed class InputRouter(WindowUiSettings ui, BackgroundTaskTracker track
         }
 
         var widgets = Widgets();
+
+        // A text selection drag in flight keeps the I-beam wherever the pointer goes, over a region that states a cursor too:
+        // tested before the region loop, as _capture is, so the drag does not flicker to the cursor of whatever it crosses.
+        for (var i = widgets.Count - 1; i >= 0; i--)
+        {
+            if (widgets[i] is ITextSelectionHost { SelectionEnabled: true, SelectionDragging: true })
+            {
+                return CursorKind.Text;
+            }
+        }
+
         for (var i = widgets.Count - 1; i >= 0; i--)
         {
             if (widgets[i].HitTestCursor(x, y) is { } cursor)
             {
                 return cursor;
+            }
+        }
+
+        // At rest, selectable text or the space just beside it on its line, where a press starts a selection: the I-beam, as over a
+        // field. A region that states a cursor keeps it (HitTestCursor's topmost-wins contract), and nothing that acts on a press
+        // may be under the point (the same test the press makes), so a button laid over text keeps its own cursor.
+        for (var i = widgets.Count - 1; i >= 0; i--)
+        {
+            if (widgets[i] is ITextSelectionHost { SelectionEnabled: true } host
+                && host.SelectionStartsAt(x, y) && SelectionInert(widgets, x, y))
+            {
+                return CursorKind.Text;
             }
         }
 
@@ -321,6 +350,14 @@ public sealed class InputRouter(WindowUiSettings ui, BackgroundTaskTracker track
                 if (!Contains(region, down.X, down.Y))
                 {
                     continue;
+                }
+
+                // A press on plain chrome painted over a region of the same widget (a cell's tooltip-only region over its clickable
+                // row) is that region's: the first region beneath that is not plain chrome takes it, a disabled one included, which
+                // swallows it as a disabled region does (#205). Only within this widget: a widget below is covered, as before.
+                if (IsInertChrome(region) && FirstBeneath(i, down.X, down.Y) is { } beneath)
+                {
+                    region = beneath;
                 }
 
                 // A right press over a part with no menu of its own (a twirl caret, a cell button) belongs to
@@ -628,9 +665,18 @@ public sealed class InputRouter(WindowUiSettings ui, BackgroundTaskTracker track
 
         if (_capture is null && SelectionInput(Widgets(), up))
         {
+            // A click with no drag selected nothing: it was a click on what lies beneath the text, run as that region's.
+            if (_clickUnderSelection is { } pending && up.Button == MouseButton.Left && !AnySelection(Widgets()))
+            {
+                ReleaseClick(pending.Region, pending.Press);
+            }
+
+            _clickUnderSelection = null;
             requestRedraw();
             return true;
         }
+
+        _clickUnderSelection = null;
 
         if (_capture is { } capture)
         {
@@ -646,6 +692,73 @@ public sealed class InputRouter(WindowUiSettings ui, BackgroundTaskTracker track
     }
 
     // ---- text selection ---------------------------------------------------------------------
+
+    // The region a click on plain chrome lands on: in the topmost widget with a region under the point, past the inert chrome painted
+    // over it (a cell's tooltip region), the first other region there, when it clicks, opens or double-clicks. Null when that first
+    // region does none of these or is disabled (a disabled region swallows the press, as it does at HandleMouseDown), and never a
+    // region of a widget below: HandleMouseDown stops at the topmost widget too.
+    private (IPixelWidget Widget, ClickableRegion Region)? ClickableBeneath(IReadOnlyList<IPixelWidget> widgets, float x, float y)
+    {
+        for (var w = widgets.Count - 1; w >= 0; w--)
+        {
+            _regions.Clear();
+            widgets[w].CollectPaintedRegions(_regions);
+            var any = false;
+            for (var i = _regions.Count - 1; i >= 0; i--)
+            {
+                var r = _regions[i];
+                if (!Contains(r, x, y))
+                {
+                    continue;
+                }
+
+                any = true;
+                if (IsInertChrome(r))
+                {
+                    continue;
+                }
+
+                return !r.IsDisabled && r is { OnClick: not null } or { OnDoubleClick: not null } or { Opens: not null } ? (widgets[w], r) : null;
+            }
+
+            if (any)
+            {
+                return null;
+            }
+        }
+
+        return null;
+    }
+
+    // The click half of a region, run at the release of a press the selection took: its click (its double-click on a second press)
+    // and the popover it opens. Never its OnPress, a press handler that may arm a drag: run after the button is up, that drag would
+    // have no button to end it.
+    private void ReleaseClick(in ClickableRegion region, in PointerPress press)
+    {
+        if (press.Clicks >= 2 && region.OnDoubleClick is { } doubleClick)
+        {
+            doubleClick(press.Modifiers);
+        }
+        else
+        {
+            region.OnClick?.Invoke(press.Modifiers);
+        }
+
+        region.Opens?.Toggle();
+    }
+
+    private static bool AnySelection(IReadOnlyList<IPixelWidget> widgets)
+    {
+        for (var i = 0; i < widgets.Count; i++)
+        {
+            if (widgets[i] is ITextSelectionHost { SelectedText: { Length: > 0 } })
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
 
     // Whether the topmost painted region under the point is plain chrome (or there is none) and no popover owns the pointer:
     // a press there is the selection's; on a button, link, field, scrollbar or menu it is the region's.
@@ -665,6 +778,8 @@ public sealed class InputRouter(WindowUiSettings ui, BackgroundTaskTracker track
                 var r = _regions[i];
                 if (Contains(r, x, y))
                 {
+                    // Not IsInertChrome: this asks whether the press is the text selection's, so a disabled region (its handlers
+                    // stripped) and one with only a click or a menu still let the selection take it, and a field that focuses on open does not.
                     return r is { Result: HitResult.ChromeHit }
                         and not ({ OnPress: not null } or { OnActivate: not null } or { OnDoubleClick: not null } or { Opens: not null }
                             or { Dismisses: not null } or { FocusOnOpen: true });
@@ -673,6 +788,27 @@ public sealed class InputRouter(WindowUiSettings ui, BackgroundTaskTracker track
         }
 
         return true;
+    }
+
+    // Plain chrome: a region that only shows a tooltip or a cursor, with nothing to do on a press and not disabled. The one rule for
+    // looking past chrome to the region beneath, at a press (FirstBeneath) and at a click under a selection (ClickableBeneath).
+    private static bool IsInertChrome(in ClickableRegion r) =>
+        r is { Result: HitResult.ChromeHit, IsDisabled: false, OnClick: null, OnPress: null, OnActivate: null, OnDoubleClick: null, Opens: null, Dismisses: null, OnContextMenu: null };
+
+    // In the widget whose regions are in _regions, the first region under the point below index above that is not plain chrome; null
+    // when there is none, and the press stays with the chrome (and does nothing), as it did.
+    private ClickableRegion? FirstBeneath(int above, float x, float y)
+    {
+        for (var i = above - 1; i >= 0; i--)
+        {
+            var r = _regions[i];
+            if (Contains(r, x, y) && !IsInertChrome(r))
+            {
+                return r;
+            }
+        }
+
+        return null;
     }
 
     private bool AnyRegionOffersMenu(IReadOnlyList<IPixelWidget> widgets, float x, float y)
@@ -744,8 +880,14 @@ public sealed class InputRouter(WindowUiSettings ui, BackgroundTaskTracker track
             changed |= had;
         }
 
+        _clickUnderSelection = null;
         if (took)
         {
+            if (inert && ClickableBeneath(widgets, down.X, down.Y) is { } beneath)
+            {
+                _clickUnderSelection = (beneath.Widget, beneath.Region, press);
+            }
+
             BlurFocusedField();
             requestRedraw();
             return true;

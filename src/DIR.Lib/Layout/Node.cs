@@ -234,7 +234,7 @@ public abstract partial record Node
     public Action<PointerPress>? OnContextMenu { get; init; }
 
     /// <summary>
-    /// Hover text for this node, set via <see cref="WithTooltip"/>. A node with a tooltip and no
+    /// Hover text for this node, set via <see cref="WithTooltip(string)"/>. A node with a tooltip and no
     /// <see cref="Hit"/> still registers a region -- inert to presses -- because a statement about what
     /// is under the pointer has nowhere else to live.
     /// </summary>
@@ -299,7 +299,7 @@ public abstract partial record Node
     public ListScrollController? Scroll { get; init; }
 
     /// <summary>
-    /// A keyboard binding that reaches this node, set via <see cref="WithShortcut"/>. Inert in measure
+    /// A keyboard binding that reaches this node, set via <see cref="WithShortcut(InputKey, InputModifier)"/>. Inert in measure
     /// and in paint: the router matches it against the PAINTED tree, so a shortcut on a panel that is not
     /// on screen is inert without anyone saying so.
     /// </summary>
@@ -369,6 +369,11 @@ public abstract partial record Node
     /// <summary>What the pointer looks like over this node's arranged rect, or null to inherit from
     /// whatever encloses it. Bound to the rect the content was painted in, like <see cref="Hit"/>.</summary>
     public CursorKind? Cursor { get; init; }
+
+    /// <summary>Told this node's arranged WIDTH, in design units, every time the tree is arranged. It is how a
+    /// consumer whose gesture starts from what is DRAWN (a table's divider, beside a star squeezed below its cap)
+    /// learns it, since a press handler sees no layout. Called on the arranging thread: keep it to storing a number.</summary>
+    public Action<float>? OnArranged { get; init; }
 
     /// <summary>Collapse threshold in design units, honoured by a parent <see cref="Stack"/>: when this
     /// node's resolved main-axis extent lands below the threshold, the node drops out of the arrangement

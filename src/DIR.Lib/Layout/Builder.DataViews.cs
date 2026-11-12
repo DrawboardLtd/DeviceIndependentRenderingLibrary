@@ -157,13 +157,23 @@ public static partial class Builder
         var top = new List<Node>(columns.Length * 2 - 1);
         for (var i = 0; i < columns.Length; i++)
         {
-            top.Add(Spacer() with { Width = widths.SizingOf(i, columns[i]), Height = Sizing.Star() });
+            var column = i;
+            top.Add(Spacer() with
+            {
+                Width = widths.SizingOf(i, columns[i]),
+                Height = Sizing.Star(),
+                OnArranged = w => widths.NoteDrawn(column, w),
+            });
             if (i + 1 < columns.Length)
             {
                 var divider = i;
-                top.Add(Spacer().WFixed(style.Gap).HStar().Pressable(
-                    new HitResult.ButtonHit($"{hitPrefix}divider:{i}"), DividerPress(copy, widths, i, scaleOrOne),
-                    CursorKind.ResizeEW).DoubleClickable(_ => widths.Fit(copy, divider)));
+                // A divider that would resize nothing is a gap like any other: no grip, no resize cursor.
+                var gap = Spacer().WFixed(style.Gap).HStar();
+                top.Add(widths.CanDrag(columns, i)
+                    ? gap.Pressable(
+                        new HitResult.ButtonHit($"{hitPrefix}divider:{i}"), DividerPress(copy, widths, i, scaleOrOne),
+                        CursorKind.ResizeEW).DoubleClickable(_ => widths.Fit(copy, divider))
+                    : gap);
             }
         }
 

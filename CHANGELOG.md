@@ -9,6 +9,50 @@ this file disagrees with. Bump it there and add the entry here, in the same comm
 Breaking changes carry their migration steps in [MIGRATION.md](MIGRATION.md); this file says what
 changed and why.
 
+## 11.57
+
+Additive, with one behaviour change in what a table divider resizes. Three new init-only properties (`TableColumn.MaxWidth`, `TableColumn.Resizable`, `Node.OnArranged`), one new
+public method (`TableColumnWidths.CanDrag`) and an init-only `TableColumnWidths.Saved.Pinned`; no record
+primary constructor changed.
+
+- **A table divider follows the pointer.** Two neighbouring columns that each have a width of their own (fixed, or a capped
+  star) trade it across the divider between them. Before, only two fixed columns traded; beside a capped star the divider
+  resized the fixed side alone, and where that column kept the edge under the pointer the divider stood still and the
+  column's far edge moved. Beside the star that takes the slack only the other side is resized, as before.
+- **The trade is of what is drawn.** A capped star in a table narrower than the sum of the caps is drawn below its cap, so a
+  drag starts from the width it is drawn at, and the divider follows the pointer at any table width, until a column reaches its
+  minimum (a column drawn below its minimum is not forced up to it, and a drag never widens the column it narrows). A star a
+  drag widens is pinned at its width for the session. `Node.OnArranged` (new, init-only: told the node's arranged width in
+  design units) is how the header's grip row reports the drawn widths. A divider beside the slack star in so narrow a table
+  moves by the star's share, since the capped stars share the slack with it.
+- **No grip beside a `Sizing.Auto` column** either (it is neither a width of its own nor the slack): before, the fixed
+  neighbour was resized alone, which pushed the Auto column along. A drag there is no longer offered.
+- **A capped star column can be dragged**: the drag moves its cap (`Sizing.Max`), and `TableColumnWidths.SizingOf`, `Save` and
+  `Restore` carry it as they carry a fixed column's width.
+- **`TableColumnWidths.CanDrag(columns, divider)`**. A divider that would resize nothing (between two slack stars, or beside a
+  column that is not resizable) is now a plain gap in the header: no hit region, no resize cursor.
+- **`TableColumn.MaxWidth`**: the widest a drag beside the slack star makes the column, for a consumer that drops a column once
+  it cannot have its width.
+- **`TableColumn.Resizable`** (default true): false for a column whose width is not the reader's to choose, such as a column
+  of buttons. No divider resizes it.
+
+## 11.56
+
+Additive. The I-beam shows where a press starts a text selection, and a press reaches further beside the text. A new default
+member on an interface and one new method; no record primary constructor changed.
+
+- **`ITextSelectionHost.SelectionStartsAt(x, y)`** (a default member, so an existing implementer still builds) and
+  **`TextSelection<TSurface>.StartsAt`**: whether a press at the point would start a selection, the same test `HandleInput` makes
+  (on a selectable run, or in the reach beside one).
+- **`InputRouter.CursorAt`** returns `CursorKind.Text` over selectable text and in the reach of a press beside it, where nothing that
+  acts on a press (a button, link, field, menu) is under the point; at rest a region that states a cursor keeps it. While a selection
+  drag is in flight it holds the I-beam wherever the pointer goes, as a captured drag holds its cursor.
+- **The beside reach grows from 1.5 letters (minimum 6 px) to 5 letters (minimum 24 px)**, measured from the run's rect. Consumers
+  pinning `11.55.*` need a pin bump to get it.
+- **Fix: a tap on a row-snapped `ListScrollController` selects the row drawn under it.** A snapped list keeps the wheel's fractional
+  carry but draws whole rows with no sub-row shift, and the tap added that shift back, so after a trackpad or browser wheel left a
+  fraction behind, a press in the lower part of a row selected the row below it.
+
 ## 11.55
 
 SharpAstro.Fonts 1.17, and the `.sdfg` glyph cache moves to format 8 so the glyphs it fixes are drawn again.

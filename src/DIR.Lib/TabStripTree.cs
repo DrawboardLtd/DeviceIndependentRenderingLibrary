@@ -73,7 +73,7 @@ public sealed record TabStripOptions
 public readonly record struct TabStrip(Node Root, int HoveredIndex, float TabsEnd);
 
 /// <summary>
-/// What <see cref="TabStripTree.Build"/> needs of whatever is supplying the tabs.
+/// What <see cref="TabStripTree.Build{T}(IReadOnlyList{TabItem{T}}, int, float?, float?, float, Func{string, float}, TabStripOptions, Action{int}?)"/> needs of whatever is supplying the tabs.
 /// </summary>
 /// <remarks>
 /// An interface rather than an <c>IReadOnlyList&lt;TabItem&lt;T&gt;&gt;</c> because the builder never
@@ -107,7 +107,7 @@ public interface ITabStripSource
 
     /// <summary>
     /// The tab's hover text, or null. Declared on the tab's region, opening on the side away from the strip, so
-    /// the host's one tooltip painter shows it (<see cref="Layout.Builder.Tooltip"/>); a disabled tab's is the
+    /// the host's one tooltip painter shows it (<see cref="Layout.Builder.Tooltip(TooltipRequest, TooltipStyle)"/>); a disabled tab's is the
     /// reason it is disabled.
     /// </summary>
     /// <remarks>A default member for the reason <see cref="Shortcut"/> is one.</remarks>
@@ -214,7 +214,7 @@ public static class TabStripTree
     /// <summary>
     /// Describes the strip. The caller arranges and paints the result.
     /// </summary>
-    /// <param name="source">The tabs, in order.</param>
+    /// <param name="items">The tabs, in order.</param>
     /// <param name="activeIndex">Index of the tab wearing the accent, or -1 for none.</param>
     /// <param name="pointerFlow">Where the pointer is along the flow axis, measured from the strip's own
     /// start, or null when it is outside the strip (or the surface has no pointer). The strip resolves
@@ -240,7 +240,7 @@ public static class TabStripTree
         => Build(new TabItemsSource<T>(items), activeIndex, pointerFlow, pointerCross, availableFlow,
             measureLabel, options, onSelect);
 
-    /// <inheritdoc cref="Build{T}(IReadOnlyList{TabItem{T}}, int, float?, float, Func{string, float}, TabStripOptions, Action{int}?)"/>
+    /// <inheritdoc cref="Build{T}(IReadOnlyList{TabItem{T}}, int, float?, float?, float, Func{string, float}, TabStripOptions, Action{int}?)"/>
     public static TabStrip Build<TSource>(
         TSource source,
         int activeIndex,
