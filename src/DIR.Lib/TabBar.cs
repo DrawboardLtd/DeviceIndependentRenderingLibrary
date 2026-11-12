@@ -31,7 +31,7 @@ public static class TabBarRegions
 
 /// <summary>
 /// Reusable tab strip: one tab per item, an active highlight + accent, a close button per tab,
-/// ellipsis truncation, hover feedback (give it <see cref="Pointer"/>), and drag-to-reorder
+/// ellipsis truncation, hover feedback (give it <see cref="PixelWidgetBase{TSurface}.Pointer"/>), and drag-to-reorder
 /// hit-testing. Backend-agnostic — it draws through its <see cref="Renderer{TSurface}"/> and is told the
 /// model (the tabs + which one is active) each frame; the host maps the returned <see cref="TabClick"/> /
 /// <see cref="SlotAt"/> to its own actions.
@@ -108,7 +108,7 @@ public sealed class TabBar<TSurface>(Renderer<TSurface> renderer) : PixelWidgetB
     /// <remarks>
     /// This is no longer how a host draws a tooltip for <see cref="TabItem{T}.Tooltip"/>: each tab DECLARES its
     /// tooltip on its region, opening away from the strip, and the host paints the router's
-    /// <see cref="InputRouter.Tooltip"/> with <see cref="Layout.Builder.Tooltip"/>, over the whole window and
+    /// <see cref="InputRouter.Tooltip"/> with <see cref="Layout.Builder.Tooltip(TooltipRequest, Layout.TooltipStyle)"/>, over the whole window and
     /// after everything else. The bar still draws none itself, for the reason it never did: a tooltip is
     /// painted outside the strip, over whatever content is adjacent to it, and a widget that clips to its own
     /// bounds cannot put it there.
@@ -141,7 +141,7 @@ public sealed class TabBar<TSurface>(Renderer<TSurface> renderer) : PixelWidgetB
 
     /// <summary>Whether the pointer is over the +, set by the host, which is what owns the mouse
     /// position. Affects only its plate, so leaving it false just means no hover feedback.
-    /// <para>Superseded by <see cref="Pointer"/>, which covers the tabs as well; the two OR together,
+    /// <para>Superseded by <see cref="PixelWidgetBase{TSurface}.Pointer"/>, which covers the tabs as well; the two OR together,
     /// so a host that already sets this keeps working.</para></summary>
     public bool NewTabHovered { get; set; }
 
@@ -444,7 +444,7 @@ public sealed class TabBar<TSurface>(Renderer<TSurface> renderer) : PixelWidgetB
 
     /// <summary>
     /// A title's drawn width, through whatever fallback the window set — the same split
-    /// <see cref="PixelWidgetBase{TSurface}.DrawText"/> will draw it with, so a tab is sized for the runs
+    /// <see cref="PixelWidgetBase{TSurface}.DrawText(ReadOnlySpan{char}, string, float, float, float, float, float, RGBAColor32, TextAlign, TextAlign)"/> will draw it with, so a tab is sized for the runs
     /// that land in it. Zero on an unresolved font, which lays every tab out at
     /// <see cref="MinTabW"/> rather than throwing (the widget's documented empty-font contract).
     /// </summary>
@@ -488,7 +488,7 @@ public sealed class TabBar<TSurface>(Renderer<TSurface> renderer) : PixelWidgetB
     /// </summary>
     /// <param name="items">The list that was rendered — the same one, in the same order.</param>
     /// <remarks>
-    /// The items come back in rather than being remembered from <see cref="Render{T}"/> because the bar is
+    /// The items come back in rather than being remembered from <see cref="Render{T}(float, float, IReadOnlyList{TabItem{T}}, T)"/> because the bar is
     /// generic over its SURFACE, not over the item type: holding the last list would mean storing it as
     /// <c>object</c> and casting on the way out, which turns a caller passing the wrong list from a
     /// compile error into a runtime one. A host builds this list per frame anyway.

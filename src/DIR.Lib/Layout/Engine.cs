@@ -59,7 +59,7 @@ public interface IMeasureContext<T> where T : INumber<T>
 
 /// <summary>
 /// Two-pass measure/arrange engine over a declarative <see cref="Node"/> tree. Generic over the
-/// coordinate numeric <typeparamref name="T"/> (<c>float</c> pixels / <c>int</c> cells) reusing
+/// coordinate numeric <c>T</c> (<c>float</c> pixels / <c>int</c> cells) reusing
 /// <see cref="Rect{T}"/> + <see cref="DockLayout{T}"/>. <see cref="Arrange{T}"/> returns a flat pre-order
 /// list of <see cref="ArrangedNode{T}"/> that a per-surface painter walks to draw + auto-bind clicks.
 /// </summary>
@@ -183,6 +183,18 @@ public static class Engine
         ImmutableArray<ArrangedNode<T>>.Builder output, int depth) where T : INumber<T>
     {
         output.Add(new ArrangedNode<T>(node, rect) { Depth = depth });
+
+        if (node.OnArranged is { } arranged)
+        {
+            // Surface units per design unit, probed over a long run so a cell surface, which rounds a single
+            // design unit, still gives its true ratio.
+            const float probe = 4096f;
+            var perUnit = float.CreateSaturating(ctx.ToSurfaceX(probe)) / probe;
+            if (perUnit > 0f)
+            {
+                arranged(float.CreateSaturating(rect.Width) / perUnit);
+            }
+        }
 
         var inner = Inset(rect, ctx.ToSurfaceX(node.Padding), ctx.ToSurfaceY(node.PadDown));
         var childDepth = depth + 1;

@@ -33,6 +33,8 @@ public class TextSelectionHostTests : IDisposable
     {
         protected override RGBAColor32 SelectionBackground => Bar;
 
+        public void ShareWith(Host other) => ShareUiContext(other);
+
         public void Render(Layout.Node page, Layout.Node? over = null)
         {
             BeginFrame();
@@ -102,6 +104,69 @@ public class TextSelectionHostTests : IDisposable
     }
 
     [Fact]
+    public void TheIBeamShowsOverSelectableTextAndBesideItWhereAPressStartsASelection()
+    {
+        // The owner, 2026-11-10: the pointer stayed an arrow in front of the text, so nothing said a press there would select.
+        // The region of "hi" is its node's rect, x 150..200 on the row at y 0..20 (WFixed(50)); the reach is measured from that rect,
+        // and at 20 px a press reaches 100 px beside it.
+        var (host, router) = Fixture();
+        host.Render(Layout.Builder.VStack(
+            Layout.Builder.HStack(Layout.Builder.Spacer().WFixed(150f).HFixed(20f), Layout.Builder.Text("hi", 20f).Selectable().WFixed(50f).HFixed(20f)),
+            Page()));
+
+        router.CursorAt(155f, 10f).ShouldBe(CursorKind.Text, "on the text");
+        router.CursorAt(100f, 10f).ShouldBe(CursorKind.Text, "50 px in front of it, within reach");
+        router.CursorAt(10f, 10f).ShouldBeNull("140 px in front of it, out of reach");
+    }
+
+    [Fact]
+    public void AButtonWithinReachOfSelectableTextKeepsItsOwnCursorAndTheIBeamStartsOnePixelOffIt()
+    {
+        // One row: a button (x 0..80, no cursor of its own) then selectable text (x 150..200), the text within reach of the button.
+        // The press on the button is the button's (SelectionInert is false there), so the hover must not promise a selection.
+        var (host, router) = Fixture();
+        host.Render(Layout.Builder.HStack(
+            Layout.Builder.Box(80f, 20f).WFixed(80f).HFixed(20f).Clickable(new HitResult.ButtonHit("go"), _ => _clicks++),
+            Layout.Builder.Spacer().WFixed(70f).HFixed(20f),
+            Layout.Builder.Text("hi", 20f).Selectable().WFixed(50f).HFixed(20f)));
+
+        router.CursorAt(40f, 10f).ShouldBeNull("over the button, though the text is in reach of a press beside it");
+        router.CursorAt(79f, 10f).ShouldBeNull("on the button's last pixel");
+        router.CursorAt(81f, 10f).ShouldBe(CursorKind.Text, "one pixel off the button, beside the text");
+    }
+
+    [Fact]
+    public void ASelectionDragKeepsTheIBeamOutOfReachAndOverARegionThatStatesACursor()
+    {
+        // The text "hi" is at x 150..200; a card at x 0..80 states a resize cursor. At rest the card's cursor wins, as the
+        // topmost-region contract says; a drag armed on the text holds the I-beam wherever the pointer goes, as a captured drag does.
+        var (host, router) = Fixture();
+        host.Render(Layout.Builder.HStack(
+            Layout.Builder.Box(80f, 20f).WFixed(80f).HFixed(20f).Clickable(new HitResult.ChromeHit(), null, CursorKind.ResizeEW),
+            Layout.Builder.Spacer().WFixed(70f).HFixed(20f),
+            Layout.Builder.Text("hi", 20f).Selectable().WFixed(50f).HFixed(20f)));
+
+        router.CursorAt(40f, 10f).ShouldBe(CursorKind.ResizeEW, "at rest, a region's stated cursor wins");
+
+        Down(router, 155f, 10f).ShouldBeTrue();
+        router.Handle(new InputEvent.MouseMove(40f, 10f, MouseButton.Left));
+        router.CursorAt(40f, 10f).ShouldBe(CursorKind.Text, "mid-drag, over the card that states a cursor");
+        router.CursorAt(20f, 110f).ShouldBe(CursorKind.Text, "mid-drag, out of reach of any text");
+
+        router.Handle(new InputEvent.MouseUp(40f, 10f, MouseButton.Left));
+        router.CursorAt(40f, 10f).ShouldBe(CursorKind.ResizeEW, "the drag is over");
+    }
+
+    [Fact]
+    public void AHostThatDidNotOptInShowsNoIBeam()
+    {
+        var (host, router) = Fixture(optIn: false);
+        host.Render(Page());
+
+        router.CursorAt(5f, 10f).ShouldBeNull();
+    }
+
+    [Fact]
     public void DragSelectsAndCtrlCCopies()
     {
         var (host, router) = Fixture();
@@ -156,6 +221,97 @@ public class TextSelectionHostTests : IDisposable
         host.Selection.HasSelection.ShouldBeFalse();
         router.Handle(new InputEvent.KeyDown(InputKey.C, InputModifier.Ctrl));
         _clipboard.ShouldBeEmpty();
+    }
+
+    // A list row, as pilot's flights table draws one: clickable as a whole, its text a selectable run inside a cell that carries
+    // its own whole-text tooltip (a region of plain chrome painted over the row).
+    private Layout.Node Row() =>
+        Layout.Builder.HStack(
+            Layout.Builder.Text("hello world", 20f).Selectable().WithTooltip("hello world, whole").WFixed(200f).HFixed(20f))
+            .Clickable(new HitResult.ListItemHit("rows", 0), _ => _clicks++)
+            .WFixed(200f).HFixed(20f);
+
+    [Fact]
+    public void AClickWithNoDragOnTheTextOfAClickableRowIsTheRowsClick()
+    {
+        // pilot, 2026-11-09: a click on a flight row's text, or the blank part of a cell, started an empty selection and the
+        // row was never selected; arrow keys did select it.
+        var (host, router) = Fixture();
+        host.Render(Row());
+
+        Down(router, 25f, 10f).ShouldBeTrue();
+        router.Handle(new InputEvent.MouseUp(25f, 10f, MouseButton.Left));
+        _clicks.ShouldBe(1);
+        host.Selection.HasSelection.ShouldBeFalse();
+
+        // Past the text, inside the cell: the same.
+        Down(router, 180f, 10f).ShouldBeTrue();
+        router.Handle(new InputEvent.MouseUp(180f, 10f, MouseButton.Left));
+        _clicks.ShouldBe(2);
+    }
+
+    [Fact]
+    public void ADragOnTheTextOfAClickableRowSelectsItAndDoesNotClickTheRow()
+    {
+        var (host, router) = Fixture();
+        host.Render(Row());
+
+        DragHello(router);
+        router.Handle(new InputEvent.KeyDown(InputKey.C, InputModifier.Ctrl));
+
+        _clipboard.ShouldBe(["hello"]);
+        _clicks.ShouldBe(0, "the gesture was a selection");
+    }
+
+    [Fact]
+    public void AClickOnTextOverARegionThatClaimsADragArmsNoDragAfterTheButtonIsUp()
+    {
+        // The release runs only the click half of what lies beneath: an OnPress run there would arm a drag with no button to end it.
+        var (host, router) = Fixture();
+        var moves = 0;
+        host.Render(Layout.Builder.HStack(
+                Layout.Builder.Text("hello world", 20f).Selectable().WithTooltip("whole").WFixed(200f).HFixed(20f))
+            .Pressable(new HitResult.ListItemHit("rows", 0), _ => new DragCapture(_ => moves++, _ => { }))
+            .WFixed(200f).HFixed(20f));
+
+        Down(router, 25f, 10f).ShouldBeTrue();
+        router.Handle(new InputEvent.MouseUp(25f, 10f, MouseButton.Left));
+        router.Handle(new InputEvent.MouseMove(60f, 10f, MouseButton.None));
+
+        moves.ShouldBe(0, "no capture was armed by the release");
+    }
+
+    [Fact]
+    public void AClickOnTheTextOfADisabledPartOfAClickableCardIsSwallowedAsBefore()
+    {
+        // A disabled region registers with its handlers stripped so the press is swallowed: the look-through stops at it.
+        var (host, router) = Fixture();
+        host.Render(Layout.Builder.HStack(
+                Layout.Builder.Text("hello world", 20f).Selectable().Disabled("not now").WFixed(200f).HFixed(20f))
+            .Clickable(new HitResult.ButtonHit("card"), _ => _clicks++)
+            .WFixed(200f).HFixed(20f));
+
+        Down(router, 25f, 10f);
+        router.Handle(new InputEvent.MouseUp(25f, 10f, MouseButton.Left));
+
+        _clicks.ShouldBe(0);
+    }
+
+    [Fact]
+    public void AClickOnTextInAPanelOverAPageNeverClicksThePageBeneathThePanel()
+    {
+        // The press stops at the topmost widget with a region under it, as HandleMouseDown does: a row of the page below is covered.
+        var page = new Host(_renderer, optIn: false);
+        var panel = new Host(_renderer, optIn: true);
+        page.ShareWith(panel);
+        var router = new InputRouter(page.Ui, new BackgroundTaskTracker(), () => _redraws++) { Widgets = () => [page, panel] };
+        page.Render(Layout.Builder.Box(200f, 20f).WFixed(200f).HFixed(20f).Clickable(new HitResult.ButtonHit("page-row"), _ => _clicks++));
+        panel.Render(Layout.Builder.Text("hello world", 20f).Selectable().WithTooltip("whole").WFixed(200f).HFixed(20f));
+
+        Down(router, 25f, 10f);
+        router.Handle(new InputEvent.MouseUp(25f, 10f, MouseButton.Left));
+
+        _clicks.ShouldBe(0);
     }
 
     [Fact]

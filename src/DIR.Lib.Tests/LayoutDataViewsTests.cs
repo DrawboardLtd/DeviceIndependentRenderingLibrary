@@ -130,13 +130,13 @@ public class LayoutDataViewsTests
     private const string Divider1 = "table-header:divider:1";
 
     private static void PaintResizable(DeclarationWidget widget, TableColumnWidths widths, TableColumn[]? columns = null,
-        DesignScale? scale = null)
+        DesignScale? scale = null, float width = 400f)
     {
         columns ??= Columns;
         var cells = columns.Select((c, i) => Layout.Builder.Spacer().Clickable(new HitResult.ButtonHit("cell" + i), _ => { })).ToArray();
         widget.Render(Layout.Builder.VStack(
             Layout.Builder.TableHeader(columns, null, _ => { }, Style, widths, scale ?? DesignScale.One).RowH(24f),
-            Layout.Builder.TableRow(columns, cells, Style, widths).RowH(20f)).Stretch(), new RectF32(0, 0, 400, 100));
+            Layout.Builder.TableRow(columns, cells, Style, widths).RowH(20f)).Stretch(), new RectF32(0, 0, width, 100));
     }
 
     /// <summary>Presses the divider's middle and returns the capture, as a router does for a real press.</summary>
@@ -397,6 +397,283 @@ public class LayoutDataViewsTests
         var moved = Named(widget, Divider0);
         moved.Cursor.ShouldBe(CursorKind.ResizeEW, "the divider that followed the drag still asks for it");
         moved.X.ShouldBeGreaterThan(x - 4f);
+    }
+
+    // The slack column first, then fixed and capped-star columns by turns.
+    private static readonly TableColumn[] SlackFirst =
+    [
+        new("name", Sizing.Star()),
+        new("context", Sizing.Fixed(60f)),
+        new("last", Sizing.Star(1f, 0f, 50f)),
+        new("state", Sizing.Fixed(60f)),
+        new("spend", Sizing.Star(1f, 0f, 50f)),
+    ];
+
+    [Theory]
+    [InlineData(0, 12f)]
+    [InlineData(1, 12f)]
+    [InlineData(2, 12f)]
+    [InlineData(3, 12f)]
+    [InlineData(0, -12f)]
+    [InlineData(1, -12f)]
+    [InlineData(2, -12f)]
+    [InlineData(3, -12f)]
+    public void EveryDividerFollowsThePointer_WhateverKindOfColumnStandsBesideIt(int divider, float by)
+    {
+        var widget = Widget();
+        var widths = new TableColumnWidths();
+        PaintResizable(widget, widths, SlackFirst);
+        var name = "table-header:divider:" + divider;
+        var before = Named(widget, name).X;
+        var capture = Grab(widget, name, out var x);
+
+        DragTo(capture, x + by);
+        PaintResizable(widget, widths, SlackFirst);
+
+        Named(widget, name).X.ShouldBe(before + by, 0.01f, "the divider is where the pointer took it");
+        ShouldLineUp(widget, SlackFirst);
+    }
+
+    // A floor on the slack star, so the capped stars get what it leaves.
+    private static readonly TableColumn[] FlooredSlack =
+    [
+        new("name", Sizing.Star(1f, 120f)),
+        new("context", Sizing.Fixed(60f)),
+        new("last", Sizing.Star(1f, 0f, 50f)),
+        new("state", Sizing.Fixed(60f)),
+        new("spend", Sizing.Star(1f, 0f, 50f)),
+    ];
+
+    // Narrower than the sum of the caps: the capped stars are drawn below their caps. Divider 0 is not here: it
+    // stands beside the slack star, which in so narrow a table shares the difference with the squeezed capped
+    // stars by weight, so it is the slack star's to answer for, not a trade between two columns.
+    [Theory]
+    [InlineData(250f, 1, 4f)]
+    [InlineData(250f, 2, 4f)]
+    [InlineData(250f, 3, 4f)]
+    [InlineData(250f, 1, -4f)]
+    [InlineData(250f, 2, -4f)]
+    [InlineData(250f, 3, -4f)]
+    [InlineData(300f, 1, 4f)]
+    [InlineData(300f, 1, -4f)]
+    [InlineData(300f, 2, 4f)]
+    [InlineData(300f, 2, -4f)]
+    [InlineData(300f, 3, 4f)]
+    [InlineData(300f, 3, -4f)]
+    public void EveryDividerFollowsThePointer_WhenTheTableIsNarrowerThanTheCaps(float width, int divider, float by)
+    {
+        // FlooredSlack is not here: its star leaves the capped ones 8 wide at 300, under their 24 minimum, so a
+        // divider beside one cannot move (it may not shrink, and must not widen). The next theory covers it.
+        var columns = SlackFirst;
+        var widget = Widget((uint)width);
+        var widths = new TableColumnWidths();
+        PaintResizable(widget, widths, columns, width: width);
+        var name = "table-header:divider:" + divider;
+        var before = Named(widget, name).X;
+        var capture = Grab(widget, name, out var x);
+
+        DragTo(capture, x + by);
+        PaintResizable(widget, widths, columns, width: width);
+
+        Named(widget, name).X.ShouldBe(before + by, 0.01f, $"{width} wide, divider {divider}");
+        ShouldLineUp(widget, columns);
+        ShouldStayOnThePage(widget, columns, width);
+    }
+
+    // The pin lifecycle: a capped star an earlier drag widened stays pinned when a later press narrows it, so the
+    // second drag follows the pointer too. Both orders: widen then narrow, narrow then widen.
+    [Theory]
+    [InlineData(250f, 1, 20f, -4f)]
+    [InlineData(250f, 2, 20f, -4f)]
+    [InlineData(250f, 3, 20f, -4f)]
+    [InlineData(250f, 2, 6f, -4f)]
+    [InlineData(300f, 1, 20f, -4f)]
+    [InlineData(300f, 2, 20f, -4f)]
+    [InlineData(300f, 3, 20f, -4f)]
+    [InlineData(300f, 2, 6f, -4f)]
+    [InlineData(250f, 1, -20f, 4f)]
+    [InlineData(250f, 2, -20f, 4f)]
+    [InlineData(250f, 3, -20f, 4f)]
+    [InlineData(300f, 1, -20f, 4f)]
+    [InlineData(300f, 2, -20f, 4f)]
+    [InlineData(300f, 3, -20f, 4f)]
+    public void ASecondDragOfTheSameDividerFollowsThePointer_WhenTheTableIsNarrowerThanTheCaps(
+        float width, int divider, float first, float second)
+    {
+        var columns = SlackFirst;
+        var widget = Widget((uint)width);
+        var widths = new TableColumnWidths();
+        PaintResizable(widget, widths, columns, width: width);
+        var name = "table-header:divider:" + divider;
+
+        var capture = Grab(widget, name, out var x);
+        DragTo(capture, x + first);
+        PaintResizable(widget, widths, columns, width: width);
+        var afterFirst = Named(widget, name).X;
+
+        capture = Grab(widget, name, out x);
+        DragTo(capture, x + second);
+        PaintResizable(widget, widths, columns, width: width);
+
+        Named(widget, name).X.ShouldBe(afterFirst + second, 0.01f, $"{width} wide, divider {divider}, {first} then {second}");
+        ShouldLineUp(widget, columns);
+        ShouldStayOnThePage(widget, columns, width);
+    }
+
+    [Fact]
+    public void SaveAndRestore_KeepAWidenedCappedStarWhereTheDragLeftIt_InANarrowTable()
+    {
+        var widget = Widget(300);
+        var widths = new TableColumnWidths();
+        PaintResizable(widget, widths, SlackFirst, width: 300f);
+        var capture = Grab(widget, "table-header:divider:1", out var x);
+        DragTo(capture, x - 4f);
+        PaintResizable(widget, widths, SlackFirst, width: 300f);
+        var drawn = Enumerable.Range(0, 5).Select(i => Named(widget, "cell" + i).Width).ToArray();
+
+        var restored = TableColumnWidths.From(widths.Save());
+        var again = Widget(300);
+        PaintResizable(again, restored, SlackFirst, width: 300f);
+
+        for (var i = 0; i < 5; i++)
+        {
+            Named(again, "cell" + i).Width.ShouldBe(drawn[i], 0.01f, "column " + i);
+        }
+    }
+
+    [Theory]
+    [InlineData(300f, 2, -12f)]
+    [InlineData(300f, 2, 12f)]
+    [InlineData(300f, 1, 12f)]
+    [InlineData(300f, 1, -12f)]
+    [InlineData(300f, 3, 12f)]
+    [InlineData(300f, 3, -12f)]
+    [InlineData(300f, 0, 12f)]
+    public void ADragNeverWidensTheColumnItNarrows_NorPushesAColumnOffThePage(float width, int divider, float by)
+    {
+        var columns = FlooredSlack;
+        var widget = Widget((uint)width);
+        var widths = new TableColumnWidths();
+        PaintResizable(widget, widths, columns, width: width);
+        var leftBefore = Named(widget, "cell" + divider).Width;
+        var rightBefore = Named(widget, "cell" + (divider + 1)).Width;
+        var capture = Grab(widget, "table-header:divider:" + divider, out var x);
+
+        DragTo(capture, x + by);
+        PaintResizable(widget, widths, columns, width: width);
+
+        var left = Named(widget, "cell" + divider).Width;
+        var right = Named(widget, "cell" + (divider + 1)).Width;
+        if (by > 0f)
+        {
+            right.ShouldBeLessThanOrEqualTo(rightBefore + 0.01f, "the column it narrows");
+        }
+        else
+        {
+            left.ShouldBeLessThanOrEqualTo(leftBefore + 0.01f, "the column it narrows");
+        }
+
+        ShouldStayOnThePage(widget, columns, width);
+    }
+
+    private static void ShouldStayOnThePage(DeclarationWidget widget, TableColumn[] columns, float width)
+    {
+        for (var i = 0; i < columns.Length; i++)
+        {
+            var cell = Named(widget, "cell" + i);
+            (cell.X + cell.Width).ShouldBeLessThanOrEqualTo(width + 0.01f, "cell" + i);
+        }
+    }
+
+    [Fact]
+    public void AFixedColumnAndACappedStarTradeWidthAcrossTheirDivider()
+    {
+        var widget = Widget();
+        var widths = new TableColumnWidths();
+        PaintResizable(widget, widths, SlackFirst);
+        var capture = Grab(widget, "table-header:divider:3", out var x);
+
+        // The divider after state: state takes what spend (a star capped at 50) gives up.
+        DragTo(capture, x + 10f);
+        PaintResizable(widget, widths, SlackFirst);
+
+        Named(widget, "cell3").Width.ShouldBe(70f, 0.01f);
+        Named(widget, "cell4").Width.ShouldBe(40f, 0.01f);
+        widths.Save().Widths.ShouldBe([null, null, null, 70f, 40f]);
+        widths.SizingOf(4, SlackFirst[4]).ShouldBe(Sizing.Star(1f, 0f, 40f));
+    }
+
+    [Fact]
+    public void BesideTheSlackStar_ACappedStarIsResizedAlone()
+    {
+        var columns = new TableColumn[]
+        {
+            new("size", Sizing.Fixed(80f)),
+            new("kind", Sizing.Star(1f, 0f, 60f)),
+            new("path", Sizing.Star()),
+        };
+        var widget = Widget();
+        var widths = new TableColumnWidths();
+        PaintResizable(widget, widths, columns);
+        var before = Named(widget, Divider1).X;
+        var capture = Grab(widget, Divider1, out var x);
+
+        DragTo(capture, x + 15f);
+        PaintResizable(widget, widths, columns);
+
+        Named(widget, "cell1").Width.ShouldBe(75f, 0.01f);
+        Named(widget, "cell0").Width.ShouldBe(80f, 0.01f);
+        Named(widget, Divider1).X.ShouldBe(before + 15f, 0.01f);
+    }
+
+    [Fact]
+    public void ADividerThatWouldResizeNothing_IsNoGrip()
+    {
+        // Two stars share the slack, so the divider between them moves nothing; the one after the fixed column still drags.
+        var columns = new TableColumn[] { new("size", Sizing.Fixed(80f)), new("a", Sizing.Star()), new("b", Sizing.Star()) };
+        var widget = Widget();
+        var widths = new TableColumnWidths();
+        PaintResizable(widget, widths, columns);
+
+        widths.CanDrag(columns, 0).ShouldBeTrue();
+        widths.CanDrag(columns, 1).ShouldBeFalse();
+        Regions(widget).Where(r => r.Result is HitResult.ButtonHit b && b.Action.Contains("divider")).Select(r => ((HitResult.ButtonHit)r.Result).Action)
+            .ShouldBe([Divider0]);
+    }
+
+    [Fact]
+    public void AColumnThatIsNotResizable_HasNoGripOnItsEdge()
+    {
+        var columns = new TableColumn[]
+        {
+            new("name", Sizing.Star()),
+            new("state", Sizing.Fixed(60f)),
+            new("", Sizing.Star(1f, 0f, 50f)) { Resizable = false },
+        };
+        var widths = new TableColumnWidths();
+
+        widths.CanDrag(columns, 0).ShouldBeTrue("state beside the slack star");
+        widths.CanDrag(columns, 1).ShouldBeFalse("beside the column that is not resizable");
+    }
+
+    [Fact]
+    public void AColumnGrowsNoFurtherThanItsMaxWidth()
+    {
+        var columns = new TableColumn[]
+        {
+            new("name", Sizing.Star()),
+            new("spend", Sizing.Star(1f, 0f, 50f)) { MaxWidth = 70f },
+        };
+        var widget = Widget();
+        var widths = new TableColumnWidths();
+        PaintResizable(widget, widths, columns);
+        var capture = Grab(widget, Divider0, out var x);
+
+        // Dragged left, the column beside the slack star grows, to its widest and no further.
+        DragTo(capture, x - 200f);
+        PaintResizable(widget, widths, columns);
+
+        Named(widget, "cell1").Width.ShouldBe(70f, 0.01f);
     }
 
     [Fact]

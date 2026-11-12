@@ -23,7 +23,7 @@ namespace DIR.Lib;
 /// Runtime callers should cache per (codepoint, size) -- rasterising is not free, and a mask is immutable
 /// and safe to share.</para>
 /// <para><b>Runs, not a bitmap.</b> A run is one horizontal span, so drawing is a loop of rectangle fills
-/// and needs no new primitive on a renderer -- the same reason <see cref="IconKind"/>'s pixel painter is
+/// and needs no new primitive on a renderer -- the same reason <see cref="Layout.IconKind"/>'s pixel painter is
 /// built from rectangles. It also stays tiny: a 20px mark is around a hundred runs.</para>
 /// <para><b>Reproducible.</b> <see cref="ManagedFontRasterizer"/> is pure managed (no FreeType, no
 /// DirectWrite), so given the same font file the same inputs produce byte-identical output on any host.
@@ -39,7 +39,7 @@ public static class IconBaker
     /// </remarks>
     public const int DefaultAlphaLevels = 4;
 
-    /// <summary>How many times <see cref="Bake"/> may shrink its request to fit the mask square.</summary>
+    /// <summary>How many times <see cref="Bake(ManagedFontRasterizer, string, Rune, int, int)"/> may shrink its request to fit the mask square.</summary>
     /// <remarks>
     /// A backstop on the fit loop, not a tuning dial: each pass multiplies the request by the overflow
     /// ratio, so it decreases monotonically and converges in one or two passes for a real face. The cap
