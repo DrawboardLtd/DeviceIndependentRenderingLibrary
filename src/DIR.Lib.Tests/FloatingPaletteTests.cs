@@ -218,6 +218,97 @@ public class FloatingPaletteTests
     }
 
     [Fact]
+    public void ThePointerLeavingTheWindowEndsHoverAndStartsTheIdleDelayAtTheLeave()
+    {
+        var state = new FloatingPaletteState();
+        state.NoteArranged(new RectF32(100f, 100f, 120f, 200f), 0f, DesignScale.One);
+        state.NotePointer(150f, 150f);
+        state.IsEngaged.ShouldBeTrue();
+        // A host reads nothing while the pointer rests on the palette, so the engagement clock goes stale.
+        state.AgeEngagement(FloatingPalette.IdleDelaySeconds + FloatingPalette.FadeSeconds + 1f);
+
+        state.NotePointerLeft();
+
+        state.IsEngaged.ShouldBeFalse();
+        state.Fade.ShouldBe(1f, 0.001f);
+        state.NextFrameIn!.Value.TotalSeconds.ShouldBe(FloatingPalette.IdleDelaySeconds, 0.25);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void NextFrameForFollowsTheWholeCurve(bool collapsed)
+    {
+        FloatingPalette.NextFrameFor(0f, true, collapsed).ShouldBeNull();
+        FloatingPalette.NextFrameFor(FloatingPalette.IdleDelaySeconds + 0.1f, true, collapsed).ShouldBeNull();
+
+        FloatingPalette.NextFrameFor(0f, false, collapsed)!.Value.TotalSeconds
+            .ShouldBe(FloatingPalette.IdleDelaySeconds, 0.001);
+        FloatingPalette.NextFrameFor(FloatingPalette.IdleDelaySeconds - 0.1f, false, collapsed)!.Value.TotalSeconds
+            .ShouldBe(0.1, 0.001);
+
+        FloatingPalette.NextFrameFor(FloatingPalette.IdleDelaySeconds + 0.01f, false, collapsed).ShouldBe(TimeSpan.Zero);
+        FloatingPalette.NextFrameFor(FloatingPalette.IdleDelaySeconds + FloatingPalette.FadeSeconds / 2f, false, collapsed)
+            .ShouldBe(TimeSpan.Zero);
+
+        FloatingPalette.NextFrameFor(FloatingPalette.IdleDelaySeconds + FloatingPalette.FadeSeconds, false, collapsed).ShouldBeNull();
+        FloatingPalette.NextFrameFor(60f, false, collapsed).ShouldBeNull();
+    }
+
+    [Fact]
+    public void IsFadingIsTrueOnlyWhileTheAlphaMoves()
+    {
+        var state = new FloatingPaletteState();
+        state.NoteArranged(new RectF32(100f, 100f, 120f, 200f), 0f, DesignScale.One);
+
+        state.NotePointer(150f, 150f);
+        state.IsFading.ShouldBeFalse();
+        state.NextFrameIn.ShouldBeNull();
+
+        state.NotePointer(10f, 10f);
+        state.AgeEngagement(1f);
+        state.IsFading.ShouldBeFalse();
+        state.NextFrameIn!.Value.TotalSeconds.ShouldBeGreaterThan(0.0);
+
+        state.NoteEngaged();
+        state.AgeEngagement(FloatingPalette.IdleDelaySeconds + FloatingPalette.FadeSeconds / 2f);
+        state.IsFading.ShouldBeTrue();
+
+        state.NoteEngaged();
+        state.AgeEngagement(FloatingPalette.IdleDelaySeconds + FloatingPalette.FadeSeconds + 1f);
+        state.IsFading.ShouldBeFalse();
+        state.NextFrameIn.ShouldBeNull();
+    }
+
+    [Fact]
+    public void AfterThePointerLeavesTheNextFrameIsTheIdleDelayAway()
+    {
+        var state = new FloatingPaletteState();
+        state.NoteArranged(new RectF32(100f, 100f, 120f, 200f), 0f, DesignScale.One);
+        state.NotePointer(150f, 150f);
+
+        state.NotePointerLeft();
+
+        state.NextFrameIn!.Value.TotalSeconds.ShouldBe(FloatingPalette.IdleDelaySeconds, 0.25);
+    }
+
+    [Fact]
+    public void ThePointerLeavingWhileAlreadyOutsideThePanelChangesNothing()
+    {
+        var state = new FloatingPaletteState();
+        state.NoteArranged(new RectF32(100f, 100f, 120f, 200f), 0f, DesignScale.One);
+        state.NotePointer(10f, 10f);
+        state.AgeEngagement(FloatingPalette.IdleDelaySeconds + FloatingPalette.FadeSeconds + 1f);
+        var rested = state.Fade;
+        rested.ShouldBeLessThan(1f);
+
+        state.NotePointerLeft();
+
+        state.IsEngaged.ShouldBeFalse();
+        state.Fade.ShouldBe(rested, 0.001f);
+    }
+
+    [Fact]
     public void ClickingARowReportsThatRowsAction()
     {
         var clicked = new List<string>();

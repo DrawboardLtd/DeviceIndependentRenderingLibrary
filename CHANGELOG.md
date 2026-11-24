@@ -9,6 +9,777 @@ this file disagrees with. Bump it there and add the entry here, in the same comm
 Breaking changes carry their migration steps in [MIGRATION.md](MIGRATION.md); this file says what
 changed and why.
 
+## 11.98
+
+- `Node.FocusRing` (`FocusRingStyle`, set with `WithFocusRing`): a declared stroke drawn outside a node's rounded edge while the list cursor is on its hit. It takes no layout space, it is in the damage signature, and `DamageRect` grows by the ring's width. Cells draw no ring yet; Console.Lib's cell painter is its own flight (SharpAstro/Console.Lib#107).
+- `FocusRingStyle.Offset` (init-only, design units, default 0, also the third argument of `WithFocusRing`): a gap between the edge and the ring, so what is behind the node shows through. Without it the ring of an accent-filled control (an Accent button, an on chip or tile) is the fill's own colour and cannot be seen. The ring's radius and `DamageRect` follow the offset. Like the shadow's extent, the damage growth is in design units; at a larger scale the pixel ring is wider than the growth.
+- `FocusRingStyle.Sides` (init-only, default all): the sides of the ring that are drawn. A part against a neighbour (a split button's two halves) leaves out the side that faces it. The ring keeps its rounded corners: it is drawn whole and clipped on each omitted side to the node's own edge, so the open end is flat at the neighbour.
+- `UiMetrics.FocusRingGap` (init-only, default 2, survives `default(UiMetrics)`): the offset the themed controls declare.
+- `UiMetrics.FocusRingWidth` (init-only, default 2, survives `default(UiMetrics)`).
+- `Button`, `Chip`, `SplitButton` and `ToggleTile` show focus as a 2-unit ring in `UiPalette.Focus` instead of painting the hover fill under the list cursor. List rows (`GroupedTreeTable`, menus) keep `BgFocus`. Settles DIR312:R1.13.
+
+## 11.97
+
+Theme-driven Slider, Dropdown and Setting row (#314, step 3), additive. Every new member is an overload, a type or an
+init-only property, so no existing signature or constructor changes and the old look stays as it was.
+
+- `SliderStyle` and `DropdownStyle` and `SettingRowStyle`, with `ControlStyles.Slider`, `ControlStyles.Dropdown` and
+  `ControlStyles.SettingRow` (init-only, not required) and their `SliderOrDerived`, `DropdownOrDerived` and
+  `SettingRowOrDerived` fallbacks, which derive from Accent and Standard when a style is unset. `ControlStyles.For` sets all three.
+- `Builder.Slider(state, theme, ...)`: the themed overload. The track fills with the accent up to the thumb over a control-fill
+  track and the thumb is round with an accent centre and a ring. It rides on the init-only `Content.Slider.RoundThumb`,
+  `ThumbRing` and `FillColor` properties; explicit colour arguments still win.
+- `Builder.Dropdown(anchor, state, theme, ...)`: the themed menu overload, a raised surface with a shadow and hover rows.
+- `Builder.DropdownBox(label, state, theme, ...)`: the closed box (control fill, edge ring, control radius, a trailing
+  `CaretDown` that turns to `CaretUp` while the menu is open).
+- `Builder.SettingRow(title, subtitle, trailing, theme, onClick, disabledReason, hit)` and `SettingTrailing`
+  (`Chevron`, `Expand(open)`, `External`, `Of(node)`): a whole card row on the panel with the control radius, a hover fill and
+  the whole row as one hit; a trailing node keeps its own hit and press. Title and subtitle end in an ellipsis with the whole
+  text as tooltip.
+
+The old `Builder.Slider` and `Builder.Dropdown` overloads look exactly as before. Console.Lib's cell painter and the other
+consumers are not built here.
+
+## 11.96
+
+Theme-driven choice controls (#313, step 2), additive. New public members:
+
+- `ChipStyle` and `ControlStyles.Chip` (plus `ControlStyles.ChipOrDerived`): the filter chip look, a round pill that is
+  filled with the accent and ringless when on, the neutral fill with the control edge ring when off.
+- `Builder.Chip(label, on, onClick, theme, icon, disabledReason, tooltip, hit)` and its row helper
+  `Builder.ChipRow(cursor, listId, theme, chips)`, a horizontal list that Left/Right step.
+- `Builder.SplitButton(label, on, onPrimary, onDetails, theme, icon, tooltip, detailsTooltip, disabledReason, hit,
+  detailsHit)`: two separate hits with a thin divider, the left part toggling or acting and the right a `CaretRight`
+  that opens details, each with its own hover, pressed fill and tooltip. It is styled from the Accent and Standard
+  styles, so it adds no style type of its own.
+- `ToggleTileStyle` and `ControlStyles.Tile` (plus `ControlStyles.TileOrDerived`): the tile's fills, ring, radius, side
+  (`SideScale` times `UiMetrics.ButtonHeight`), label gap and label ink.
+- `Builder.ToggleTile(icon, label, on, onToggle, theme, opens, disabledReason, tooltip, hit)`: an icon tile (Accent when
+  on, Standard when off) with its label under it, ending in an ellipsis at the tile's width (`TextTrim.End`), with the whole label as the
+  caption's tooltip (a caller's `tooltip` describes the tile), so a long label never squeezes the icon; the tile and its label are one hit.
+
+The new `ControlStyles` members (`Chip`, `Tile`) are init-only and not required, so an existing
+`new ControlStyles { Accent, Standard, Subtle, Hyperlink }` still compiles and gets derived styles. The split button shows its rest fill under both parts (no notch beside the divider) and its caret part defaults to the
+tooltip `label + " options"`; the tile's label gap is `PaddingX / 2` set or derived. The tree shape is unchanged. Console.Lib's cell
+painter and the other consumers are not built here.
+
+## 11.95
+
+Notifications keep long text on the page, and a host can build the list frame alone (#275), additive. A word wider
+than its line never runs past the row: `NotificationsLayout.Wrapped` splits a word of 16 characters or more after `\`, `/`, `|`, `,`, `;`, `=`, `&`, `-`, `_` or `.` (never at a `.` or `,` inside a number such as `11.95`; shorter words such as `2.1` stay whole), and a
+capped wrap with `Ellipsis` ends any text leaf still wider than its line in an ellipsis (the whole text stays the
+hover), and that cut leaf ends its line, so no narrow leaf sits after the ellipsis. That engine rule reaches every capped `Ellipsis` wrap, not only notifications: an over-wide piece is now cut
+with an ellipsis instead of clipped (pilot's `WrappedProse` comment that the engine ends a capped wrap in an ellipsis
+only when it drops a child is stale; a follow-up for pilot). New public `NotificationsLayout.BuildList(feed, state, colors, style)` returns the bar's header with Clear and
+its scrolled list as wide and tall as it is given, and is not a surface (a page of its own covers nothing); the open
+bar is built from the same frame and arranges as before. `Build` leaves the strip out when
+`NotificationsStyle.StripWidth` is 0 or less (no bell, no count, no shortcut node); the `ToggleKey` shortcut lives on
+the strip, so a strip-less host binds its own. The cell snapshots of notification text change where a long word now
+splits.
+
+## 11.94
+
+A staying toast's buttons wrap instead of running past the card (#318), additive. `Notification.Buttons` now sit in an
+Auto-width `WrapH` behind the star spacer: while they fit they stay right-aligned on one row as before (pixel baselines
+unchanged), and past the card they wrap onto further rows. The arranged tree of every staying toast gains that Wrap
+node, so a consumer's cell snapshot differs by the Wrap node and the spacer taking the old gap. A single button wider
+than the whole card still gets its own row and overflows, as `ArrangeWrap` documents.
+
+## 11.93
+
+Theme-driven buttons and links (#312, step 1), additive. New public members:
+
+- `UiPalette.ControlFill`, `ControlFillHover`, `ControlFillPressed`, `ControlEdge`: the neutral control roles, derived
+  from the existing palette so every palette and theme looks as it did.
+- `UiMetrics.ControlRadius` (init-only, default 4), `UiMetrics.ControlEdgeWidth` (default 1) and `UiMetrics.LinkArrowGap`
+  (default 2); `ButtonStyle.EdgeWidth` and `HyperlinkStyle.ArrowGap` take them.
+- `ControlStyles`, `ButtonStyle` and `HyperlinkStyle` records, and `UiTheme.Controls` (derived per instance by
+  `ControlStyles.For`; restyle one kind with a `with`).
+- `Layout.Node.PressedBackground`, set with `BgPressed`: painted while the primary button is held on the node.
+- `Layout.Content.Text.UnderlineOnHover`, set with `Node.UnderlineOnHover()`: shown while the pointer is in the nearest
+  node with a hit that holds the text, so hovering an external link's arrow underlines its text (painter and
+  `LayoutDamage` alike).
+- `LayoutDamage.Signature(node, pointer, pressOrigin)` and `LayoutDamage.Compute(..., previousPress, currentPress, ...)`:
+  the press-aware overloads, so a host's damage repaint sees a pressed fill come and go.
+- `Layout.ButtonKind` (Accent, Standard, Subtle) and `Builder.Button(label, kind, onClick, theme, icon, opens,
+  disabledReason, tooltip, hit)`: height `ButtonHeight`, everything else from `UiTheme.Controls`; `opens` adds a
+  `CaretRight` (a right-pointing caret, the family having no chevron); a disabled button is flat, takes no press and shows its reason.
+- `Builder.Hyperlink(label, onClick, theme, external, hit)`: link colour (the accent, stepped towards `BodyText` until it
+  reads at 4.5:1 on both `PanelBg` and `ContentBg`), underline on hover, hand cursor, a trailing north-east
+  arrow when `external`; its hit is a `ButtonHit` named by the label unless `hit` says otherwise.
+
+Console.Lib's cell painter and the other consumers are not built here; the new Node members are inert for a painter that
+ignores them.
+
+## 11.92
+
+Fix, additive, no API change. A widget listed in `InputRouter.Widgets` that did not paint a cycle now stops counting
+in `InputRouter.AfterPaint` (decided per settings object, so a wrapper that forwards `Ui` counts as the inner
+widget): its settings are no longer asked whether the pointer claim settled, and the surfaces it
+painted last are no longer laid over the widgets painted before it. A host that kept a toast in a widget with its own
+settings saw endless redraws, and a row dark beneath the toast's old rect, once that widget stopped painting. Consumers
+need no change.
+
+## 11.91
+
+A staying `Notification` carries the host's own buttons in its button row (#302). The new init-only
+`Notification.Buttons` (`Func<IReadOnlyList<Layout.Node>>?`) is evaluated every build like `Row`, so a host can
+show a working or done state, and its buttons are drawn after the action and before Dismiss. Built with
+`NotificationsLayout.PrimaryButton` and `PlainButton`, they share one height, padding, radius and middle with
+Dismiss, where a host's own row above it did not. Dismiss is filled only when it stands alone; beside an action
+or any host button it is plain. Additive: an init-only property, no constructor change.
+
+## 11.90
+
+**Fix: the arrows could not get past a run of disabled rows taller than a scrolled list's viewport.** (additive)
+
+- A scrolled stack lays out only the rows within a viewport's extent of its viewport (`Engine.ArrangeStack`; pilot's
+  chat is 300 rows and more), and the arrows step onto the nearest laid-out row that is enabled. A run of disabled rows
+  taller than that margin holds no such row, and the rows after it are not in the frame at all, so Down (or Up) was
+  refused as if the list had ended: with five disabled 20 unit rows in a 50 unit viewport the key did nothing.
+- **`IPixelWidget.RevealListEdge(cursor, delta)`** (a default interface method that answers false, so an implementer
+  compiles and runs unchanged). When no row can take the cursor, `PixelWidgetBase.MoveListCursor` and `InputRouter`'s
+  declared-list step ask the surface to bring the farthest row it holds in that direction into view. If the list
+  moved, the key is taken: the next paint lays out the rows after it and the next press continues, so a long run
+  scrolls by under repeated presses and the cursor lands on the first enabled row beyond it. If it did not move, that
+  row was already in view and the key is refused, as at any end of a list.
+- `PixelWidgetBase` implements it from the scrolled rows the last paint noted, and `CompositeWidget` passes the question
+  to its children as it passes `CollectClippedListRows` and `RevealListRow`, so a list painted by a child of a composed
+  frame is reached too. Console.Lib's cell surface shares the engine and so the defect; it gets the same method in its
+  next release.
+
+## 11.89
+
+**A segmented control and an icon toggle button, with words that drop when the row is narrow.**
+(additive; issue #290)
+
+- **`Node.NarrowForm`** (`OrWhenNarrow(node)`): a node declares the form it takes when its full form does not fit the room
+  it is given. The engine MEASURES the full form and swaps in the narrow one whole, identically in measure and arrange,
+  for float and int (cell) measure contexts.
+- **`Builder.Segmented`**: a themed one-of-few control built from `UiTheme` only. Each segment is icon and word, and every
+  word drops at once when the control does not fit. Left/Right move the choice when it has the keyboard, segments take
+  shortcuts, and a disabled segment says why. The chosen segment's ink comes from the new `UiPalette.InkOn(fill)`.
+- **`Builder.IconToggle` and `Builder.IconAction`**: a square icon button from the SVG set. Pressed, a toggle fills with the
+  accent and takes the filled form of its icon; its words are its tooltip, and an optional word beside the icon drops by
+  the same narrow-form rule. `IconAction` is the same button with no pressed state (OpenInPage).
+- **Horizontal declared list**: `DeclaredList.Horizontal` and `SelectOnStep` (init-only), and a `Node.ListOf(cursor, id,
+  horizontal, selectOnStep)` overload. `InputRouter` steps a horizontal list with Left/Right, and with `SelectOnStep` acts
+  on the row each step lands on.
+- **`IconSet.FilledForm(kind)`**: Pin maps to PinFilled; a kind with no filled drawing maps to itself.
+
+Console.Lib needs a follow-up for the cell look of these controls. No existing public member changed shape.
+
+## 11.88
+
+**Toasts look like toasts: tinted by severity, with an edge, a key shadow and a severity icon.**
+(additive; issue #289)
+
+- **`Layout.Node.Shadow`**: a declared drop shadow (`Shadow(ShadowStyle)`, or `Elevated(level)` for a stock shadow by
+  elevation) painted under a node's rounded rect. Cells draw none and it takes no cells, so a cell arrange is the same
+  with or without it. The painter draws it through the new public virtual `Renderer.DrawShadow`, whose default stacks
+  rounded fills (one per pixel of blur): a GPU renderer (SdlVulkan.Renderer, WebGl.Renderer) should override it.
+- **An SVG icon set** (`IconSet`: twelve embedded outlines on one 16-unit grid, drawn in the caller's ink) and new
+  `IconKind` members (including `Info`, `Warning`, `Error`, `Close`), each with one character in `IconGlyphs` for
+  cells. Console.Lib must spell the new members in its own `EveryIconKindHasAGlyph` test.
+- **Theme tokens**: `UiPalette.RaisedBg` and `UiPalette.Edge` (init-only, derived by default), `UiMetrics.CornerRadius`,
+  `UiMetrics.Shadow` and `UiMetrics.DefaultShadow` (init-only, no binary break), and `NotificationsColors` gains tint roles (`TintedFill`, `TintedEdge`, `InkOn`, `Raised`, `Edge`,
+  `Shadow`, `OneHue`, `CornerRadius`, and an init-only `Body`), plus `RGBAColor32.Mix`, `RGBAColor32.ContrastRatio` and
+  `UiPalette.IsOneHue`. A one-hue palette falls back by rule: no tint, no shadow, and an edge moved toward `Text`
+  until it reaches 3:1 against the page (`Page`, from `UiPalette.ContentBg`; `EdgeOnPage`), since it is then the only
+  thing marking the card.
+- **Toast look B.** A 1-unit tinted edge, radius 6, the key shadow, an 18-unit severity icon at the left, the title in
+  `Text` and the body in body ink. A fading toast has a Close cross at its top right (`NotificationPart.Close`) that
+  dismisses it; the card's own hit still reaches the host. A staying card's first button is filled in the severity colour
+  and the rest are plain: the public `NotificationsLayout.PrimaryButton` / `PlainButton`, also used in the bar's rows
+  (the rows keep their own left-border look). The countdown sits inside the rounded card.
+  `NotificationsToastLookTests` asserts the contrast of every ink on its fill. The edge is the severity colour itself (3:1
+  against the page on every severity), and the source line's dim ink is derived per fill (`DimOn`) to keep 4.5:1.
+  Shadows are cheap on a few toasts but not on many rows: `Elevated(3)` on 30 rows costs about 12 ms a frame in
+  `RgbaImageRenderer`, so hosts keep shadows off rows.
+- **Small public additions**: `NotificationsColors.From(UiTheme)` (every role from a theme in one call),
+  `NotificationsColors.OnSeverity` (init-only ink on a filled severity button; `InkOn` derives it when null),
+  `NotificationsColors.ToastShadow` (the shadow to paint, null when one-hue), `NotificationsColors.DimOn(fill)`,
+  `NotificationsColors.EdgeOnPage()` and `NotificationsColors.OnPage(edge)`. A multi-hue `TintedEdge` that misses 3:1
+  against `Page` is now moved toward `Text` until it reaches it, as the one-hue edge already was.
+- **Shadow and damage members**: the `Layout.ShadowStyle` record (`OffsetX`, `OffsetY`, `Blur`, `Color`, and `Extent`,
+  how far the shadow reaches past the node's rect), the `Node.Shadow(offsetX, offsetY, blur, color)` overload that
+  builds one in place, and the `Node.ShadowStyle` property that reads it back. `LayoutDamage.PaintSignature.Shadow` is
+  init-only, so the record's constructor keeps its arity, and `LayoutDamage.DamageRect` now grows a damaged rect on
+  every side by a shadow's `Extent` rounded up plus one design unit (the default shadow reaches one unit past its extent, and
+  the offset rounds), in the bounds' unit, so a shadow's fringe is repainted. A shadow with zero alpha grows nothing, and a
+  surface at a `DesignScale` other than 1 passes bounds divided by that scale.
+- **Icon and colour helpers**: `IconSet.IsVectorBacked` (whether an `IconKind` has an embedded outline) and
+  `IconSet.Get` (the outline for a kind), and `RGBAColor32.RelativeLuminance` (the WCAG luminance that
+  `ContrastRatio` is built on).
+- **Toast constants**: `NotificationsLayout.ToastIconSize` (the 18-unit severity icon), `CloseBoxSize` (the square hit
+  box of the Close cross) and `ButtonPadY` (vertical padding of a toast button).
+
+## 11.87
+
+**The points DIR.Lib's reviews left for later, worked through: one layout fix, one loader rule, one test that never ran.**
+(additive, with one tightening in the prototype loader; issues #214 to #285 titled "Follow-up of")
+
+- **The menu panel's content fills its card.** `MenuLayout.BuildPanel`'s column was as wide as its widest row and sat at
+  the card's left edge. It showed whenever the card is wider than its content, which is a short menu clamped up to
+  `MenuPanelStyle.MinWidth` and every portrait card at full width: the title off-centre (in the test's measure its
+  middle was at 84 on a 360 wide surface, where the card's is 180), the close control short of the corner, and Back
+  touching close when the header is the widest row. The column is now `Star` wide. `PlanPanel` is unchanged, so a card
+  keeps its size and font. Found by the test #256 asked for, a case where the header decides the fit.
+  `MenuPanelRenderTests` pins the look with a wide and a narrow baseline.
+- **Fix: the arrows could stop on, and Enter could run, a row of a disabled group scrolled out of view.**
+  `PixelWidgetBase` read a node's disabled state only for nodes it painted, so rows under a disabled container that a
+  scrolled node clipped away were noted enabled for the keyboard. A disabled node now disables what it holds whether or
+  not it is on screen (a disabled ROW out of view was already handled). Found while making the same fix in Console.Lib's
+  cell surface (Console.Lib #52), where the review note that pointed at it said it "mirrors `PixelWidgetBase`".
+- **A prototype number that measures something drawn may not be negative.** `padding`, `borderWidth`, `borderRadius`,
+  `size`, `gap`, `firstExtent`, `fontSize`, `iconSize`, `minWidth` and `minHeight` below zero are a load problem at their
+  path ("expected a number that is not negative"); a negative `width` or `height` already was, and its message now says
+  why. Zero loads; a slider's `min` and `max` and a progress `value` may be any number. `PrototypeProperty.NonNegative`
+  (init-only) marks them, and `prototype-format.md` has a Numbers section a test holds to the vocabulary. **A document
+  with such a value loaded before and reports a problem now** (#257).
+- **A player's `target` follows the player's design size.** `PrototypePlayer.BuildTree` gives its builder the player's
+  `DesignSize` before every build, so a size written on the public `TreeBuilder` no longer leaves `target` and the modal
+  centring on one size while `Fit` scales by another. `PrototypeTreeBuilder.DesignSize`'s doc says that it sets `target`,
+  and that a builder used on its own with no size leaves `target` unset (#262, #263).
+- **The Debug twin's targets file is checked at last.** `DebugTwinNupkg_CarriesItsOwnNamedTargets` looked for the twin
+  one folder above the repository, and CI ran it before the twin was packed, so it skipped on every machine and nothing
+  had ever opened a twin. It looks in the repository, CI runs it again after the twin pack, and there
+  `DIR_LIB_REQUIRE_DEBUG_TWIN=1` makes a missing twin a failure. The twin does carry
+  `buildTransitive/DIR.Lib.Debug.targets` (#253).
+- **`--filter` works on this runner.** `CLAUDE.md` and `PILOT.md` said VSTest's `--filter` fails as an unknown option.
+  It does not: `--filter "FullyQualifiedName~MenuPanelTests"` runs that class's 42 tests on the 10.0.404 and 11.0.100
+  SDKs, and an expression that matches nothing exits 8. `--logger` and `--blame-*` do fail (exit 5), as the pages say.
+  The 11.1 entry's "`--filter` is unchanged" was right all along (#285).
+- **Tests that pin what they claim.** The table header tests find a column's grip cell by what it is and fail by name
+  when the row stops holding one cell per column (#214). A press on a child window's border strip is asserted to raise
+  that window, with a second window active first (#281). New tests pin that building a prototype tree never raises
+  `PrototypeState.Changed`, that a bare builder sets `target` only once it has a size, and that a `default`
+  `PrototypeFinding` prints (#262, #263).
+- **Comments.** `PixelWidgetBase`'s private `RevealListCursor` says why it is apart from `RevealListRow` (#223); the
+  summaries of `ExtentFacts` and `Engine.Extent` say the cache does not hold under a text editor (#227); a test comment
+  that asked a question states the arithmetic (#231).
+
+## 11.86
+
+**What is painted over something takes the pointer from it, and toasts sit at the bottom right.** (additive; #282)
+
+- **`Layout.Node.IsSurface`, set with `AsSurface()`.** Within a surface's rect, nothing painted before it (earlier in
+  the same tree, or in a widget painted beneath) gets the hover highlight, the tooltip, the cursor, a press, a release
+  click, a double click, a context menu or the wheel. What the surface contains (its buttons, its own hover rows) works
+  as ever. Declared rather than inferred from an opaque background, so no existing tree changes until it says so.
+- **One rule, in the engine.** The painter registers a region over the surface's whole rect (its own `Hit`, else a
+  `ChromeHit`) marked `ClickableRegion.IsSurface` (init-only), and every walk of `InputRouter` stops there: press,
+  press-within, context menu, tooltip, cursor, wheel, the click under a selection, the declared list a press chooses
+  and the start of a text selection. A surface with no handler takes a press and does nothing; the wheel over it is
+  consumed, not handed to `Unhandled`. A release with no capture still reaches `Unhandled`, so a host's own drag that
+  ends over a toast still ends. `ClickableRegionTracker.HitTestCursor` and `PixelWidgetBase.ScrollTargetAt` stop at a
+  surface too.
+- **Hover rides the popover's pointer claim.** Hover resolves during paint, before a later surface is known, so
+  `WindowUiSettings` notes each painted surface with its paint order (`NotePaintedNode`, `NoteSurfacePainted`,
+  `PaintedSurfaces`, `IsCoveredBySurface`), clears them per cycle, carries them into the next and folds them into
+  `PointerClaimSettled`: the frame a surface appears, moves or goes asks the router for one more, exactly as a popover
+  that opens does. `HoverMayAnswer` is the one predicate for both claims; `HoverAllowedAt` and `PointerHovers` follow it.
+- **Across widgets that share no settings too.** A host may paint its toasts in a widget it never shares settings with
+  (pilot does). `InputRouter.AfterPaint`, which knows the paint order of every widget in its list, lays each widget's
+  surfaces onto the settings of the widgets painted before it, bounded by paint order so a widget sharing the page's
+  settings but painted after the surface (a panel over the toasts) still lights, and asks for one more frame when that
+  set changes. It also asks every listed widget's settings for `PointerClaimSettled`, not only the router's own.
+- **`NotificationsLayout`**: every toast card (fading and staying) and the open bar are surfaces. A fading toast keeps
+  its `NotificationHit` (`ToastIdOf` still names it); a staying card's body takes the press and does nothing; its
+  buttons act as ever. The toast stack sits at `NotificationsStyle.Corner`, default `ToastCorner.BottomRight`, and never
+  changes corner with the pointer; at the bottom the newest toast is nearest the corner, so a new toast pushes no older
+  one under the pointer. `Build(..., pointer, contentRect)` still compiles and ignores both; `PlaceToasts`,
+  `TopRightRegion` and `ToastHeightEstimate` are `[Obsolete]`.
+- **`ChildWindowsLayout`**: each window (and the tabbed box) is a surface, so the host's tooltip, hover and wheel no
+  longer reach through a window's body, a back window's close button no longer lights through the one in front, and a
+  maximised window's border no longer passes a press to the host.
+- **Cost to consumers.** Binary: none (init-only properties and new members only; no record constructor changed). Source:
+  `Build(page, feed, state, colors, style, pointer)` with six positional arguments no longer compiles (the seven-argument
+  overload has no default for `contentRect`; no caller in the org passes six). Behaviour and warnings, for pilot when its
+  pin moves (a pilot follow-up flight): its host call `NotificationsHost.Frame` compiles and binds unchanged, but
+  `Pilot.Gui.Tests/ToastTests.cs` calls the now `[Obsolete]` `TopRightRegion`, which is CS0618 and, with pilot's
+  `TreatWarningsAsErrors` in Release and CI, a build error; and two of its tests pin the old placement and fail on
+  behaviour: `AFadingToastPausesWhileThePointerIsOverIt` looks for the toast only near the top, and
+  `NoToastIsPlacedUnderThePointerAndNoMoreThanThreeShow` expects the toast to dodge the pointer, which it no longer does
+  by design. Pilot's own open bar (`NotificationsHost.OpenBar`) is pilot's tree, not the library's bar, so it does not
+  become a surface until pilot marks it `AsSurface()`; pilot's toasts are the library's and do. A non-pixel painter
+  (Console.Lib's `CellLayout`) registers no surface regions until it learns `IsSurface`, so a terminal (`Pilot.Tui`)
+  keeps the old behaviour.
+
+## 11.85
+
+**Floating child windows inside one host window, as a model and one declaration.** (additive)
+
+- **`DIR.Lib.ChildWindows.ChildWindowSet`** is the surface-neutral model: front-to-back order, the one active child,
+  `BringToFront`, `Move`, `Resize` (never below `MinWidth` x `MinHeight`), `Close`, and the `Cascade`, `Tile` and
+  `ShowAsTabs` commands. A move or resize in an arranged set frees every child where it stands first; `ShowFree`
+  restores. `ShowAsTabs(host)` takes the host rect, as `Cascade` and `Tile` do. `Version` and `Changed` work as on
+  `NotificationFeed`. Everything is design units against a host rect, with no surface read.
+- **The keep-reachable rule**: a strip of each title bar (`KeepReachableStrip`, 48 units) always stays inside the host
+  on every edge, and the title bar never leaves the top or bottom, so a window cannot be dragged or left (by a
+  shrinking host) where it cannot be grabbed. `NoteHost` re-clamps free windows and refits tiles and tabs.
+- **`ChildWindowsLayout.Build(content, set, windowContent, colors, style, scale, onChanged)`** declares the set as one
+  `Layout.Node` tree: each child an `Anchored` free node in its own `Overlay` layer, back to front, with a title bar
+  (active marker, ellipsised title with the whole title on hover, close button), a drag to move, resize handles and a
+  body that swallows presses. The active child says so in words (`ChildWindowStyle.ActiveLabel`, "active") beside
+  its marker, as well as in colour. Tabs use `TabStripTree`; the strip's empty part is a `ChildWindowPart.Strip` hit
+  that swallows a press so it never reaches the host content behind it. Every gesture is declared, so `InputRouter`
+  routes it and a host writes no pointer code.
+- **The handles** are one layer laid out by the engine (fixed thin rows and columns, stretched along each edge, each a
+  `Content.Fill` keyed `ChildWindowsLayout.HandleFillKey`, which a host's drawFill skips), so they keep a cell on a
+  cell surface. None covers the close button: the top edge stops short of it and the right edge starts below the
+  title row, so there is no top-right corner handle. The other corners show the new diagonal cursors.
+- **Minimised and maximised**: a maximised child is drawn over the whole host with no handles and no drag; a minimised
+  one is left out, for the host to show where it can be restored.
+- **Tab labels** are measured by `ChildWindowStyle.MeasureLabel` when the host gives one, else estimated at
+  `TabCharEm` (now 0.75 em), so a short title such as "Camera" is not ellipsised while the strip has room.
+  `ChildWindowStyle.TabRule` (default 1) is the strip's rule and accent thickness; a cell host passes 0, since each
+  is a fill a cell surface keeps at one cell, and in a one-row strip the rule took the labels' row.
+- **`Layout.Node.Anchored.OffsetsPerAxis`** (init-only, off by default): the engine maps the offsets with
+  `ToSurfaceX` / `ToSurfaceY` by axis instead of the axis-less `ToSurface`, so an anchored node lands on the right
+  cell. Off, every existing arrangement is unchanged.
+- **`CursorKind.ResizeNWSE` and `ResizeNESW`**, appended so every earlier value keeps its number. A host that does not
+  map them yet falls back to its default cursor.
+- **`Layout.Node.OnPressWithin`** (init-only, `WithPressWithin`): the router tells the topmost declaring container at
+  or below the region that takes a press, before the control acts, so a press on a content control still raises its
+  window. No constructor changed. Console.Lib, SdlVulkan.Renderer and WebGl.Renderer hosts that run their own
+  dispatch instead of `InputRouter` do not get it.
+- Tests: `ChildWindowSetTests`, `ChildWindowsLayoutTests` and `ChildWindowsRenderTests`, which keeps five pixel
+  baselines (`Baselines/childwindows_*.png`) and five cell snapshots (`Snapshots/childwindows_*.txt`).
+
+## 11.84
+
+Additive. `WindowUiSettings.CaretPhase` holds the caret blink phase once per window, beside `CaretRect`:
+the loop that owns the frames sets it once per frame from `CaretBlink.PhaseAt(TimeProvider)`, and
+`PixelWidgetBase` draws its text inputs and editors from it. `PixelWidgetBase.CaretPhase` stays and
+forwards get and set to it (not obsolete, so warnings-as-errors consumers keep building; it goes in the
+next major). A child given its parent's `Ui` now shares the parent's phase.
+
+## 11.83
+
+**A notifications component: a bell, a side bar, toasts and the list, as one declaration.** (additive)
+
+- **`DIR.Lib.Notifications`**: `NotificationFeed` is the surface-neutral model a host fills (`Post`, `Advance`,
+  `PointerOver`, `Dismiss`, `Handle`, `Clear`; `Toasts`, `NeedsYou`, `History`, `BellCount`, `WorstSeverity`). The clock
+  is passed in, so there are no timers and no wall-clock reads and a test steps time.
+- **`NotificationsLayout.Build(page, feed, state, colors, style, pointer, contentRect)`** returns one `Layout.Node`
+  tree, arranged alike by a pixel (float) and a cell (int) measure context. Collapsed, a narrow strip at the right edge
+  holds the bell (worst severity colour, count under it) and up to three toasts overlay the page, fading ones with a
+  countdown bar and staying ones with their buttons. Open, the bar covers the right of the page as an overlay, with
+  Needs you first, then History, and a Clear button. The page's rect is the same open or collapsed.
+- **Toasts dodge the pointer**: top right, or bottom right while the pointer is over where the top-right stack
+  would sit (`NotificationsLayout.PlaceToasts`, pure). Long text wraps to `MaxTextLines` with an ellipsis and the whole
+  text on hover. `NotificationsState` holds open or collapsed and the list's scroll; Ctrl+N toggles it.
+- **`IconKind.Bell`** is a new icon kind, drawn by the pixel painter. A cell surface needs its own rune for it
+  (Console.Lib).
+- Tests: `NotificationFeedTests`, `NotificationsLayoutTests` and `NotificationsRenderTests`, which keeps three pixel
+  baselines (`Baselines/notifications_*.png`) and three cell snapshots (`Snapshots/notifications_*.txt`).
+
+## 11.82
+
+SVG blend modes and filters, and one colour between the UI and a drawing. (additive)
+  * **Pins**: `SharpAstro.Svg` 3.40 and `SharpAstro.Fonts` 2.0. They move together: Fonts 2.0 draws what Svg 3.40 reads.
+    Fonts is a major number because its own `Rgba32` is gone (it uses `SharpAstro.VectorGraphics.Rgba32`); nothing in
+    DIR.Lib named that type, and no code here changed for it.
+  * **Drop shadows, glows, blurs and blend modes in an SVG are drawn.** `VectorIcon`, `IconBaker.Bake(VectorScene, ...)`
+    and `bake-icons --svg` draw `filter` (blur, offset, flood, composite, merge, colour matrix, blend, component
+    transfer, drop shadow) and `mix-blend-mode` / `isolation`; 11.80 listed them in `VectorIcon.Issues` and drew the
+    element plainly. The filter steps that are still not read are listed there as before.
+  * **A filtered drawing costs more to rasterise** (a buffer and a pass for every step), once a size, as before: a
+    `VectorIcon` keeps what it rasterised.
+  * **`RGBAColor32` converts to and from `SharpAstro.VectorGraphics.Rgba32`**, implicitly, both ways. They are the same
+    colour under two names (sRGB, 8 bits a channel, alpha not premultiplied). A palette colour can be handed to a
+    drawing as it is: `VectorIcon.FromSvg(svg, new SvgReadOptions { CurrentColor = palette.Accent })`.
+  * A scene file written by `VectorIcon.ToSceneFile` is now version 4 of the layout; files written by 11.78 to 11.80
+    still load. A file written by this version is not read by 11.80 or earlier.
+  * Tests: `VectorIconRenderTests` draws a card with a drop shadow, a light with a glow, a tint laid on with `screen`
+    and a blurred, desaturated corner, and keeps a baseline capture (`Baselines/svg_effects_card.png`).
+
+## 11.81
+
+**F1 shows a menu's keys on its card, in place of the rows.** (additive)
+
+- **`MenuModel.ShowingHelp`**: F1 opens the key list; while it is open F1 or Esc closes it and every other key is consumed
+  unchanged, so nothing behind the list can be chosen blind. `Reset` leaves it open, so a host that refreshes its rows
+  meanwhile (a lobby's peer list) does not close it under the reader. `ToggleHelp()` for a host that opens it some other way.
+- **`MenuModel.HelpLines`**: the keys this menu answers to now, as `MenuHelpLine(Keys, Action)` pairs: arrows, Enter and
+  1-N for its rows, Tab and Shift+Tab only when it has a Back or close control. **`MenuModel.HostHelp`** appends the keys
+  the host handles itself (Esc or Backspace going back, say); the model cannot know those.
+- **`MenuLayout.BuildPanel`** shows the list on the same card: title "Keys", prompt "F1 or Esc to return", then one row per
+  key in two measured columns, the descriptions lined up. No header controls while it is open. `BuildTree`, which cannot
+  measure and fills its surface, shows each key as one centred line instead.
+- **Keys:** the column declares F1 and, while the list is open, the title declares Esc, so `InputRouter` reaches the model
+  through the modal panel. A host that takes Esc or Backspace before the router (to go back a step) should not while
+  `ShowingHelp` is true, or Esc goes back instead of closing the list.
+- **`PixelMenuWidget.ShowingHelp`** and **`HostHelp`** pass through to the model.
+- No footer hint is drawn: the key list is the only place the keys are spelled out.
+
+## 11.80
+
+SVG text, the glyphs of OpenType `SVG ` fonts, and SVG icons and images with clips, masks, markers, patterns and
+embedded pictures. (The second half below was written as 11.79 and is released here: 11.79 went out with the menu
+change alone.)
+  * **Pins**: `SharpAstro.Svg` 3.39 and `SharpAstro.Fonts` 1.21. They move together: Fonts 1.21 needs Svg 3.39.
+  * **Text in an SVG is drawn.** `VectorIcon`, `IconBaker.Bake(VectorScene, ...)` and `bake-icons --svg` draw `text`,
+    `tspan` and `textPath` (11.78 listed them in `VectorIcon.Issues` and left them out). As a mask, text is coverage
+    like any shape.
+  * **`SceneFonts`**: where the fonts for that text come from. `SceneFonts.Installed` is the fonts on this machine:
+    each family a span names in turn, the generic ones (`serif`, `sans-serif`, `monospace`) as the usual faces of each
+    kind, bold and italic by the family's own faces, then a sans-serif face, then the platform's faces for other
+    scripts and its emoji face for a character none of those has. `SceneFonts.From(faces)` is the faces an app names
+    and no others, for a drawing that must read the same on every machine.
+  * **By default text is drawn with the machine's fonts.** To say otherwise hand over render options:
+    `VectorIcon.FromSvg(svg, new SceneRenderOptions { ShapeText = SceneFonts.From(path) })`, and the same on `Load`,
+    the constructor and `IconBaker.Bake(scene, size, alphaLevels, render)`. The options also carry the picture
+    decoder the overloads below take.
+  * **A drawing with text now depends on the machine unless it is given its fonts.** That includes masks baked at
+    build time by `bake-icons --svg`: bake those with a face that is in the repository, or without text.
+  * **First use can be slow.** A family that is not one of the standard ones is found by reading the name of every
+    installed font, once (tens of milliseconds warm, seconds on a cold disk). A `VectorIcon` rasterises when first
+    drawn, so ask for such a drawing's sizes before the first frame if that would show.
+  * Shaping is plain: one glyph a character and pair kerning. Give `SceneRenderOptions.ShapeText` a shaper of your own
+    for text that needs more.
+  * **Colour glyphs from an OpenType `SVG ` table** are drawn wherever a colour glyph is (`ManagedFontRasterizer`
+    asks the font, and Fonts 1.20 answers for such fonts), in black for `currentColor` and with the font's first
+    palette, since a glyph atlas does not know the text's colour. Nothing changed here for it.
+  * Tests: `VectorIconRenderTests` draws a badge with a label in two sizes and colours, an underline and a word set
+    along a curve, with a bundled face, and keeps a baseline capture (`Baselines/svg_text_badge.png`).
+
+Clips, masks, markers, patterns and embedded pictures:
+  * **What the pins bring**: `SharpAstro.Svg` reads `clipPath`, `mask`, markers, `paint-order`, `image` and `pattern`
+    (since 3.37) and `SharpAstro.Fonts` draws them (since 1.19). `VectorIcon`, `IconBaker.Bake(VectorScene, ...)` and `bake-icons --svg`
+    get them through the two packages.
+  * **An embedded PNG is drawn** (an `image` with a `data:` URI). A picture in another format is drawn once the icon
+    is given a decoder: `VectorIcon.FromSvg(svg, ImageCodecs.TryDecode)` (also `Load` and the constructor) takes the
+    `SharpAstro.Codecs` facade's method as it is, and `IconBaker.Bake(scene, size, alphaLevels, decodeImage)` takes
+    `SceneRasterizer.DecodeWith(ImageCodecs.TryDecode)`. DIR.Lib does not reference the facade, so an app that
+    draws no such pictures does not carry every codec. Without a decoder such a picture is left out, and
+    `VectorIcon.Issues` does not list it, because the reader carried it faithfully and only the drawing skipped it.
+    A picture the document only names by an address is never drawn: nothing is fetched.
+  * A scene file written by `VectorIcon.ToSceneFile` is now version 3 of the layout; files written by 11.78 still load.
+  * Tests: `VectorIconRenderTests` draws one SVG that uses a clip, a mask, a pattern, markers and an embedded PNG, as
+    a colour image and as a mask through a widget, and keeps a baseline capture (`Baselines/svg_rung3_features.png`).
+
+## 11.79
+
+**A menu panel's Back and close controls are reachable by keyboard: Tab and Shift+Tab, as in dialog/whiptail.** (additive)
+
+- **`MenuModel.Focus`** (`MenuFocus.Rows` / `Back` / `Close`): where the keyboard is. Tab moves it on and Shift+Tab back
+  over the stops the menu has, in reading order (rows, Back, close), wrapping. Arrows stay on the rows: a header control is
+  a Tab stop, never an extra row, which is what the Windows keyboard guidelines and dialog/whiptail do. Up or Down from a
+  focused control returns to the rows and moves there.
+- **`MenuModel.HandleKey(InputKey, InputModifier)`**: the new overload that takes the modifiers Shift+Tab needs. Enter on a
+  focused control runs it and confirms no row. With no Back or close, Tab is not consumed, so a host's own Tab still gets
+  it. The one-argument `HandleKey(InputKey)` is unchanged and forwards with no modifiers.
+- **`MenuModel.MoveFocus(bool backwards)`** for a host that drives focus itself.
+- **`MenuLayout`** lights the focused control in the selected row's colours and shows the row's selection only while the
+  rows have focus, so one thing on the card is lit: what Enter will do. The panel declares Tab and Shift+Tab as shortcuts
+  (on the title and prompt rows) only when it has a header control.
+- **`PixelMenuWidget.HandleInput`** passes the key's modifiers through.
+
+## 11.78
+
+**SVG reaches DIR.Lib: a drawing can be baked to an icon, or held and drawn in colour, and it is never read while drawing.**
+
+- **`IconBaker.Bake(VectorScene, size)`** bakes a vector drawing to the same coverage runs a glyph bakes to, so it is drawn by
+  the `DrawCoverageMask` that is already there, in whatever ink the caller picks. This complements glyph baking; it does not
+  replace it. It removes the one thing glyph baking cannot: the mark no longer has to exist in a font. A drawing's own box is
+  kept (a glyph's ink is centred), because the icons of a set are drawn on one grid and that grid is what lines them up.
+  Sizes up to `IconBaker.MaxSceneSize` (255: a run packs its coordinates into bytes).
+- **`VectorIcon`** holds a drawing ready: `VectorIcon.FromSvg(bytes)` reads the SVG ONCE and keeps the scene, `Mask(size)`
+  rasterises a size once and keeps it, `Image(width, height)` / `ImageFitting(...)` do the same in the drawing's own colours.
+  Asking again costs a dictionary lookup and allocates nothing (a test draws ten thousand frames to say so). What the reader
+  could not take from the file is on `Issues`.
+- **`VectorIcon.Load(bytes)`** takes a scene file or an SVG, told apart by the first four bytes, and
+  **`VectorIcon.ToSceneFile()`** writes one. A scene file (`SharpAstro.Vector`'s `VectorSceneFile`) is the drawing with the
+  reading done: it loads 15 to 50 times faster than the SVG is read (measured in the Codecs repo), and is not reliably
+  smaller (0.6 to 1.6 times the SVG's size). It is for drawings an app loads in colour or at sizes it cannot list.
+  **`bake-icons --scenes <dir>`** writes one a `--svg`.
+- **`bake-icons --svg Name=path.svg`**: the tool bakes SVG files next to (or instead of) font glyphs, into the same generated
+  constants. `--font` is now only needed when there is a `--glyph`. The generated file holds no SVG, so an app that uses it
+  parses and rasterises nothing at run time.
+- **New dependency: `SharpAstro.Svg`** (and through it and `SharpAstro.Fonts` 1.18, `SharpAstro.Vector`). It reads SVG into a
+  scene; `SharpAstro.Fonts`' `SceneRasterizer` draws the scene. Not a pixel codec: DIR.Lib stays codec-agnostic for those.
+- **Changed by `SharpAstro.Fonts` 1.18, visibly:** a COLR emoji whose radial gradient has circles that do not share a centre
+  was drawn mirrored; it is right now. The one baseline that shows it is the storm cloud in `color_weather_emoji.png`, whose
+  yellow glow behind the lightning bolt was missing and is now drawn, as a browser draws it from the same font.
+
+Measured with BenchmarkDotNet in the two libraries underneath (`--job short`, arm64): reading a 294-byte outline icon takes
+about 5 us and allocates 9.8 KB (`SvgReadBenchmarks`, Codecs), and rasterising its coverage takes 29 us at 20 px and 157 us at
+64 px (`SceneRasterizerBenchmarks`, Fonts.Lib). So an icon is ready in well under a tenth of a millisecond, once; the test in
+this repo that reads and bakes one in a loop only says that it stays far from a frame's budget. Drawing from a kept icon is a
+lookup. Captures of baked icons at six sizes and of a colour drawing are in `docs/captures/`.
+## 11.77
+
+Additive: a prototype is checked and rendered at its targets (DIR.Lib #250). `Prototype.Check(document, theme?,
+options?, fontPath?)` and `Prototype.Render(document, theme?, fontPath?)` iterate `document.Targets`, drawing at
+`width * scale` by `height * scale` with a player at that target; findings carry `PrototypeFinding.Target` (an
+init-only property, so the constructor and `Deconstruct` are unchanged) and renders return
+`(Target, Screen, Image)`. `Check` never sets `target` as a state variant. The sized overloads are unchanged. A
+consumer such as pilot can show one prototype as phone and as tablet.
+
+One behaviour to know: `target` is now a reserved, read-only state name for every document, with or without
+`targets`. An 11.75 document that used `target` as a state of its own (`set:target=...`, `toggle:target`, a `bind`, or a
+`when` naming a value other than compact or regular) no longer loads; the problem names the JSON path, and renaming
+the state fixes it. `scale` on a target is optional and defaults to 1.
+
+## 11.76
+
+Additive fix: `DirInspectorSupport` is false only on an actual publish (flight DIR259, DIR.Lib #259). 11.73 keyed
+the default on `PublishAot` or `PublishTrimmed` being true, but a csproj that declares `<PublishAot>true</PublishAot>`
+(chess's Chess.GUI) has it true on every build, run and test, so the inspector was off there even behind
+`DIR_INSPECTOR=1`. The default now also requires `_IsPublishing`, which `dotnet publish` sets, so build, run and
+test keep the inspector as on 11.72. A bare `msbuild /t:Publish` does not set `_IsPublishing` and keeps the inspector
+unless `-p:DirInspectorSupport=false` is passed. SdlVulkan.Renderer and Console.Lib (SDL182, CON88) mirror the same
+switch and want the same condition; chess can drop its workaround once it repins.
+
+## 11.75
+
+Additive: `DIR.Lib.Prototyping`, a prototype as a JSON document of screens (DIR.Lib #249). `Prototype.Load(json)`
+reads the document (design size, entry screen, screens of node trees) and returns it or a list of problems,
+each with its JSON path; the node vocabulary is one page, `src/DIR.Lib/Prototype/prototype-format.md`, which a
+test holds to what the loader accepts. A loaded screen builds real `Layout.Node` trees, and
+`PrototypePlayer<TSurface>` holds the current screen and state, builds the tree each frame and routes clicks
+through the ordinary `ClickableRegion` path, so goto, set, toggle and bound inputs work in any host.
+`Prototype.Check(document, sizes, theme?, options?, fontPath?)` draws every screen, in its default state and once
+per `name=value` a `when` names, at each size into a `WireframeRenderer`, and returns `Wireframe.Check`
+findings tagged with screen, state and size. `Prototype.Render(document, size, theme?, fontPath?)` returns an
+`RgbaImage` per screen. With no `fontPath` both resolve the platform's default face (`Prototype.ResolveFont`)
+and throw `FileNotFoundException` when there is none, since with no font no text is measured or drawn.
+Nothing existing changed: consumers (pilot, tianwen, Console.Lib, the renderers) are unaffected unless they adopt it.
+
+## 11.74
+
+Flight DIR246, DIR.Lib #246 (additive). The menu panel can show a Back control top-left and a close control
+top-right on the card.
+
+- `MenuModel.Back` and `MenuModel.Close` (`Action?`), and the matching `PixelMenuWidget.Back` / `Close` members.
+  Back draws "< Back" top-left and is meant for later steps of a multi-step menu; close draws a multiplication
+  sign (U+00D7, at 1.5 fonts so it reads) top-right and is meant for the first step.
+- Each control is shown only when the host sets its action. Absent means no control and no header row, so a
+  panel that sets neither is laid out exactly as before.
+- Both are declared hits (`ButtonHit("MenuBack")` / `ButtonHit("MenuClose")`) that `InputRouter` routes to the
+  action, so a host draws and routes nothing itself. Pressing one does not confirm the menu.
+- No Escape shortcut is declared: the host keeps Esc and decides whether it means Back or close.
+- Sized from the panel font in design units; the header adds one two-line row to the card.
+- Not checked here: consumers, namely Console.Lib's cell layout of `BuildPanel` and sebgod chess.
+
+## 11.73
+
+Flight DIR251, DIR.Lib #251 (additive). The inspector is now trimmed out of a published app by default,
+behind a feature switch.
+
+- `DebugInspectorCore.IsSupported` (`[FeatureSwitchDefinition("DIR.Lib.Inspector.IsSupported")]`, true when the
+  switch is unset). `StartIfOptedIn` checks it first and returns null before reaching any socket, registry or
+  command code, so ILC can drop them. When off and `DIR_INSPECTOR=1`, it writes one stderr line saying the
+  inspector was trimmed out of this build and to publish with `-p:DirInspectorSupport=true`; when off and not
+  opted in it is silent.
+- The package ships `buildTransitive/DIR.Lib.targets` (and `DIR.Lib.Debug.targets` in the twin). The property
+  `DirInspectorSupport` defaults to false when `PublishTrimmed` or `PublishAot` is true and to true otherwise, so
+  build, run and test are unchanged. A value the consumer sets is never overridden.
+- `Start` and `Detached` do NOT consult the switch: they are the direct calls that root the inspector on purpose.
+- **AOT cost, measured** against the packed 11.73 with `tools/inspector-aot-probe` (a minimal NativeAOT console, `dotnet publish -c Release -r win-x64`): 1,106,944 bytes without a `StartIfOptedIn` call; 1,110,016 bytes with the call by default (**+3,072 bytes**, the switch off, so the inspector is trimmed out); 2,433,536 bytes with the call and `-p:DirInspectorSupport=true` (+1,326,592 bytes over the baseline, about 1.3 MB; the 11.70 figure was 2,194,432, which is 11% less in total but not in cost: the baseline here is 1,106,944 against 933,888 then, so the inspector adds +1,326,592 against +1,260,544, within 5%). The AOT publishes show no IL2xxx or IL3xxx warning. Run check, with `DIR_INSPECTOR=1` and `DIR_INSPECTOR_TOKEN=probe`: the default publish prints `[inspector] DIR_INSPECTOR=1 but the inspector was trimmed out of this build: publish with -p:DirInspectorSupport=true` and starts nothing; the `DirInspectorSupport=true` publish prints the `[inspector] 'aotprobe' command server on 127.0.0.1:<port> (registry)` banner and starts.
+
+## 11.72
+
+A node whose border has a radius on all four sides now fills its background inside that same rounded
+outline on a pixel surface, so the square corners outside the curve show what is beneath (the menu panel's
+scrim, DIR.Lib #245). The fill radius is the larger of `CornerRadius` and the border's `Radius`. Visible
+change to any node pairing `Background` with a rounded all-sides border; a partial-side or square border
+fills as before. Consumers that paint their own cells (Console.Lib, SdlVulkan.Renderer, WebGl.Renderer) were
+not checked.
+
+## 11.71
+
+- **Menu panel: a long row no longer runs past the card's edge** (DIR.Lib #243, found in sebgod/chess#84).
+  `MenuLayout.PlanPanel` measured every line once at font size 1 and scaled linearly, but a renderer's glyph
+  advances are not linear in size, so the selected row (marker included) could be wider at the drawn font than
+  predicted and was cut at the card edge. It now re-measures every row, with and without the selection marker,
+  at the font it will be drawn at and shrinks the font (at most 8 passes) until the widest fits inside the card
+  less border and `PadX`. The marker string is shared by `BuildColumn` and `PlanPanel`. No API change.
+
+## 11.70
+
+Flight DIR242 (#242): the inspector core is available in Release builds, off unless the process opts in at run time. Additive.
+
+- **Inspector core in Release.** `DebugInspectorCore`, `DebugInspectorRegistry` and their tests are no longer `#if DEBUG`, so the Release package (and a NativeAOT consumer) has them. `Start` / `Detached` behave as before.
+- **Run-time opt-in.** `DebugInspectorCore.StartIfOptedIn(host)` returns null and touches nothing unless `DIR_INSPECTOR=1`. `DIR_INSPECTOR_TOKEN` is a per-run secret: when set (non-empty) every client request must carry it as `token` (else `!unauthorized`). `DIR_INSPECTOR=1` without a token refuses to start and says why on stderr (`[inspector] DIR_INSPECTOR=1 but DIR_INSPECTOR_TOKEN is not set: not starting`); the token is never echoed.
+- **Tests in Release.** The inspector tests (scheduling, discovery, registry, `InspectorOptInTests`) now run in the `-c Release` CI run, not only with `-c Debug`.
+- **AOT cost, measured.** A minimal NativeAOT console (`dotnet publish -c Release -r win-x64`, win-x64) is 933,888 bytes without the inspector and 2,194,432 bytes with a `StartIfOptedIn` call (a trivial host, disposed): **+1,260,544 bytes (about 1.2 MB)**. That is over the 1 MB line, so it is a candidate for a feature switch; none is added here, which is the owner's call. Run check: with `DIR_INSPECTOR` unset nothing is printed to stderr; with `DIR_INSPECTOR=1` and a token it prints the `[inspector] 'aotprobe' command server on 127.0.0.1:<port> (registry)` banner.
+- The `DIR.Lib.Debug` twin and its CI steps stay; retiring it is a follow-up.
+
+## 11.69
+
+Flight DIR239 (#239): an overlay menu panel, in three additive parts. Binary-compatible: only new members and init-only properties.
+
+- **Declared modal routing.** `Layout.Node.Overlay.Modal` / `OnDismiss` (init-only) and `Builder.Modal(layer, top, onDismiss)`. While a modal is painted, `InputRouter` delivers presses, keys, scroll, drags, shortcuts and declared-list keys to its Top only; nothing reaches Base or a widget painted beneath. A press outside the card is consumed and runs `OnDismiss`; Escape runs it too. The tree is the open state (a null top is the modal closed).
+- **A menu routes its own input.** `MenuLayout.BuildTree` declares Up, Down, Enter and D1..D9 as shortcuts calling `MenuModel.HandleKey`, so a host drives a `PixelMenuWidget` through `InputRouter` with `Widgets = () => [menu]` and no `Unhandled` fallback. Surface-neutral, so Console.Lib gets the keys with no DIR.Lib change.
+- **Menu panel.** `MenuLayout.BuildPanel` / `PlanPanel` with `MenuPanelStyle` and `MenuPanelPlan`, and `PixelMenuWidget.RenderPanel()` with `PanelStyle`: a modal Overlay of a full-surface scrim and a card centred on it, sized to its content between a min and a max width in design units, full width less side margins on a portrait surface, the font taken from the card (not the surface height) and capped so the widest line fits, and the edge declared as `Node.Border`. It shares its rows, regions and key declarations with `BuildTree`. `Render()` is unchanged.
+
+## 11.68
+
+Additive. A node can declare a border (SharpAstro/DIR.Lib#238): `Node.BorderStyle` (colour, width and corner radius
+in design units, and the `BorderSides` it covers), set with `Node.Border(...)` and `BorderTop`, `BorderBottom`,
+`BorderLeft`, `BorderRight`. The engine reserves it inside the node's extent, outside the padding, in measure and
+arrange alike, through the new `ExtentKind.Border` on the 11.63 extent hook; its default mapping is the surface
+extent of the width but never less than one surface unit, so a border does not round away. Pixel painting strokes
+it after the background through the new virtual `Renderer.DrawBorder`, whose software default fills
+non-overlapping bands (a rounded ring when all four sides are drawn with a radius), so a translucent border never
+double-blends. `LayoutDamage.PaintSignature` carries the border as an init-only property, so a border change
+damages the node and an unbordered tree's signature is unchanged. `WireframeRenderer` records no fills for a
+border, so a bordered panel holding text gives no findings. Nothing changes for a tree without a border.
+Follow-ups in the consumers: Console.Lib paints box-drawing cells and answers `ExtentKind.Border` with one cell
+per side; SdlVulkan.Renderer and WebGl.Renderer may override `DrawBorder` with an antialiased SDF stroke;
+pilot-tui's cards panel adopts it.
+
+## 11.67
+
+Additive. A table can now declare what pilot's `ListTable.Dropping` and `Inert` rebuilt by hand
+(SharpAstro/DIR.Lib#233). `TableColumn.DropBelow` (design units, 0 = never) drops a column below a width:
+its title, its row cell, the gap beside it and the divider in that gap leave together, in `TableHeader` and
+`TableRow`, in pixels and in a cell host alike, so the remaining grips stay exactly over the remaining gaps.
+`TableColumn.GripAfter = false` declares a divider with no grip (no `ButtonHit`, no resize cursor; the gap
+stays). The engine side is a new init-only `Node.Separator`: a Stack draws a separator child only between two
+surviving non-separator siblings, one per run, which is how the header's grip row follows a collapsed column
+without any rounding of its own. Nothing changes for a table that uses neither feature: `TableRow` keeps a
+cell's own `CollapseBelow` unless its column declares a `DropBelow`. pilot must delete `ListTable.Dropping` and
+`Inert` in the same change that takes 11.67, not after: every gap cell of the grip row is now a separator, and
+`Dropping`'s two-child groups keep no separator, so its grips would vanish there. It can then drop the 4
+`TerminalWireframeSweepTests` Baseline entries for #233.
+
+## 11.66
+
+Behaviour change. A stack declared `WithScroll` whose controller draws a bar (`Mode` is not `None`, controller
+`Axis` on the stack's axis) now MEASURES its cross extent with the bar column added (`ScrollBarBaseWidthPx`, 6
+design units at the context's scale), less any trailing padding that already covers it, by the same rule
+`ArrangeStack` reserves it by. Always, not only on overflow, since a measure cannot know the viewport's height. So a list that fits also measures the column, and the arrange gives the room back.
+A Fixed cross size still overrides it, and `Mode = None`, an unscrolled stack and a controller on the other axis
+measure as before. Why: an Auto scrolled stack measured without the column and was then arranged with it
+reserved, so its widest row came out one bar narrower than its content (SharpAstro/tianwen#2156, the session form
+floor; DIR.Lib #232). Consumers whose sizes may move by 6 units: tianwen's Session form floor,
+PlanetaryControlPanel, and dropdown and context menus with an Auto width. (The issue says 11.64; main shipped
+11.65 and 11.64 was skipped, so this is 11.66.)
+
+## 11.65
+
+Additive. `Node.Wrap` gains `FirstLineTrailing`, an init-only `Node?`, and `Node.WithFirstLineTrailing(Node)`
+sets it (a no-op on a node that is not a `Wrap`). The node is drawn flush at the main end of the FIRST line only,
+and its main extent is MEASURED: a Fixed size goes through `IMeasureContext<T>.MapExtent`, an Auto size is measured
+by the surface context. Line 1 holds the items in the room left after that extent and one gap; every later line
+uses the full extent. Measure and arrange honour it identically. A wrap without it lays out as before, so existing
+`WrapH` layouts and snapshots do not change. A trailing node wider than the container is placed at the main
+origin and overflows at the end, never at a negative position.
+
+11.64 was never released: it was the number of a PR (#228) that closed unmerged, so the series goes 11.63 to 11.65.
+
+- Narrow-case rule: when the first item does not fit in the room left on line 1, line 1 holds only the trailing
+  node and the items start on line 2. The gap before the trailing node applies only when line 1 holds an item.
+- The first line's cross extent is the larger of its items' and the trailing node's.
+- `FirstLineReserve`, if also set, is extra space between the items and the trailing node.
+- `MaxLines` always keeps the trailing node; the items the cap cuts set `Truncated`, and the ellipsis room on
+  line 1 is the item room.
+- Why: pilot's top bar (SharpAstro/pilot#1062). A `Dock` or an HStack narrows every line by the corner node's
+  width, and a hand-computed `FirstLineReserve` is in design units, which is the wrong number on a cell surface.
+  Measuring the trailing node reserves what it actually takes on the surface it lands on.
+
+## 11.63
+
+Additive. `IMeasureContext<T>` gains a default interface method, `T MapExtent(in ExtentRequest request)`, and the
+engine routes every Fixed extent and every padding it resolves through it, in measure and arrange alike (a node's
+Fixed width and height, the narrowing its children are measured in, a stack's Fixed main and cross, a Fixed grid
+column, a wrap child's main and cross, a dock strip, `Padding` and `PadDown`).
+
+- `ExtentRequest` (a readonly record struct with init-only properties, so later fields stay additive) carries
+  `Value`, `Axis`, `Kind` (`ExtentKind.Fixed` or `Padding`), `HasContent` (the node or a descendant is a `Text`,
+  `TextEditor`, `TextInput`, `Icon` or `Slider` leaf), `ContentLines` (authored lines of that content; a text
+  input, icon or slider is one) and `HasFill` (the node or a descendant has a `Background`, or is a `Fill` leaf or a
+  `Box` with a visible colour).
+- The facts of a subtree are cached per node, except one holding a `TextEditor`, whose line count follows its state.
+- The default returns `ToSurfaceX` or `ToSurfaceY` of `Value` by axis, which is today's mapping, so no existing
+  context changes and every arrangement is byte-identical (`LayoutArrangeSnapshotTests` pins it).
+- Gaps, margins, Box and Icon content, split dividers, Min/Max clamps and anchored offsets stay on `ToSurface*`.
+- Why: a terminal cannot map a pixel-authored extent to cells without knowing what the node holds. Console.Lib#60
+  (CON60) uses it in `CellMeasureContext.PixelAuthored` so a one-line row stays one row whatever its fixed pixel
+  height, padding rounds down, an empty spacer adds nothing and a filled bar thinner than a cell keeps one row.
+
+## 11.62
+
+A fix; nothing to migrate. A scrolled stack given exactly the room its content takes no longer scrolls.
+
+- The arrange counted the content in atoms rounded up and the controller counts what shows rounded down, so rows
+  that are not whole surface units (a row 0.8 of another, at any scale) in a viewport sized to them came out an
+  atom over: `MaxOffset` 1, and a decorative or interactive bar drawn beside a list showing every row. Content
+  the viewport holds now counts as the viewport's own atoms. Found on TianWen's Session tab (tianwen#2139).
+
+## 11.61
+
+Additive; a list declares the cursor that owns its rows, every surface's router steps it, and a non-pixel
+surface can carry a popover's pointer claim. Consumer: Console.Lib#57 (CON57).
+
+- `Layout.Node.ListOf(cursor, listId)` declares a `DeclaredList` on a list's container. Any router reading the
+  PAINTED nodes finds it, whatever kind of widget painted them.
+- `DeclaredList.Active` states the active-list rule once: the list holding the focus, else the one holding the
+  pointer's last press, else the only list on the frame, else none (the key goes to `InputRouter.Unhandled`).
+- `InputRouter` steps the active declared cursor (Up/Down) and activates its row (Enter) for any
+  `IPixelWidget`, including one that paints nothing itself. `PixelWidgetBase` follows the same declaration, so
+  a pixel surface behaves exactly as a non-pixel one; widgets that declare nothing keep today's behaviour.
+- `IPixelWidget.CollectClippedListRows` lets a widget report the rows of a list its viewport clips, so the
+  cursor steps only through rows that are reachable.
+- `WindowUiSettings.NoteFrameBegin`, `NotePopoverPainted` and `ClaimPointer` are public and documented, so a
+  surface that is not a `PixelWidgetBase` can note a painted popover and claim the pointer for its content.
+  A press inside the claimed content reaches the popover's regions, and `InputRouter` leaves the last pressed
+  list alone for it, so a menu click does not move the keyboard to the list beneath the menu.
+- `IPixelWidget.RevealListRow` (default empty) is called by `InputRouter` after it steps a declared list, so a
+  list under `WithScroll` scrolls to the row an arrow lands on.
+- A widget that declares lists and also drives its own `PixelWidgetBase.ListCursor` gets the declared lists'
+  keys only; `ListCursor` is used when nothing on the frame is declared.
+
+## 11.60
+
+Additive; a frame can be recorded and checked for overlaps in a unit test.
+
+- `WireframeRenderer` (a `RgbaImageRenderer`) records where a frame puts its text, its opaque fills and its
+  clickable regions, in one paint order, and rasterizes nothing unless asked to. It records at the draw call,
+  so text a widget draws by hand into a slot is seen as well as what the layout engine placed.
+- `Wireframe.Check(frame, options)` returns what a person would see as broken: text over text, text half on a
+  control, two controls sharing a place, anything past the surface, and text a clip cut with no ellipsis.
+  What an opaque fill was painted over (the page under a popover) collides with nothing. `WireframeOptions`
+  picks the rules and names text or regions to leave alone (labels on a map or a chart).
+- `Renderer<TSurface>.NoteRegion(in ClickableRegion)` is told each region as `PixelWidgetBase` registers it.
+  The default does nothing; the recorder uses it to place regions in the paint order.
+- Use: draw a widget on a `WireframeRenderer` at one size after another and assert the findings are empty.
+  tianwen sweeps its tabs over twelve widths, two heights and two scales in about six seconds.
+
+## 11.59
+
+Additive; the pointer leaving the window is an input event, and a palette says when it next needs a frame (#218).
+
+- `InputEvent.PointerLeft` (a sealed record with no parameters, like `PinchEnd`) says the pointer left the
+  window. `InputRouter` handles it by forgetting the pointer, so hover state does not outlive the leave.
+  A consumer whose exhaustive `switch` over `InputEvent` has no default arm sees the new case; every switch
+  inside DIR.Lib has a default arm.
+- `FloatingPaletteState.NotePointerLeft()` ends hover and starts the idle delay at the leave.
+- `FloatingPalette.NextFrameFor(idleSeconds, engaged, collapsed)` and `FloatingPaletteState.NextFrameIn`:
+  null when nothing will change by itself, the time left of the idle delay while it waits (schedule one
+  wake), zero while the alpha is moving (draw every frame).
+- Behaviour change: `FloatingPaletteState.IsFading` is true only while the alpha is moving. It used to be
+  true whenever the alpha sat above its floor, so a host polling it drew 60 frames a second while the
+  palette rested hovered or waited out its delay (tianwen#2130).
+- Follow-ups, not buildable here: SdlVulkan.Renderer dispatches `PointerLeft` from SDL's window
+  mouse-leave, and tianwen moves from `IsFading` to `NextFrameIn`.
+
+## 11.58
+
+Additive; two behaviour fixes to the resizable table header (#212).
+
+- A divider drag that trades width between two columns, each with a width of its own, holds the widened
+  side to its `TableColumn.MaxWidth`, so it never passes the room the page has and drops; the narrowed
+  side gives up no more than that.
+- `TableHeader` gives no grip to a divider beside a collapsed column (one the last arrange did not draw,
+  as a `CollapseBelow` drops pilot's `ListTable` grip cell). `TableColumnWidths.CanDrag` is false for it
+  and `Begin` returns null, so a stale grip cannot drag a hidden column back. A header not yet arranged
+  keeps all its grips. No public constructor changes. pilot#1000 bumps its pin to this release.
+
 ## 11.57
 
 Additive, with one behaviour change in what a table divider resizes. Three new init-only properties (`TableColumn.MaxWidth`, `TableColumn.Resizable`, `Node.OnArranged`), one new

@@ -852,6 +852,155 @@ public abstract class Renderer<TSurface>(TSurface surface) : IDisposable
     }
 
     /// <summary>
+    /// Draws a soft drop shadow for a box occupying <paramref name="rect"/> (the node's own rect, not yet offset).
+    /// <paramref name="shadow"/> is in SURFACE units (pixels or cells), already scaled by the caller.
+    /// <para>
+    /// The default stacks <c>n + 1</c> rounded rects, outermost first, where <c>n</c> is the blur in whole pixels
+    /// capped at 16. Layer <c>d</c> is the offset rect grown by <c>d</c> pixels (radius grown with it); the layers'
+    /// alphas are chosen so the COMPOSITED alpha falls from the colour's alpha at the rect's edge to zero at
+    /// <c>n + 1</c> pixels out along a smoothstep curve. Cost is <c>n + 1</c> rounded fills (each one
+    /// <see cref="FillRectangle"/> per scanline), so about <c>(n + 1) * height</c> rect calls: a blur of 2 is three
+    /// fills; blur 16 is seventeen, which a card affords and a long list of rows should avoid. The shadow is
+    /// painted under the node, so an opaque node hides its inner part; a translucent node shows it through.
+    /// </para>
+    /// <para>
+    /// Virtual, not abstract, so every renderer compiles unchanged; a GPU renderer should override it with one
+    /// rounded-box SDF quad, which is cheaper and antialiased. A transparent colour draws nothing.
+    /// </para>
+    /// </summary>
+    public virtual void DrawShadow(in RectInt rect, float cornerRadius, Layout.ShadowStyle shadow)
+    {
+        ArgumentNullException.ThrowIfNull(shadow);
+        if (shadow.Color.Alpha == 0)
+        {
+            return;
+        }
+
+        var left = Math.Min(rect.UpperLeft.X, rect.LowerRight.X) + (int)MathF.Round(shadow.OffsetX);
+        var right = Math.Max(rect.UpperLeft.X, rect.LowerRight.X) + (int)MathF.Round(shadow.OffsetX);
+        var top = Math.Min(rect.UpperLeft.Y, rect.LowerRight.Y) + (int)MathF.Round(shadow.OffsetY);
+        var bottom = Math.Max(rect.UpperLeft.Y, rect.LowerRight.Y) + (int)MathF.Round(shadow.OffsetY);
+        var n = Math.Min((int)MathF.Round(MathF.Max(shadow.Blur, 0f)), 16);
+        var peak = shadow.Color.Alpha / 255f;
+
+        // Composited alpha at distance d from the edge (d = n + 1 is zero, d = 0 is the full colour).
+        float Cumulative(int d)
+        {
+            var t = 1f - d / (float)(n + 1);
+            return peak * t * t * (3f - 2f * t);
+        }
+
+        var below = 0f;
+        for (var d = n; d >= 0; d--)
+        {
+            var target = Cumulative(d);
+            // Over-compositing: 1 - target = (1 - below) * (1 - a), so a = 1 - (1 - target) / (1 - below).
+            var a = below >= 1f ? 0f : 1f - (1f - target) / (1f - below);
+            below = target;
+            var alpha = (byte)Math.Clamp((int)MathF.Round(a * 255f), 0, 255);
+            if (alpha == 0)
+            {
+                continue;
+            }
+
+            FillRoundedRectangle(new RectInt((right + d, bottom + d), (left - d, top - d)),
+                shadow.Color with { Alpha = alpha }, cornerRadius + d);
+        }
+    }
+
+    /// <summary>
+    /// Strokes a node's border inside <paramref name="rect"/>: <paramref name="width"/> pixels on each of
+    /// <paramref name="sides"/>, with the corners rounded to <paramref name="radius"/> pixels when all four sides
+    /// are drawn.
+    /// <para>
+    /// The default fills non-overlapping bands (and, for a rounded ring, non-overlapping scanline spans, as
+    /// <see cref="FillRoundedRectangle"/> does), so a translucent <paramref name="color"/> never double-blends
+    /// where two sides meet. It is virtual, not abstract, so every renderer compiles unchanged; a GPU renderer
+    /// may override it with an antialiased SDF stroke. A radius applies only to a border on all four sides (a
+    /// single-side separator has no corner to round). The radius clamps to half the shorter side, and a width of
+    /// half the shorter side or more degrades to a filled rect.
+    /// </para>
+    /// </summary>
+    public virtual void DrawBorder(in RectInt rect, RGBAColor32 color, int width, float radius, Layout.BorderSides sides)
+    {
+        var left = Math.Min(rect.UpperLeft.X, rect.LowerRight.X);
+        var right = Math.Max(rect.UpperLeft.X, rect.LowerRight.X);
+        var top = Math.Min(rect.UpperLeft.Y, rect.LowerRight.Y);
+        var bottom = Math.Max(rect.UpperLeft.Y, rect.LowerRight.Y);
+        if (width <= 0 || sides == Layout.BorderSides.None || right <= left || bottom <= top) return;
+
+        var shorter = Math.Min(right - left, bottom - top);
+        if (sides == Layout.BorderSides.All && radius > 0f)
+        {
+            var outer = MathF.Min(radius, shorter * 0.5f);
+            if (outer > 0f)
+            {
+                if (width * 2 >= shorter)
+                {
+                    FillRoundedRectangle(rect, color, outer);
+                    return;
+                }
+                var innerRadius = MathF.Max(0f, outer - width);
+                for (var y = top; y < bottom; y++)
+                {
+                    if (!RoundedSpan(left, right, top, bottom, outer, y, out var oL, out var oR)) continue;
+                    if (RoundedSpan(left + width, right - width, top + width, bottom - width, innerRadius, y, out var iL, out var iR)
+                        && iR > iL)
+                    {
+                        if (iL > oL) FillRectangle(new RectInt((iL, y + 1), (oL, y)), color);
+                        if (oR > iR) FillRectangle(new RectInt((oR, y + 1), (iR, y)), color);
+                    }
+                    else
+                    {
+                        FillRectangle(new RectInt((oR, y + 1), (oL, y)), color);
+                    }
+                }
+                return;
+            }
+        }
+
+        var hasTop = sides.HasFlag(Layout.BorderSides.Top);
+        var hasBottom = sides.HasFlag(Layout.BorderSides.Bottom);
+        var topEnd = hasTop ? Math.Min(top + width, bottom) : top;
+        var bottomStart = hasBottom ? Math.Max(bottom - width, topEnd) : bottom;
+        if (hasTop) FillRectangle(new RectInt((right, topEnd), (left, top)), color);
+        if (hasBottom) FillRectangle(new RectInt((right, bottom), (left, bottomStart)), color);
+        if (bottomStart > topEnd)
+        {
+            if (sides.HasFlag(Layout.BorderSides.Left))
+            {
+                FillRectangle(new RectInt((Math.Min(left + width, right), bottomStart), (left, topEnd)), color);
+            }
+            if (sides.HasFlag(Layout.BorderSides.Right))
+            {
+                var rl = Math.Max(right - width, sides.HasFlag(Layout.BorderSides.Left) ? Math.Min(left + width, right) : left);
+                FillRectangle(new RectInt((right, bottomStart), (rl, topEnd)), color);
+            }
+        }
+    }
+
+    /// <summary>The span a rounded rect covers on row <paramref name="y"/>, by the rule
+    /// <see cref="FillRoundedRectangle"/> uses; false when the row misses it.</summary>
+    private static bool RoundedSpan(int left, int right, int top, int bottom, float radius, int y,
+        out int spanLeft, out int spanRight)
+    {
+        spanLeft = spanRight = 0;
+        if (right <= left || bottom <= top || y < top || y >= bottom) return false;
+        radius = MathF.Min(radius, MathF.Min(right - left, bottom - top) * 0.5f);
+        spanLeft = left;
+        spanRight = right;
+        if (radius <= 0f) return true;
+        var dy = MathF.Abs(y + 0.5f - (top + bottom) * 0.5f) - ((bottom - top) * 0.5f - radius);
+        if (dy <= 0f) return true;
+        var chord = radius * radius - dy * dy;
+        if (chord <= 0f) return false;
+        var inset = (int)MathF.Round(radius - MathF.Sqrt(chord));
+        spanLeft = left + inset;
+        spanRight = right - inset;
+        return spanRight > spanLeft;
+    }
+
+    /// <summary>
     /// Fills multiple rectangles in a single batched draw call.
     /// Default implementation falls back to individual FillRectangle calls.
     /// </summary>
@@ -869,6 +1018,14 @@ public abstract class Renderer<TSurface>(TSurface surface) : IDisposable
     /// </summary>
     public virtual void DrawScrim(in RectInt bounds, RGBAColor32 scrimColor)
         => FillRectangle(bounds, scrimColor);
+
+    /// <summary>
+    /// Told each clickable region as a widget registers it, in paint order. Nothing draws from it: it is here so
+    /// a renderer that RECORDS a frame (<see cref="WireframeRenderer"/>) sees the regions on the same clock as the
+    /// text and the fills, which is what says whether a region was painted over or under them. The default does
+    /// nothing.
+    /// </summary>
+    public virtual void NoteRegion(in ClickableRegion region) { }
 
     public abstract void Dispose();
 }

@@ -92,6 +92,33 @@ namespace DIR.Lib
         /// <summary>The cursor stated by the topmost region under the point, or null where nothing under
         /// it had a view.</summary>
         CursorKind? HitTestCursor(float x, float y);
+
+        /// <summary>
+        /// Appends the rows of list <paramref name="listId"/> that a scrolled list arranged but its viewport
+        /// clipped out, so the keyboard can step onto a row nobody can see. A default interface method:
+        /// the default reports none, which is right for a surface whose lists are not scrolled.
+        /// </summary>
+        void CollectClippedListRows(string listId, List<ListCursor.PaintedRow> into) { }
+
+        /// <summary>
+        /// Brings the row <paramref name="cursor"/> is on into view, in the scrolled node the last paint met
+        /// it in. <see cref="InputRouter"/> calls it after it stepped a declared list's cursor, so an arrow
+        /// that lands on a row the viewport clipped scrolls to it. A default interface method: the default
+        /// does nothing, which is right for a surface whose lists do not scroll.
+        /// </summary>
+        void RevealListRow(ListCursor cursor) { }
+
+        /// <summary>
+        /// Called when an arrow could not step <paramref name="cursor"/>: no row of the last paint can take it in the
+        /// direction of <paramref name="delta"/>. A scrolled list lays out only the rows within a viewport's extent of
+        /// its viewport (<c>Engine.ArrangeStack</c>), so a run of disabled rows taller than that holds nothing to
+        /// step to although the list goes on. The surface brings the farthest row it holds in that direction into
+        /// view and answers whether the list moved: the next paint then lays out the rows after it, and the next
+        /// press continues. False is the end of the list: a list that ends in disabled rows takes the presses that
+        /// bring them into view and refuses the next. A default interface method (11.90): the default answers
+        /// false, which is right for a surface whose lists do not scroll.
+        /// </summary>
+        bool RevealListEdge(ListCursor cursor, int delta) => false;
     }
 
     /// <summary>
@@ -113,11 +140,14 @@ namespace DIR.Lib
         // Reused rather than allocated, for the reason the router's region buffer is -- a key repeat is
         // a step per frame.
         private readonly List<ListCursor.PaintedRow> _paintedListRows = [];
+        private readonly List<ListCursor.PaintedRow> _clippedListRows = [];
 
         // Every list row this frame's paint met inside a scrolled node, painted or clipped out of its
         // viewport, with where it sits in what that node scrolls over: what lets the keyboard step onto a
         // row the viewport hides, and bring the row it lands on into view. Mirrors _tracker's lifecycle.
         private readonly List<ScrolledListRow> _scrolledListRows = [];
+        // The lists the painted tree declared (Node.ListOf), in paint order; rebuilt every frame.
+        private readonly List<DeclaredList> _declaredLists = [];
 
         private readonly record struct ScrolledListRow(
             HitResult.ListItemHit Hit, bool IsDisabled, bool IsClipped, ListScrollController Scroll, float Start, float End);
@@ -191,8 +221,17 @@ namespace DIR.Lib
         /// The caret's blink phase for the frame being painted (<see cref="CaretBlink.PhaseAt(TimeProvider)"/>),
         /// set by the host once per frame. It replaces a frame counter that blinked every 30 frames, which
         /// made a focused field a reason to render continuously; see <see cref="CaretBlink"/>.
+        /// <para>
+        /// Forwards to <see cref="WindowUiSettings.CaretPhase"/> on <see cref="Ui"/>, where the phase now
+        /// lives once per window; set that instead. A child given its parent's <see cref="Ui"/> shares the
+        /// parent's phase. This forwarder goes in the next major.
+        /// </para>
         /// </summary>
-        public long CaretPhase { get; set; }
+        public long CaretPhase
+        {
+            get => Ui.CaretPhase;
+            set => Ui.CaretPhase = value;
+        }
 
         /// <summary>
         /// The window's DPI scale (device pixels per design unit), owned per widget instance -- a widget
@@ -310,6 +349,7 @@ namespace DIR.Lib
             _selectableText.Clear();
             _capturedLayout?.Clear();
             _scrolledListRows.Clear();
+            _declaredLists.Clear();
 
             // Window-level, so it is cleared once per paint CYCLE rather than once per widget: see the
             // remarks on WindowUiSettings.PointerOwner for why clearing it here unconditionally would break
@@ -370,9 +410,18 @@ namespace DIR.Lib
         /// edge never both claim it.</summary>
         /// <param name="r">The node's arranged rect.</param>
         /// <param name="inClaimantContent">Whether the node is painted inside an open popover's content.</param>
-        private bool PointerWithin(Rect<float> r, bool inClaimantContent) =>
-            Pointer is { } p && HoverMayAnswer(p, inClaimantContent)
+        /// <param name="order">The node's paint order (<see cref="WindowUiSettings.NotePaintedNode"/>): a surface painted
+        /// after it over the pointer keeps it dark (<see cref="Layout.Node.IsSurface"/>).</param>
+        private bool PointerWithin(Rect<float> r, bool inClaimantContent, int order) =>
+            Pointer is { } p && HoverMayAnswer(p, inClaimantContent, order)
             && p.X >= r.X && p.X < r.X + r.Width && p.Y >= r.Y && p.Y < r.Y + r.Height;
+
+        /// <summary>Whether the primary button is held with its press inside <paramref name="r"/> and the pointer
+        /// still inside it, both by the hover rule (<see cref="HoverMayAnswer"/>). See <see cref="Layout.Node.PressedBackground"/>.</summary>
+        private bool PressedWithin(Rect<float> r, bool inClaimantContent, int order) =>
+            Ui.PressOrigin is { } o && PointerWithin(r, inClaimantContent, order)
+            && HoverMayAnswer(o, inClaimantContent, order)
+            && o.X >= r.X && o.X < r.X + r.Width && o.Y >= r.Y && o.Y < r.Y + r.Height;
 
         /// <summary>
         /// Whether hover may answer at <paramref name="p"/> for a node: always, unless an open popover has claimed the
@@ -388,11 +437,15 @@ namespace DIR.Lib
         /// popover itself; neither is pointed at.</para>
         /// <para>Only HOVER is confined; the region tracker still hit-tests in paint order, so the backdrop keeps taking
         /// the click that dismisses.</para>
+        /// <para>The same predicate answers for a surface (<see cref="Layout.Node.IsSurface"/>, 11.86): a node at paint
+        /// order <paramref name="order"/> under a surface painted after it does not light, whatever the popover claim says.
+        /// One rule, two kinds of claim: a popover's over everything outside its content, a surface's over what it covers.</para>
         /// </remarks>
-        private bool HoverMayAnswer((float X, float Y) p, bool inClaimantContent) =>
-            Ui.PointerClaim is not { } owner
-            || (inClaimantContent
-                && p.X >= owner.X && p.X < owner.X + owner.Width && p.Y >= owner.Y && p.Y < owner.Y + owner.Height);
+        private bool HoverMayAnswer((float X, float Y) p, bool inClaimantContent, int order) =>
+            !Ui.IsCoveredBySurface(p.X, p.Y, order)
+            && (Ui.PointerClaim is not { } owner
+                || (inClaimantContent
+                    && p.X >= owner.X && p.X < owner.X + owner.Width && p.Y >= owner.Y && p.Y < owner.Y + owner.Height));
 
         /// <summary>
         /// Whether hover may answer at (<paramref name="x"/>, <paramref name="y"/>) for chrome a widget paints by hand:
@@ -406,8 +459,10 @@ namespace DIR.Lib
         /// it.</para>
         /// <para>Before this a consumer kept its own prediction of "does an overlay own the pointer" beside such chrome,
         /// a list of its popovers that every new one had to be added to.</para>
+        /// <para>Under a surface (<see cref="Layout.Node.IsSurface"/>) painted after the chrome, as the next node to paint
+        /// would be, it is not allowed either.</para>
         /// </remarks>
-        protected bool HoverAllowedAt(float x, float y) => HoverMayAnswer((x, y), inClaimantContent: false);
+        protected bool HoverAllowedAt(float x, float y) => HoverMayAnswer((x, y), inClaimantContent: false, Ui.PaintOrder);
 
         /// <summary>
         /// Whether <see cref="Pointer"/> hovers <paramref name="rect"/> of hand-painted chrome by the rule a declared node
@@ -415,7 +470,7 @@ namespace DIR.Lib
         /// (<see cref="HoverAllowedAt"/>).
         /// </summary>
         protected bool PointerHovers(RectF32 rect) =>
-            Pointer is { } p && HoverMayAnswer(p, inClaimantContent: false)
+            Pointer is { } p && HoverMayAnswer(p, inClaimantContent: false, Ui.PaintOrder)
             && p.X >= rect.X && p.X < rect.X + rect.Width && p.Y >= rect.Y && p.Y < rect.Y + rect.Height;
 
         /// <summary>
@@ -445,36 +500,124 @@ namespace DIR.Lib
         /// </remarks>
         public bool MoveListCursor(int delta)
         {
-            if (delta == 0 || !ListCursor.IsOpen) return false;
+            var cursor = ActiveCursor();
+            if (delta == 0 || cursor is null || !cursor.IsOpen) return false;
 
-            _paintedListRows.Clear();
-            foreach (var region in RegisteredRegions)
+            _clippedListRows.Clear();
+            CollectClippedListRows(cursor.ListId!, _clippedListRows);
+            if (!ListKeys.Move(cursor, delta, RegisteredRegions, _clippedListRows, _paintedListRows))
             {
-                if (region.Result is HitResult.ListItemHit item && ListCursor.Owns(item))
-                {
-                    _paintedListRows.Add(new ListCursor.PaintedRow(item.Index, region.IsDisabled));
-                }
+                // Nothing in the frame can take the cursor that way. That is the end of the list only when the
+                // list cannot scroll further towards it (see RevealListEdge).
+                return RevealListEdge(cursor, delta);
             }
 
-            // And the rows a scrolled list arranged but its viewport clipped out. They registered nothing,
-            // because a row nobody can see must not answer a press, but they are rows of the list all the
-            // same: the paint met them, declared. Without them the arrows stopped dead at the last row
-            // the viewport showed, half of which could be under its edge.
-            foreach (var row in _scrolledListRows)
-            {
-                if (row.IsClipped && ListCursor.Owns(row.Hit))
-                {
-                    _paintedListRows.Add(new ListCursor.PaintedRow(row.Hit.Index, row.IsDisabled));
-                }
-            }
+            RevealListCursor(cursor);
+            return true;
+        }
 
-            if (!ListCursor.Step(delta, _paintedListRows))
+        /// <inheritdoc cref="IPixelWidget.RevealListEdge"/>
+        public virtual bool RevealListEdge(ListCursor cursor, int delta)
+        {
+            ArgumentNullException.ThrowIfNull(cursor);
+            if (delta == 0)
             {
                 return false;
             }
 
-            RevealListCursor();
-            return true;
+            // The farthest row of the cursor's list the last paint met in a scrolled node, beyond the cursor in the
+            // direction of the key. Painted or clipped, enabled or not: it is where the laid-out part of the list ends.
+            ScrolledListRow? edge = null;
+            foreach (var row in _scrolledListRows)
+            {
+                if (!cursor.Owns(row.Hit))
+                {
+                    continue;
+                }
+
+                var index = row.Hit.Index;
+                if (cursor.Index >= 0 && (delta > 0 ? index <= cursor.Index : index >= cursor.Index))
+                {
+                    continue;
+                }
+
+                if (edge is not { } best || (delta > 0 ? index > best.Hit.Index : index < best.Hit.Index))
+                {
+                    edge = row;
+                }
+            }
+
+            if (edge is not { } farthest)
+            {
+                return false;
+            }
+
+            var before = farthest.Scroll.Offset;
+            farthest.Scroll.RevealExtent(farthest.Start, farthest.End);
+            return farthest.Scroll.Offset != before;
+        }
+
+        /// <summary>
+        /// The cursor the keys act on. Where the painted tree declares lists (<see cref="Layout.Node.ListOf(ListCursor, string)"/>)
+        /// it is the active declared list's own cursor, by <see cref="DeclaredList.Active"/>: this widget sees
+        /// no presses, so its hint is the one declared list whose cursor is already open (a press opens it),
+        /// else the only list on the frame, else none. Where nothing is declared it is
+        /// <see cref="ListCursor"/>, exactly as before.
+        /// </summary>
+        private ListCursor? ActiveCursor()
+        {
+            if (_declaredLists.Count == 0 || !RegionsAreCurrent) return ListCursor;
+
+            string? openId = null;
+            foreach (var list in _declaredLists)
+            {
+                if (!string.Equals(list.Cursor.ListId, list.ListId, StringComparison.Ordinal)) continue;
+                if (openId is not null && !string.Equals(openId, list.ListId, StringComparison.Ordinal))
+                {
+                    openId = null;
+                    break;
+                }
+
+                openId = list.ListId;
+            }
+
+            var active = DeclaredList.Active(_declaredLists, null, openId);
+            if (active is null) return null;
+            if (!string.Equals(active.Cursor.ListId, active.ListId, StringComparison.Ordinal))
+            {
+                active.Cursor.Open(active.ListId);
+            }
+
+            return active.Cursor;
+        }
+
+        // Whether the row is under this widget's cursor or under any declared list's own cursor.
+        private bool CursorIsOn(HitResult? hit)
+        {
+            if (ListCursor.IsOn(hit)) return true;
+            foreach (var list in _declaredLists)
+            {
+                if (list.Cursor.IsOn(hit)) return true;
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// The rows a scrolled list arranged but its viewport clipped out. They registered nothing,
+        /// because a row nobody can see must not answer a press, but they are rows of the list all the
+        /// same: the paint met them, declared. Without them the arrows stop dead at the last row
+        /// the viewport showed, half of which could be under its edge.
+        /// </summary>
+        public virtual void CollectClippedListRows(string listId, List<ListCursor.PaintedRow> into)
+        {
+            foreach (var row in _scrolledListRows)
+            {
+                if (row.IsClipped && string.Equals(row.Hit.ListId, listId, StringComparison.Ordinal))
+                {
+                    into.Add(new ListCursor.PaintedRow(row.Hit.Index, row.IsDisabled));
+                }
+            }
         }
 
         /// <summary>
@@ -483,11 +626,17 @@ namespace DIR.Lib
         /// and a row of a virtualised list the paint never arranged is the host's to bring into view, off
         /// <see cref="ListCursor.Moved"/>, as before.
         /// </summary>
-        private void RevealListCursor()
+        public virtual void RevealListRow(ListCursor cursor) => RevealListCursor(cursor);
+
+        /// <summary>
+        /// The scroll behind <see cref="RevealListRow"/>. The widget's own cursor step and its Enter call this
+        /// directly, so an override of the public method changes what the router's call does and not theirs.
+        /// </summary>
+        private void RevealListCursor(ListCursor cursor)
         {
             foreach (var row in _scrolledListRows)
             {
-                if (ListCursor.IsOn(row.Hit))
+                if (cursor.IsOn(row.Hit))
                 {
                     row.Scroll.RevealExtent(row.Start, row.End);
                     return;
@@ -516,41 +665,16 @@ namespace DIR.Lib
         /// </remarks>
         public bool ActivateListCursor(InputModifier modifier = InputModifier.None)
         {
-            if (!ListCursor.IsOpen) return false;
-            if (ListCursor.Index < 0 && !MoveListCursor(1)) return false;
+            var cursor = ActiveCursor();
+            if (cursor is null || !cursor.IsOpen) return false;
 
-            foreach (var region in RegisteredRegions)
-            {
-                if (!ListCursor.IsOn(region.Result)) continue;
-                // Declared unavailable: the press is swallowed, so Enter is too, and for the same
-                // reason. The arrows do not stop here either, so reaching this is a cursor placed by
-                // hand rather than walked.
-                if (region.IsDisabled)
-                {
-                    return false;
-                }
-
-                // Enter's own handler where the row declared one, because Enter and a click are not
-                // always the same act -- Enter pins the target, a click merely selects it. Without
-                // somewhere to say so, such a list had to keep Enter by hand and the cursor could not
-                // own the whole keyboard contract.
-                //
-                // A row can also declare itself and carry NEITHER handler: it registers so the cursor
-                // can reach it and a debug inspector can name it, while its host takes the action on the
-                // pointer RELEASE somewhere else (a list whose press must reach a scroll controller, or
-                // a touch drag would act on whichever row it started on). This used to answer true
-                // there, reporting an activation that had not happened, and a host forwarding the key
-                // saw it claimed and never reached its own binding. Silently, there being no handler to
-                // notice it was missing.
-                if ((region.OnActivate ?? region.OnClick) is not { } act)
-                {
-                    return false;
-                }
-
-                act(modifier);
-                return true;
-            }
-            return false;
+            // The walk is ListKeys.Activate's: Enter's own handler where the row declared one (Enter pins
+            // the target, a click merely selects it), a disabled row refusing, and a row with NEITHER
+            // handler answering false, so a host forwarding the key still reaches its own binding.
+            _clippedListRows.Clear();
+            CollectClippedListRows(cursor.ListId!, _clippedListRows);
+            return ListKeys.Activate(cursor, modifier, RegisteredRegions, _clippedListRows, _paintedListRows,
+                () => RevealListCursor(cursor));
         }
 
         /// <summary>
@@ -563,6 +687,12 @@ namespace DIR.Lib
         /// Escape is deliberately NOT here. Closing is the widget's own business — a menu dismisses, a
         /// panel may commit, a nested list may only step out one level — and a shared answer would be
         /// wrong for most of them.
+        /// <para>
+        /// Where several lists are declared and none is open or alone on the frame (a reader who pressed in
+        /// both), this widget cannot tell which list the keys mean, so it answers false and the key stays the
+        /// host's. <see cref="InputRouter"/> knows the last pressed list and steps that one, so it is the
+        /// router that resolves the ambiguity, never this method guessing.
+        /// </para>
         /// </remarks>
         public bool HandleListKey(InputKey key, InputModifier modifier = InputModifier.None) => key switch
         {
@@ -580,7 +710,7 @@ namespace DIR.Lib
         protected void RegisterClickable(float x, float y, float w, float h, HitResult result,
             Action<InputModifier>? onClick = null, CursorKind? cursor = null,
             Func<PointerPress, DragCapture?>? onPress = null, bool focusOnOpen = false)
-            => _tracker.Register(new ClickableRegion(x, y, w, h, result, onClick, cursor)
+            => RegisterClickable(new ClickableRegion(x, y, w, h, result, onClick, cursor)
             {
                 OnPress = onPress,
                 FocusOnOpen = focusOnOpen
@@ -588,14 +718,19 @@ namespace DIR.Lib
 
         /// <summary>
         /// Registers an already-built region, for the paths that state more than the shorthand above
-        /// covers -- a tooltip, a scroll target, a disabled row. <see cref="PaintLayout(ImmutableArray{Layout.ArrangedNode{float}}, string?, DesignScale?, Action{Layout.Content.Fill, RectF32}?)"/>'s own path,
-        /// since a node can declare all of them at once.
+        /// covers -- a tooltip, a scroll target, a disabled row. This is the path
+        /// <see cref="PaintLayout(ImmutableArray{Layout.ArrangedNode{float}}, string?, DesignScale?, Action{Layout.Content.Fill, RectF32}?)"/>
+        /// takes, since a node can declare all of them at once.
         /// </summary>
-        protected void RegisterClickable(in ClickableRegion region) => _tracker.Register(region);
+        protected void RegisterClickable(in ClickableRegion region)
+        {
+            _tracker.Register(region);
+            Renderer.NoteRegion(region);
+        }
 
         /// <summary>Registers a region that only states a cursor -- a card, a bar -- with no action.</summary>
         protected void RegisterCursor(float x, float y, float w, float h, CursorKind cursor)
-            => _tracker.RegisterCursor(x, y, w, h, cursor);
+            => RegisterClickable(new ClickableRegion(x, y, w, h, new HitResult.ChromeHit(), null, cursor));
 
         /// <summary>
         /// The scroll controller of the innermost region under the point that declared one
@@ -624,9 +759,20 @@ namespace DIR.Lib
             for (var i = regions.Length - 1; i >= 0; i--)
             {
                 var r = regions[i];
-                if (r.Scroll is { } scroll && x >= r.X && x < r.X + r.Width && y >= r.Y && y < r.Y + r.Height)
+                if (!(x >= r.X && x < r.X + r.Width && y >= r.Y && y < r.Y + r.Height))
+                {
+                    continue;
+                }
+
+                if (r.Scroll is { } scroll)
                 {
                     return scroll;
+                }
+
+                // Nothing painted before a surface gets the wheel (Layout.Node.IsSurface).
+                if (r.IsSurface)
+                {
+                    return null;
                 }
             }
             return null;
@@ -668,7 +814,7 @@ namespace DIR.Lib
             // Nothing else reaches inside a field: the layout painter splits TEXT LEAVES per coverage run,
             // and a field's content is not a leaf.
             var caret = TextInputRenderer.Render(Renderer, state, x, y, width, height, fontPath, fontSize,
-                CaretBlink.IsVisible(CaretPhase), colors, FontFallback, leadingRoom);
+                CaretBlink.IsVisible(Ui.CaretPhase), colors, FontFallback, leadingRoom);
             if (state.IsActive)
             {
                 Ui.CaretRect = caret;
@@ -694,7 +840,7 @@ namespace DIR.Lib
             float fontSize, float lineHeight, DesignScale scale, TextInputColors? colors = null, bool focusOnOpen = false)
         {
             var caret = TextEditorRenderer.Render(Renderer, state, x, y, width, height, fontPath, fontSize, lineHeight,
-                CaretBlink.IsVisible(CaretPhase), colors, FontFallback);
+                CaretBlink.IsVisible(Ui.CaretPhase), colors, FontFallback);
             if (state.IsActive)
             {
                 Ui.CaretRect = caret;
@@ -781,7 +927,7 @@ namespace DIR.Lib
             float handleH, float frac, RGBAColor32 fillColor, RectF32 hitBand, HitResult hit,
             TrackSliderChrome chrome, DesignScale? scale = null)
         {
-            DrawTrackSliderVisual(trackX, trackW, barCenterY, handleY, handleH, frac, fillColor, chrome, scale);
+            DrawTrackSliderVisual(trackX, trackW, barCenterY, handleY, handleH, frac, fillColor, chrome, scale, null);
             RegisterClickable(hitBand.X, hitBand.Y, hitBand.Width, hitBand.Height, hit);
         }
 
@@ -794,7 +940,8 @@ namespace DIR.Lib
         /// leaf (<see cref="PaintLayout(System.Collections.Immutable.ImmutableArray{Layout.ArrangedNode{float}},PixelMeasureContext{TSurface},System.Action{Layout.Content.Fill,RectF32}?)"/>).
         /// </summary>
         private void DrawTrackSliderVisual(float trackX, float trackW, float barCenterY, float handleY,
-            float handleH, float frac, RGBAColor32 fillColor, TrackSliderChrome chrome, DesignScale? scale)
+            float handleH, float frac, RGBAColor32 fillColor, TrackSliderChrome chrome, DesignScale? scale,
+            (RGBAColor32 Ring, float RingWidth)? roundThumb)
         {
             var s = (scale ?? Scale).OrOne();
             // A bar thickness runs across the track and a handle width along it, but both are the same
@@ -821,6 +968,17 @@ namespace DIR.Lib
 
             // Handle marker; guard the clamp's upper bound for a sliver-thin track (trackW < handleW would
             // make Math.Clamp's max < min and throw -- the minimize-to-sliver crash).
+            if (roundThumb is { } round)
+            {
+                // A round thumb is as wide as the row is tall: a disc of the handle colour inside a ring.
+                var radius = handleH / 2f;
+                var cx = Math.Clamp(trackX + trackW * frac, trackX + MathF.Min(radius, trackW / 2f), trackX + MathF.Max(trackW - radius, trackW / 2f));
+                var cy = handleY + radius;
+                FillCircle(cx, cy, radius, round.Ring);
+                FillCircle(cx, cy, MathF.Max(0f, radius - s.ToSurface(round.RingWidth)), chrome.Handle);
+                return;
+            }
+
             var handleMax = MathF.Max(trackX, trackX + trackW - handleW);
             var handleX = Math.Clamp(trackX + trackW * frac - handleW / 2f, trackX, handleMax);
             FillRect(handleX, handleY, handleW, handleH, chrome.Handle);
@@ -1155,6 +1313,11 @@ namespace DIR.Lib
             // two painters have to agree, or the same tree means different things per surface.
             var links = new Stack<(int Depth, string Url)>();
 
+            // The nearest enclosing node with a hit (the node itself included), by depth like the link above: a hover
+            // underline (Content.Text.UnderlineOnHover) shows while the pointer is anywhere in that region, so a link's
+            // trailing arrow underlines its text as the text itself does. LayoutDamage resolves it identically.
+            var hitScopes = new Stack<(int Depth, Rect<float> Bounds)>();
+
             // The nearest enclosing DISABLED node, and the background the dim is measured against, both
             // resolved by depth exactly as the link above is. Disabling reaches the subtree because that
             // is what a caller means by it: a row declared unavailable whose label stayed bright would be
@@ -1189,13 +1352,26 @@ namespace DIR.Lib
             // region registered for it would take the presses aimed at whatever the card is sitting on.
             var scrolls = new Stack<(int Depth, ListScrollController Scroll, RectF32 Clip)>();
 
+            // A MODAL overlay being painted: the overlay's depth, and where Top's card is still to be read off
+            // the node after an Anchored Top. -1 is "not inside a modal".
+            var modalDepth = -1;
+            Layout.Node.Overlay? modalOverlay = null;
+            ModalClaim? modalClaim = null;
+            var modalCardDepth = -1;
+
             foreach (var arrangedNode in arranged)
             {
                 var (node, bounds) = arrangedNode;
+                if (node.DeclaredList is { } declaredList) _declaredLists.Add(declaredList);
 
                 while (links.Count > 0 && links.Peek().Depth >= arrangedNode.Depth)
                 {
                     links.Pop();
+                }
+
+                while (hitScopes.Count > 0 && hitScopes.Peek().Depth >= arrangedNode.Depth)
+                {
+                    hitScopes.Pop();
                 }
 
                 while (scrolls.Count > 0 && scrolls.Peek().Depth >= arrangedNode.Depth)
@@ -1213,6 +1389,21 @@ namespace DIR.Lib
                     // A list row is still a row of its list, though, and is noted for the keyboard (see
                     // MoveListCursor), unless it sits in a closed popover, which lists nothing. The depth
                     // markers are read as "an ancestor's", since this skip comes before they are retired.
+                    //
+                    // A disabled node that is off screen still disables what it holds, so its marker is set here as
+                    // it is for a painted node further down (after retiring one an earlier subtree left). Until 11.87
+                    // only a painted node set it, and rows under a disabled group scrolled out of view were noted
+                    // enabled: the arrows stopped on them and Enter ran their handlers.
+                    if (disabledDepth >= 0 && arrangedNode.Depth <= disabledDepth)
+                    {
+                        disabledDepth = -1;
+                    }
+
+                    if (node.IsDisabled && disabledDepth < 0)
+                    {
+                        disabledDepth = arrangedNode.Depth;
+                    }
+
                     if (node.Hit is HitResult.ListItemHit clipped
                         && !(closedPopoverDepth >= 0 && closedPopoverDepth < arrangedNode.Depth))
                     {
@@ -1267,6 +1458,37 @@ namespace DIR.Lib
                     continue;
                 }
 
+                if (modalDepth >= 0 && arrangedNode.Depth <= modalDepth)
+                {
+                    modalDepth = -1;
+                    modalOverlay = null;
+                    modalClaim = null;
+                    modalCardDepth = -1;
+                }
+
+                if (modalClaim is { } pendingCard && modalCardDepth >= 0 && arrangedNode.Depth == modalCardDepth)
+                {
+                    pendingCard.Card = new RectF32(bounds.X, bounds.Y, bounds.Width, bounds.Height);
+                    modalCardDepth = -1;
+                }
+
+                if (node is Layout.Node.Overlay { Modal: true } declaredModal)
+                {
+                    modalDepth = arrangedNode.Depth;
+                    modalOverlay = declaredModal;
+                }
+                else if (modalOverlay is not null && modalClaim is null && ReferenceEquals(node, modalOverlay.Top))
+                {
+                    // Top begins here: everything this widget registers from now on is Top's. Noted before the
+                    // node is captured or registers anything, so the counts are exactly what lay beneath.
+                    modalClaim = Ui.NoteModalPainted(this, _tracker.Regions.Length, captured.Count,
+                        new RectF32(bounds.X, bounds.Y, bounds.Width, bounds.Height), modalOverlay.OnDismiss);
+                    if (node is Layout.Node.Anchored)
+                    {
+                        modalCardDepth = arrangedNode.Depth + 1;
+                    }
+                }
+
                 // Captured HERE, past the closed-popover skip, so what is retained is what was PAINTED and
                 // not merely what was arranged. A closed popover is still measured and still arranged (the
                 // node is inert everywhere but this loop), so appending the whole arranged array at the end
@@ -1275,6 +1497,10 @@ namespace DIR.Lib
                 // prevent. It also gives damage-based repaint the transition it was missing, an opening
                 // popover being nodes that appear rather than nodes whose signature never changed.
                 captured.Add(arrangedNode);
+
+                // The node's place in the cycle's paint order, which a surface painted after it is compared against
+                // (WindowUiSettings.IsCoveredBySurface), and the surface's own note when it is one.
+                var paintOrder = Ui.NotePaintedNode();
 
                 // The pointer owner is the popover's CONTENT rect, and it cannot be read off the Anchored
                 // node: ArrangeNode records every node against the rect it was GIVEN, so the Anchored node's
@@ -1299,6 +1525,11 @@ namespace DIR.Lib
                     links.Push((arrangedNode.Depth, linkHit.Url));
                 }
 
+                if (node.Hit is not null)
+                {
+                    hitScopes.Push((arrangedNode.Depth, bounds));
+                }
+
                 if (node.IsDisabled && disabledDepth < 0)
                 {
                     disabledDepth = arrangedNode.Depth;
@@ -1314,22 +1545,105 @@ namespace DIR.Lib
                 // what the pointer is over are the same rectangle by construction -- the guarantee the
                 // click region below already has. A node with no HoverBackground, or a host that sets no
                 // Pointer, paints exactly as it did before.
-                var nodeFill = node.HoverBackground is { } hover && PointerWithin(bounds, openPopoverDepth >= 0) ? hover
+                // Pressed outranks hover, hover outranks focus, and a disabled node shows neither pressed nor hover.
+                var nodeFill = !disabled && node.PressedBackground is { } pressed
+                        && PressedWithin(bounds, openPopoverDepth >= 0, paintOrder) ? pressed
+                    : !disabled && node.HoverBackground is { } hover && PointerWithin(bounds, openPopoverDepth >= 0, paintOrder) ? hover
                     // And the keyboard's own position, resolved against the node's HIT rather than
                     // against a rect -- the row already says which list and index it is.
-                    : node.FocusBackground is { } focus && ListCursor.IsOn(node.Hit) ? focus
+                    : node.FocusBackground is { } focus && CursorIsOn(node.Hit) ? focus
                     : node.Background;
+                // A rounded all-sides border strokes a curved outline, so the fill follows the same
+                // outline (the larger of the two radii) and the square corners outside it stay clear.
+                var fillRadius = node.BorderStyle is { Radius: > 0f, Sides: Layout.BorderSides.All, Width: > 0f } rb
+                    ? MathF.Max(radius, ctx.ToSurface(rb.Radius))
+                    : radius;
+
+                // The shadow goes under the background and takes the background's outline. Its design-unit
+                // fields scale through the same axis-free mapping as CornerRadius.
+                if (node.ShadowStyle is { Color.Alpha: > 0 } shadow && bounds.Width > 0 && bounds.Height > 0)
+                {
+                    var scaled = shadow with
+                    {
+                        OffsetX = ctx.ToSurface(shadow.OffsetX),
+                        OffsetY = ctx.ToSurface(shadow.OffsetY),
+                        Blur = ctx.ToSurface(shadow.Blur),
+                    };
+                    Renderer.DrawShadow(new RectInt(new PointInt((int)(bounds.X + bounds.Width), (int)(bounds.Y + bounds.Height)),
+                        new PointInt((int)bounds.X, (int)bounds.Y)), fillRadius, scaled);
+                }
+
                 if (nodeFill is { } bg)
                 {
-                    FillRect(bounds.X, bounds.Y, bounds.Width, bounds.Height, bg, radius);
+                    FillRect(bounds.X, bounds.Y, bounds.Width, bounds.Height, bg, fillRadius);
                     backgrounds.Push((arrangedNode.Depth, bg));
+                }
+
+                // The border strokes over the background, in the width the engine reserved (through the same
+                // MapExtent mapping, so stroke and reservation agree to the pixel). Hover, focus and disabled
+                // never change it. A transparent colour reserves room and paints nothing.
+                if (node.BorderStyle is { Color.Alpha: > 0 } border)
+                {
+                    var inset = Layout.Engine.BorderInsets(ctx, node);
+                    var strokeWidth = (int)MathF.Round(MathF.Max(MathF.Max(inset.Left, inset.Right), MathF.Max(inset.Top, inset.Bottom)));
+                    if (strokeWidth > 0 && bounds.Width > 0 && bounds.Height > 0)
+                    {
+                        var borderRect = new RectInt(new PointInt((int)(bounds.X + bounds.Width), (int)(bounds.Y + bounds.Height)),
+                            new PointInt((int)bounds.X, (int)bounds.Y));
+                        Renderer.DrawBorder(borderRect, border.Color, strokeWidth, ctx.ToSurface(border.Radius), border.Sides);
+                    }
+                }
+
+                // The focus ring strokes OUTSIDE the edge, after the border so nothing of the node covers it, and takes
+                // no layout space. Only while the list cursor is on the node's hit, never for a disabled node.
+                if (!disabled && node.FocusRing is { Color.Alpha: > 0, Width: > 0f } ring && node.Hit is { } ringHit
+                    && CursorIsOn(ringHit) && bounds.Width > 0 && bounds.Height > 0)
+                {
+                    var ringWidth = MathF.Max(1f, MathF.Round(ctx.ToSurface(ring.Width)));
+                    // The gap (Offset) leaves the page showing between edge and ring, so the ring reads on a control
+                    // filled in the ring's own colour.
+                    var gap = ring.Offset > 0f ? MathF.Round(ctx.ToSurface(ring.Offset)) : 0f;
+                    var reach = ringWidth + gap;
+                    var ringRect = new RectInt(
+                        new PointInt((int)(bounds.X + bounds.Width + reach), (int)(bounds.Y + bounds.Height + reach)),
+                        new PointInt((int)(bounds.X - reach), (int)(bounds.Y - reach)));
+                    // DrawBorder rounds only a border on all four sides, so a ring with a side left out is drawn
+                    // whole and rounded, inside a clip trimmed on each omitted side to the node's own edge: the
+                    // corners stay round and the open end is flat at the neighbour, with no band over it.
+                    var partial = ring.Sides != Layout.BorderSides.All;
+                    if (partial)
+                    {
+                        var cl = (int)(bounds.X - reach); var ct = (int)(bounds.Y - reach);
+                        var cr = (int)(bounds.X + bounds.Width + reach); var cb = (int)(bounds.Y + bounds.Height + reach);
+                        if ((ring.Sides & Layout.BorderSides.Left) == 0) cl = (int)bounds.X;
+                        if ((ring.Sides & Layout.BorderSides.Top) == 0) ct = (int)bounds.Y;
+                        if ((ring.Sides & Layout.BorderSides.Right) == 0) cr = (int)(bounds.X + bounds.Width);
+                        if ((ring.Sides & Layout.BorderSides.Bottom) == 0) cb = (int)(bounds.Y + bounds.Height);
+                        Renderer.PushClip(new RectInt(new PointInt(cr, cb), new PointInt(cl, ct)));
+                    }
+                    Renderer.DrawBorder(ringRect, ring.Color, (int)ringWidth,
+                        fillRadius > 0f ? fillRadius + reach : 0f, Layout.BorderSides.All);
+                    if (partial) Renderer.PopClip();
                 }
 
                 // The engine is the only thing that knows where the list was arranged, so it is the only
                 // thing that can state the viewport without keeping a second copy of the rect. What the
                 // list contains stays the consumer's, through SetExtent -- and bound BEFORE the leaf
                 // draws, so a drawFill that states the whole extent is the later word and wins.
-                node.Scroll?.BindViewport(new RectF32(bounds.X, bounds.Y, bounds.Width, bounds.Height));
+                // A scrolled node's viewport is the rect inside its border (the engine arranges and measures
+                // the scroll extent against that same rect), so rows and the bar never cover the stroke.
+                var viewBounds = bounds;
+                if (node.Scroll is not null && node.BorderStyle is not null)
+                {
+                    var vi = Layout.Engine.BorderInsets(ctx, node);
+                    if (vi.Any)
+                    {
+                        viewBounds = new Rect<float>(bounds.X + vi.Left, bounds.Y + vi.Top,
+                            MathF.Max(0f, bounds.Width - vi.Left - vi.Right), MathF.Max(0f, bounds.Height - vi.Top - vi.Bottom));
+                    }
+                }
+
+                node.Scroll?.BindViewport(new RectF32(viewBounds.X, viewBounds.Y, viewBounds.Width, viewBounds.Height));
 
                 // Auto-bind the click region to the arranged rect. Any node can be a hit target -- a whole
                 // slot row or panel, not just a leaf -- and inner nodes register later so they win the hit.
@@ -1350,6 +1664,17 @@ namespace DIR.Lib
                 // What the region covers: the arranged rect, or only the part of it inside the enclosing
                 // scrolled node's viewport -- the rest is not on screen and must not answer a press.
                 var region = scrolls.Count > 0 ? Intersect(scrolls.Peek().Clip, bounds) : bounds;
+
+                // A surface takes the pointer from what was painted before it (Node.IsSurface): its region covers the
+                // whole rect, so the router's walk down the regions stops here, and the rect is noted for the hover of
+                // the next frame's earlier nodes. A surface with no hit of its own registers plain chrome that is not
+                // inert: a press on it is taken and does nothing.
+                var surface = node.IsSurface;
+                if (surface)
+                {
+                    Ui.NoteSurfacePainted(new RectF32(region.X, region.Y, region.Width, region.Height), paintOrder);
+                }
+
                 if (node.Hit is { } hit)
                 {
                     if (hit is HitResult.ListItemHit listRow && scrolls.Count > 0)
@@ -1365,6 +1690,7 @@ namespace DIR.Lib
                         OnActivate = disabled ? null : node.OnActivate,
                         OnDoubleClick = disabled ? null : node.OnDoubleClick,
                         OnContextMenu = disabled ? null : node.OnContextMenu,
+                        OnPressWithin = disabled ? null : node.OnPressWithin,
                         Tooltip = tooltip,
                         TooltipSide = node.TooltipSide,
                         IsDisabled = disabled,
@@ -1373,9 +1699,10 @@ namespace DIR.Lib
                         // the press is swallowed, and swallowed is all it is.
                         Opens = disabled ? null : node.OpensPopover,
                         Dismisses = node.DismissesPopover,
+                        IsSurface = surface,
                     });
                 }
-                else if (cursor is not null || tooltip is not null || node.Scroll is not null)
+                else if (surface || cursor is not null || tooltip is not null || node.Scroll is not null || (node.OnPressWithin is not null && !disabled))
                 {
                     // A cursor, a tooltip or a scroll target with no hit still needs a region, or the
                     // statement has nowhere to live. Inert to presses (ChromeHit, no handler), which is
@@ -1388,6 +1715,8 @@ namespace DIR.Lib
                         TooltipSide = node.TooltipSide,
                         IsDisabled = disabled,
                         Scroll = node.Scroll,
+                        OnPressWithin = disabled ? null : node.OnPressWithin,
+                        IsSurface = surface,
                     });
                 }
 
@@ -1395,7 +1724,7 @@ namespace DIR.Lib
                 // background and region, which are the viewport itself and are never clipped by it.
                 if (node.Scroll is { } scrolled)
                 {
-                    var clip = scrolls.Count > 0 ? Intersect(scrolls.Peek().Clip, bounds) : bounds;
+                    var clip = scrolls.Count > 0 ? Intersect(scrolls.Peek().Clip, viewBounds) : viewBounds;
                     PushClip(clip.X, clip.Y, clip.Width, clip.Height);
                     scrolls.Push((arrangedNode.Depth, scrolled, new RectF32(clip.X, clip.Y, clip.Width, clip.Height)));
                 }
@@ -1452,6 +1781,30 @@ namespace DIR.Lib
                                 DrawText(value.AsSpan(), fp, ctx.Fallback,
                                     bounds.X, bounds.Y, bounds.Width, bounds.Height,
                                     fontSize, runColor, text.HAlign, text.VAlign);
+                            }
+
+                            // The hover underline: a 1-unit rule under the measured run, in the run's colour.
+                            if (text.UnderlineOnHover && !disabled && value.Length > 0
+                                && PointerWithin(hitScopes.Count > 0 ? hitScopes.Peek().Bounds : bounds,
+                                    openPopoverDepth >= 0, paintOrder))
+                            {
+                                var run = Renderer.MeasureText(value.AsSpan(), fp, fontSize);
+                                var runW = MathF.Min(run.Width, bounds.Width);
+                                var runX = text.HAlign switch
+                                {
+                                    TextAlign.Center => bounds.X + (bounds.Width - runW) / 2f,
+                                    TextAlign.Far => bounds.X + bounds.Width - runW,
+                                    _ => bounds.X,
+                                };
+                                var runTop = text.VAlign switch
+                                {
+                                    TextAlign.Center => bounds.Y + (bounds.Height - run.Height) / 2f,
+                                    TextAlign.Far => bounds.Y + bounds.Height - run.Height,
+                                    _ => bounds.Y,
+                                };
+                                var rule = MathF.Max(1f, ctx.ToSurface(1f));
+                                FillRect(runX, MathF.Min(runTop + run.Height - rule, bounds.Y + bounds.Height - rule),
+                                    runW, rule, text.Color);
                             }
                             break;
                         case Layout.Content.Box box when box.Color.Alpha > 0:
@@ -1541,9 +1894,12 @@ namespace DIR.Lib
                                     DimTowards(slider.Chrome.TrackBackground, behind),
                                     DimTowards(slider.Chrome.Handle, behind))
                                 : slider.Chrome;
+                            (RGBAColor32, float)? roundThumb = slider.RoundThumb
+                                ? (sliderDisabled ? DimTowards(slider.ThumbRing, behind) : slider.ThumbRing, slider.ThumbRingWidth)
+                                : null;
 
                             DrawTrackSliderVisual(bounds.X, bounds.Width, bounds.Y + bounds.Height / 2f,
-                                bounds.Y, bounds.Height, frac, fillColor, chrome, ctx.Scale);
+                                bounds.Y, bounds.Height, frac, fillColor, chrome, ctx.Scale, roundThumb);
 
                             // draw == hit: the drag reads the SAME rect it was just painted into, captured
                             // once here rather than re-derived from wherever the press lands.

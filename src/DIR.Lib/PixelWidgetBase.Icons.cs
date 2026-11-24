@@ -44,6 +44,17 @@ namespace DIR.Lib
                 return;
             }
 
+            // The SVG-backed kinds: the embedded outline's coverage at this pixel size, in the ink, centred.
+            // The mask is kept per size by the VectorIcon, so nothing is read or rasterised twice.
+            if (IconSet.Get(kind) is { } vector)
+            {
+                var px = Math.Clamp((int)MathF.Round(side), 1, IconBaker.MaxSceneSize);
+                var mask = vector.Mask(px);
+                DrawCoverageMask(mask, MathF.Round(rect.X + (rect.Width - px) / 2f),
+                    MathF.Round(rect.Y + (rect.Height - px) / 2f), px, ink);
+                return;
+            }
+
             // 5.4 units across the icon: two 2.2-unit cells plus the 1-unit gutter between them. The bars
             // below reuse the same unit, so the two icons read as one family at any size.
             var unit = MathF.Max(1f, side / 5.4f);
@@ -314,6 +325,28 @@ namespace DIR.Lib
                         var length = MathF.Sqrt(x * x + y * y);
                         return (x / length, y / length);
                     }
+                }
+
+                case Layout.IconKind.Bell:
+                {
+                    // Knob on top, a dome that widens in steps, a rim across the foot, a clapper under it:
+                    // ink reaches all four edges of the square. Rows of rectangles, never triangles.
+                    var bellX = rect.X + (rect.Width - side) / 2f;
+                    var bellY = rect.Y + (rect.Height - side) / 2f;
+                    var bellCx = bellX + side / 2f;
+                    void Band(float topFrac, float heightFrac, float widthFrac)
+                    {
+                        var w = side * widthFrac;
+                        FillRect(bellCx - w / 2f, bellY + side * topFrac, w, MathF.Max(1f, side * heightFrac), ink);
+                    }
+
+                    Band(0f, 0.10f, 0.14f);      // knob
+                    Band(0.10f, 0.14f, 0.40f);   // shoulder
+                    Band(0.24f, 0.18f, 0.60f);   // dome
+                    Band(0.42f, 0.22f, 0.74f);   // waist
+                    Band(0.64f, 0.14f, 1.00f);   // rim, full width
+                    Band(0.88f, 0.12f, 0.24f);   // clapper
+                    break;
                 }
 
                 case Layout.IconKind.Search:

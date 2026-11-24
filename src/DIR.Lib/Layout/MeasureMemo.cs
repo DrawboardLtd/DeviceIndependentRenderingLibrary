@@ -37,6 +37,12 @@ internal static class MeasurePurity
 
     private static bool Compute(Node node)
     {
+        // The narrow form can be the one measured, so it must be as pure as the node for the result to be kept.
+        if (node.NarrowForm is { } narrowForm && !IsPure(narrowForm))
+        {
+            return false;
+        }
+
         switch (node)
         {
             case Node.Leaf { Content: Content.TextEditor or Content.TextInput }:
@@ -48,7 +54,7 @@ internal static class MeasurePurity
             case Node.Grid grid:
                 return AllPure(grid.Cells);
             case Node.Wrap wrap:
-                return AllPure(wrap.Children);
+                return AllPure(wrap.Children) && (wrap.FirstLineTrailing is not { } trailing || IsPure(trailing));
             case Node.Overlay overlay:
                 return IsPure(overlay.Base) && IsPure(overlay.Top);
             case Node.Anchored anchored:

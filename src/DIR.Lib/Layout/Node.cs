@@ -125,6 +125,20 @@ public abstract partial record Node
     public RGBAColor32? HoverBackground { get; init; }
 
     /// <summary>
+    /// Background to paint instead of <see cref="HoverBackground"/>, <see cref="FocusBackground"/> and
+    /// <see cref="Background"/> while the primary button is HELD down on this node: the press went down inside
+    /// the node's arranged rect (not on a surface, popover backdrop or modal that took it) and the pointer is still
+    /// inside it. Letting go, or dragging off the node, ends it; a press that started elsewhere and is dragged over
+    /// the node lights nothing. A disabled node never shows it.
+    /// <para>
+    /// The press is recorded by <see cref="InputRouter"/> (<see cref="WindowUiSettings.PressOrigin"/>) on a left
+    /// MouseDown and cleared on the MouseUp, with a redraw on both edges, so no host code is needed.
+    /// Painted by the pixel painter; Console.Lib's cell painter, SdlVulkan.Renderer and WebGl.Renderer may honour it later.
+    /// </para>
+    /// </summary>
+    public RGBAColor32? PressedBackground { get; init; }
+
+    /// <summary>
     /// Background to paint instead of <see cref="Background"/> while the KEYBOARD cursor is on this
     /// node — the same idea as <see cref="HoverBackground"/>, for the other pointing device.
     /// <para>
@@ -150,9 +164,29 @@ public abstract partial record Node
     /// painter through <c>Renderer.FillRoundedRectangle</c>, a cell painter by drawing arc corners
     /// (U+256D..U+2570) since a character grid cannot round by fractions of a cell. A surface that cannot
     /// express it at all just fills square, which is why this is a hint rather than a guarantee.
+    /// A rounded all-sides <see cref="BorderStyle"/> also rounds the background on a pixel surface, to the
+    /// larger of the two radii, so fill and stroke share one outline.
     /// </para>
     /// Set via <see cref="Radius"/>.</summary>
     public float CornerRadius { get; init; }
+
+    /// <summary>The border this node declares, or null (default) for none, which changes nothing about a tree
+    /// that does not set it. The engine reserves it inside this node's extent on every surface, per declared side
+    /// and outside <see cref="Padding"/>, through <see cref="ExtentKind.Border"/>, in measure and arrange alike.
+    /// Set via <see cref="Border(RGBAColor32, float, float)"/> and the per-side <c>BorderTop</c> family.</summary>
+    public BorderStyle? BorderStyle { get; init; }
+
+    /// <summary>The drop shadow this node declares, or null (default) for none. Chrome only: arrange never sees it,
+    /// so a shadowed node occupies the rect an unshadowed one would. A pixel surface paints it under the background
+    /// (following its corner radius); a cell surface paints nothing. Init-only, never a constructor parameter.
+    /// Set via <see cref="Shadow(float, float, float, RGBAColor32)"/> or <see cref="Elevated"/>.</summary>
+    public ShadowStyle? ShadowStyle { get; init; }
+
+    /// <summary>The focus ring this node declares, or null (default) for none: a stroke drawn outside the node's edge while
+    /// the list cursor is on <see cref="Hit"/>, never for a disabled node. Chrome only: arrange never sees it, so a node with
+    /// a ring occupies the rect one without would. A cell surface paints nothing. Init-only, never a constructor parameter.
+    /// Set via <see cref="WithFocusRing(RGBAColor32, float, float)"/>.</summary>
+    public FocusRingStyle? FocusRing { get; init; }
 
     /// <summary>Optional click region bound to this node's arranged rect (draw == hit by construction).
     /// Lives on the node, not the content, so a whole container (a slot row, a panel) is clickable -- not
@@ -179,6 +213,23 @@ public abstract partial record Node
     public Func<PointerPress, DragCapture?>? OnPress { get; init; }
 
     /// <summary>
+    /// Told of every left press that lands inside this node's arranged rect, set via <see cref="WithPressWithin"/>,
+    /// BEFORE the topmost region under the point acts. The press is not consumed by it: the topmost region (a
+    /// button, a field, this node's own body) still gets it exactly as before.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Why: a floating child window must come to the front and become active on a press anywhere on it, content
+    /// controls included, and a control that takes the press is the topmost region, so a window beneath it never
+    /// heard. Only the INNERMOST-LAST (topmost painted) node declaring this under the point is told, within the
+    /// widget that owns the topmost region, so two overlapping windows never both activate. A popover backdrop
+    /// ends the search. A disabled node's rule is dropped, like its other handlers.
+    /// </para>
+    /// <para>An init-only property, so no constructor changes shape.</para>
+    /// </remarks>
+    public Action<PointerPress>? OnPressWithin { get; init; }
+
+    /// <summary>
     /// What Enter does on this node when it differs from a click, set via <see cref="Activatable"/>.
     /// Null (the default) means the two are the same thing and Enter runs <see cref="OnClick"/>.
     /// </summary>
@@ -189,6 +240,12 @@ public abstract partial record Node
     /// kept its Enter by hand and the cursor could not own the whole keyboard contract of a list.
     /// </remarks>
     public Action<InputModifier>? OnActivate { get; init; }
+
+    /// <summary>
+    /// The list this node is the container of, set via <see cref="ListOf(ListCursor, string)"/>: the cursor that owns its rows
+    /// and their list id. An init-only property, so no constructor changes shape. See <see cref="DIR.Lib.DeclaredList"/>.
+    /// </summary>
+    public DIR.Lib.DeclaredList? DeclaredList { get; init; }
 
     /// <summary>
     /// What the SECOND press of a double-click does, set via <see cref="DoubleClickable"/>: a rig card
@@ -290,11 +347,19 @@ public abstract partial record Node
     /// a wheel can be delivered to the innermost scrollable under the pointer.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// The rows and the row height stay the consumer's, stated through
     /// <see cref="ListScrollController.SetExtent"/>; only the viewport moves here, because only the
     /// engine knows it. What it removes is the "is the pointer over my rect" test every wheel handler was
     /// making for itself -- seventeen of them across eleven files in one consumer, each a second
     /// derivation of a rect the arrange pass already held.
+    /// </para>
+    /// <para>
+    /// A stack whose controller draws a bar on the stack's axis also MEASURES that bar's column (6 design
+    /// units, less any trailing padding that already covers it) on its cross extent, by the rule the arrange
+    /// reserves it by (11.66). A list that fits is measured the same way: the column is reserved by the
+    /// measure whether or not it ends up drawn, and the arrange gives the room back.
+    /// </para>
     /// </remarks>
     public ListScrollController? Scroll { get; init; }
 
@@ -375,6 +440,17 @@ public abstract partial record Node
     /// learns it, since a press handler sees no layout. Called on the arranging thread: keep it to storing a number.</summary>
     public Action<float>? OnArranged { get; init; }
 
+    /// <summary>
+    /// The form this node takes when the room offered is too narrow for it, or null for none. The rule, applied
+    /// identically in <see cref="Engine.Measure{T}"/> and <see cref="Engine.Arrange{T}"/> (one helper, so they cannot
+    /// disagree) and for a float and an int (cell) measure context alike: the FULL form (this node) is used when its
+    /// natural width, measured unconstrained on the main axis, fits the width offered; otherwise the narrow form
+    /// replaces it whole, so the arranged list, painters, <c>InputRouter</c> and damage see only the chosen form (a
+    /// click region exists only for it). The narrow form is never measured against a third form: its own
+    /// <c>NarrowForm</c> is ignored. Init-only on purpose, never a constructor parameter (the 9.1 binary-break rule).
+    /// </summary>
+    public Node? NarrowForm { get; init; }
+
     /// <summary>Collapse threshold in design units, honoured by a parent <see cref="Stack"/>: when this
     /// node's resolved main-axis extent lands below the threshold, the node drops out of the arrangement
     /// entirely (not painted, no hit region, no gap) and its space redistributes to the surviving
@@ -382,6 +458,29 @@ public abstract partial record Node
     /// remnant is unreadable noise, so it collapses instead. 0 (default) = never collapse. Set via
     /// <see cref="CollapseBelow"/>; only a Stack parent honours it (Dock/Grid strips are explicit).</summary>
     public float CollapseThreshold { get; init; }
+
+    /// <summary>A node that is only the space BETWEEN its siblings (a table header's grip cell): a parent
+    /// <see cref="Stack"/> draws it only between two surviving non-separator siblings, and one per run, so a
+    /// sibling that collapses (<see cref="CollapseBelow"/>) takes one separator with it, as the stack's own
+    /// <see cref="Stack.Gap"/> goes with it. A separator never collapses by threshold. Init-only, so it
+    /// adds nothing to any record's constructor.</summary>
+    public bool Separator { get; init; }
+
+    /// <summary>
+    /// This node is a surface: what is painted over something takes the pointer from it. Within the node's arranged rect,
+    /// nothing painted BEFORE it, earlier in the same tree or in a widget painted beneath, gets the hover highlight, the
+    /// tooltip, the cursor, a press, a release click, a double click or the wheel. What the node itself contains (its
+    /// buttons, its own hover rows) works as ever, being painted after it. Set with <see cref="AsSurface"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>The painter registers a region for the whole rect (the node's own <see cref="Hit"/> when it has one, else a
+    /// <see cref="HitResult.ChromeHit"/>) marked <see cref="ClickableRegion.IsSurface"/>, which is where the router stops,
+    /// and notes the rect on <see cref="WindowUiSettings"/> beside a popover's pointer claim, which is how a node painted
+    /// before it in the next frame knows not to light (<see cref="WindowUiSettings.PointerClaimSettled"/>).</para>
+    /// <para>Declared, not inferred from an opaque <see cref="Background"/>: a card a host draws with a background over
+    /// nothing costs nothing, and no existing tree changes behaviour until it says so. Init-only (11.86).</para>
+    /// </remarks>
+    public bool IsSurface { get; init; }
 
     /// <summary>Children laid out sequentially along <paramref name="Axis"/>, separated by <paramref name="Gap"/> design units.</summary>
     public sealed record Stack(ImmutableArray<Node> Children, Axis Axis = Axis.Vertical, float Gap = 0f) : Node;
@@ -466,6 +565,33 @@ public abstract partial record Node
         public float FirstLineReserve { get; init; }
 
         /// <summary>
+        /// A node drawn flush at the main end of the FIRST line only, whose main extent is MEASURED (a Fixed
+        /// size goes through <see cref="IMeasureContext{T}.MapExtent"/>, an Auto size is measured by the
+        /// surface context). Line 1 holds the items in the room left after that extent and one gap; every
+        /// later line uses the full extent. Unlike <see cref="FirstLineReserve"/> (a design-unit number,
+        /// wrong in cells) the reservation is whatever the node measures on the surface it lands on.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// Why: pilot's top bar. A <see cref="Dock"/> or an HStack narrows EVERY line by the corner node's
+        /// width, and a hand-computed reserve is in design units, which is the wrong number on a cell surface.
+        /// </para>
+        /// <para>
+        /// Narrow rule: when the first item does not fit in that room, line 1 holds only the trailing node and
+        /// the items start on line 2. (Without a trailing node a child always takes an empty line.) The gap
+        /// before the trailing node applies only when line 1 holds at least one item. The line's cross extent
+        /// is the larger of its items' and the trailing node's; a Star cross stretches to it like an item.
+        /// A <see cref="FirstLineReserve"/>, if also set, is extra space between the items and the trailing
+        /// node. With <see cref="MaxLines"/> the trailing node is always kept; the items the cap cuts set
+        /// <see cref="ArrangedNode{T}.Truncated"/> and the <see cref="Ellipsis"/> room on line 1 is the item
+        /// room. A wrap with no children and a trailing node is one line holding the trailing node. The node
+        /// is arranged after line 1's items. An init-only property for the same binary-compatibility reason
+        /// as <see cref="FirstLineReserve"/>.
+        /// </para>
+        /// </remarks>
+        public Node? FirstLineTrailing { get; init; }
+
+        /// <summary>
         /// Most lines the flow may use. Children that do not fit within them are DROPPED -- not
         /// arranged, not painted, not registered. Zero (the default) means unlimited. The arranged wrap
         /// reports a cut through <see cref="ArrangedNode{T}.Truncated"/>, and <see cref="Ellipsis"/> opts
@@ -490,6 +616,13 @@ public abstract partial record Node
         /// When <see cref="MaxLines"/> drops children, end the last kept line with an ellipsis: if the last
         /// kept child is a text leaf, its text is cut from the end and U+2026 appended until it fits the
         /// line. A child that is not a text leaf is left alone. Default false.
+        /// <para>
+        /// An Ellipsis wrap also never lets a text leaf run past its line: a text leaf that opens a line and
+        /// is wider than that line's room is cut to the room and ends in an ellipsis, whether or not the cap
+        /// cuts there (measure and arrange agree on the cut extent), and a cut leaf ends its line, so nothing
+        /// is drawn after its ellipsis. Without Ellipsis such a leaf still gets
+        /// a line of its own and overflows.
+        /// </para>
         /// </summary>
         /// <remarks>
         /// Opt-in, because a capped toolbar of text buttons must not get a glyph glued to a button label,
@@ -501,7 +634,26 @@ public abstract partial record Node
     }
 
     /// <summary><paramref name="Base"/> drawn first, <paramref name="Top"/> on top (modal / dropdown / popup). Both fill the same rect.</summary>
-    public sealed record Overlay(Node Base, Node Top) : Node;
+    public sealed record Overlay(Node Base, Node Top) : Node
+    {
+        /// <summary>
+        /// Declares <see cref="Top"/> modal: while it is painted, <see cref="InputRouter"/> delivers presses, keys,
+        /// scroll, drags, shortcuts and declared-list keys to <see cref="Top"/> only, and nothing reaches
+        /// <see cref="Base"/> or a widget painted beneath. Default false.
+        /// </summary>
+        /// <remarks>
+        /// Open and closed are the tree's own state: build the overlay while the modal is open and leave it out
+        /// when it is not (<see cref="Builder.Modal"/> does that for a null top). An init-only property rather
+        /// than a primary-constructor parameter, which would be a binary break.
+        /// </remarks>
+        public bool Modal { get; init; }
+
+        /// <summary>
+        /// What a press outside the modal card, or Escape, does to close it. Null: the press is still consumed,
+        /// and nothing closes. Read only when <see cref="Modal"/> is set.
+        /// </summary>
+        public System.Action? OnDismiss { get; init; }
+    }
 
     /// <summary>
     /// Two resizable panes laid out along <paramref name="Axis"/> with a draggable divider of
@@ -654,6 +806,16 @@ public abstract partial record Node
         /// a consumer could compute when it builds the tree.
         /// </remarks>
         public bool CenterAlong { get; init; }
+
+        /// <summary>
+        /// Map <see cref="OffsetAlong"/> and <see cref="OffsetAcross"/> on the axis each runs along
+        /// (<see cref="IMeasureContext{T}.ToSurfaceX"/> across the surface, <see cref="IMeasureContext{T}.ToSurfaceY"/>
+        /// down it) instead of the axis-less <see cref="IMeasureContext{T}.ToSurface"/>. On a square-unit surface the two
+        /// agree; on a terminal, where a cell is 8x16 design units, a free child authored at (280, 180) lands at column 35,
+        /// row 11 rather than column 280, row 180. Off by default, so a tree written before it arranges exactly as it did.
+        /// </summary>
+        /// <remarks>An init-only property, not a positional parameter, for the reason <see cref="CenterAlong"/> is one.</remarks>
+        public bool OffsetsPerAxis { get; init; }
 
         /// <summary>
         /// The widest the child is measured and arranged at, in design units; 0 means no cap beyond the room it floats in.

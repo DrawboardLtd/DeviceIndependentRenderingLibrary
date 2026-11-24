@@ -504,6 +504,84 @@ public class InputRouterTests
         harness.UnhandledEvents.ShouldHaveSingleItem().ShouldBeOfType<InputEvent.MouseMove>();
     }
 
+    // ---- PointerLeft --------------------------------------------------------------------------
+
+    [Fact]
+    public void ThePointerLeavingUnlightsTheHoveredNodeAndAsksForOneRedraw()
+    {
+        var harness = new Harness();
+        harness.Paint(front: Layout.Builder.Box(200f, 20f).RowH(20f).BgHover(Lit).Stretch());
+        harness.Move(10f, 10f);
+        var before = harness.Redraws;
+        harness.Back.Pointer.ShouldNotBeNull();
+        harness.Front.Pointer.ShouldNotBeNull();
+
+        harness.Router.Handle(new InputEvent.PointerLeft());
+
+        harness.Redraws.ShouldBe(before + 1);
+        harness.Back.Pointer.ShouldBeNull();
+        harness.Front.Pointer.ShouldBeNull();
+
+        harness.Router.Handle(new InputEvent.PointerLeft());
+        harness.Redraws.ShouldBe(before + 1, "nothing was left to drop the second time");
+    }
+
+    [Fact]
+    public void ThePointerLeavingDropsAPendingAndAShownTooltip()
+    {
+        var harness = new Harness();
+        harness.Paint(front: Layout.Builder.Box(200f, 20f).RowH(20f).WithTooltip("Cool the camera"));
+
+        harness.Move(10f, 10f);
+        var before = harness.Redraws;
+        harness.Router.Handle(new InputEvent.PointerLeft());
+        harness.Router.Tooltip.ShouldBeNull();
+        harness.Clock.Advance(harness.Router.TooltipDelay);
+        harness.Router.Tooltip.ShouldBeNull("the pending tooltip was dropped, not delayed");
+        harness.Redraws.ShouldBe(before + 1);
+
+        harness.Move(10f, 10f);
+        harness.Clock.Advance(harness.Router.TooltipDelay);
+        harness.Router.Tooltip.ShouldNotBeNull();
+        before = harness.Redraws;
+        harness.Router.Handle(new InputEvent.PointerLeft());
+        harness.Router.Tooltip.ShouldBeNull();
+        harness.Redraws.ShouldBe(before + 1);
+    }
+
+    [Fact]
+    public void ThePointerLeavingWithNothingHoveredAsksForNoRedrawAndReachesTheHost()
+    {
+        var harness = new Harness();
+        harness.Paint(front: Layout.Builder.Box(200f, 20f).RowH(20f));
+        harness.Move(10f, 10f);
+        var before = harness.Redraws;
+
+        harness.Router.Handle(new InputEvent.PointerLeft());
+
+        harness.Redraws.ShouldBe(before);
+        harness.UnhandledEvents.OfType<InputEvent.PointerLeft>().ShouldHaveSingleItem();
+    }
+
+    [Fact]
+    public void ThePointerLeavingDuringADragLeavesTheCaptureWorking()
+    {
+        var harness = new Harness();
+        var moves = 0;
+        var released = false;
+        harness.Paint(front: Layout.Builder.Box(50f, 20f).Pressable(
+            new HitResult.ButtonHit("drag"), _ => new DragCapture(_ => moves++, _ => released = true)));
+        harness.Press(10f, 10f);
+
+        harness.Router.Handle(new InputEvent.PointerLeft());
+        harness.Move(120f, 120f, MouseButton.Left);
+        harness.Release(130f, 120f);
+
+        moves.ShouldBe(1);
+        released.ShouldBeTrue();
+        harness.UnhandledEvents.OfType<InputEvent.PointerLeft>().ShouldHaveSingleItem();
+    }
+
     [Fact]
     public void AMoveDuringAGestureGoesToTheCaptureAndNowhereElse()
     {
@@ -1270,5 +1348,48 @@ public class InputRouterTests
         harness.Router.Handle(new InputEvent.Scroll(-1f, 50f, 50f));
         harness.UnhandledEvents.OfType<InputEvent.Scroll>().ShouldHaveSingleItem("a box that fits has nothing to scroll");
         short_.ScrollOffsetY.ShouldBe(0f);
+    }
+
+    // ---- OnPressWithin ------------------------------------------------------------------------
+
+    [Fact]
+    public void AContainerDeclaringPressWithinHearsAPressAndTheControlInsideItStillGetsItsOwn()
+    {
+        var harness = new Harness();
+        var heard = new List<(float X, float Y)>();
+        var clicks = 0;
+        var button = Layout.Builder.Text("go", 14f).WFixed(40f).HFixed(20f)
+            .Clickable(new HitResult.ButtonHit("go"), _ => clicks++);
+        var container = Layout.Builder.VStack(button).WFixed(100f).HFixed(100f)
+            .Bg(Lit).WithPressWithin(p => heard.Add((p.X, p.Y)));
+        harness.Paint(front: Layout.Builder.Anchored(container, null, 0f, 0f, 0f, clamp: false));
+
+        harness.Press(5f, 5f).ShouldBeTrue();
+        heard.ShouldHaveSingleItem();
+        clicks.ShouldBe(1, "the control is still the topmost region and acts as before");
+
+        harness.Press(80f, 80f);
+        heard.Count.ShouldBe(2, "a press on the container's empty part is heard too");
+        clicks.ShouldBe(1);
+
+        harness.Press(150f, 150f);
+        heard.Count.ShouldBe(2, "a press outside the container is not heard");
+    }
+
+    [Fact]
+    public void OnlyTheTopmostContainerUnderThePointIsTold()
+    {
+        var harness = new Harness();
+        var heard = new List<string>();
+        Layout.Node Box(string name, float x)
+            => Layout.Builder.Anchored(
+                Layout.Builder.Spacer().WFixed(100f).HFixed(100f).Bg(Lit)
+                    .Clickable(new HitResult.ButtonHit(name))
+                    .WithPressWithin(_ => heard.Add(name)),
+                null, x, 0f, 0f, clamp: false);
+        harness.Paint(front: Layout.Builder.Overlay(Box("back", 0f), Box("front", 50f)));
+
+        harness.Press(75f, 10f);
+        heard.ShouldBe(["front"], "two overlapping containers: the one painted last takes the press");
     }
 }

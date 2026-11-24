@@ -726,6 +726,65 @@ public class LayoutEngineTests
     }
 
     [Fact]
+    public void ClampedStar_SurplusOfCappedStarsReachesAFlooredOne_NotLeftOver()
+    {
+        // A table's slack column (a star with a floor) beside capped optional columns. The even split (300 / 4 = 75)
+        // is under the floor (100) and over every cap (30), and freezing both kinds in one pass held the floored star
+        // at 100 with 110 of the 300 left empty. They still all freeze in that pass, and then the 110 nobody was given
+        // goes to the star frozen at its floor: 300 - 3 * 30.
+        var floored = new Layout.Node.Leaf(new Layout.Content.Box(0, 0))
+        { Height = Layout.Sizing.Star(min: 100f), Width = Layout.Sizing.Star() };
+        Layout.Node Capped() => new Layout.Node.Leaf(new Layout.Content.Box(0, 0))
+        { Height = Layout.Sizing.Star(1f, 0f, 30f), Width = Layout.Sizing.Star() };
+        var capped = new[] { Capped(), Capped(), Capped() };
+        var stack = new Layout.Node.Stack([floored, .. capped]);
+
+        var arranged = Layout.Engine.Arrange(stack, new Rect<float>(0, 0, 100, 300), new PixelCtx());
+
+        RectOf(arranged, floored).Height.ShouldBe(210f, 0.001);
+        foreach (var c in capped)
+        {
+            RectOf(arranged, c).Height.ShouldBe(30f, 0.001);
+        }
+    }
+
+    [Fact]
+    public void ClampedStar_ACappedStarKeepsItsCap_WhenAFloorFreezesInTheSamePass()
+    {
+        // Split 100 / 2 = 50: under the floor (80), over the cap (40). Both freeze at their bound in the one pass,
+        // and the capped star keeps its 40 (the floored star overflows, as a floor does). CSS flexbox's rule (11.58.6221)
+        // froze the floor first and left the capped star 20, under its cap: a table's optional column, which drops
+        // below its width, then dropped where it had kept its width before.
+        var floored = new Layout.Node.Leaf(new Layout.Content.Box(0, 0))
+        { Height = Layout.Sizing.Star(min: 80f), Width = Layout.Sizing.Star() };
+        var capped = new Layout.Node.Leaf(new Layout.Content.Box(0, 0))
+        { Height = Layout.Sizing.Star(1f, 0f, 40f), Width = Layout.Sizing.Star() };
+        var stack = new Layout.Node.Stack([floored, capped]);
+
+        var arranged = Layout.Engine.Arrange(stack, new Rect<float>(0, 0, 100, 100), new PixelCtx());
+
+        RectOf(arranged, floored).Height.ShouldBe(80f, 0.001);
+        RectOf(arranged, capped).Height.ShouldBe(40f, 0.001);
+    }
+
+    [Fact]
+    public void ClampedStar_LeftoverGoesToAFlooredStarOnlyUpToItsMax()
+    {
+        // Every star freezes in the first pass (split 300 / 2 = 150: under the floor of 160, over the cap of 30), so
+        // 110 is left. The floored star also has a Max of 200: it grows from 160 to 200 and the rest stays empty.
+        var floored = new Layout.Node.Leaf(new Layout.Content.Box(0, 0))
+        { Height = Layout.Sizing.Star(1f, 160f, 200f), Width = Layout.Sizing.Star() };
+        var capped = new Layout.Node.Leaf(new Layout.Content.Box(0, 0))
+        { Height = Layout.Sizing.Star(1f, 0f, 30f), Width = Layout.Sizing.Star() };
+        var stack = new Layout.Node.Stack([floored, capped]);
+
+        var arranged = Layout.Engine.Arrange(stack, new Rect<float>(0, 0, 100, 300), new PixelCtx());
+
+        RectOf(arranged, floored).Height.ShouldBe(200f, 0.001);
+        RectOf(arranged, capped).Height.ShouldBe(30f, 0.001);
+    }
+
+    [Fact]
     public void ClampedStar_CrossAxis_MaxCapsTheStretch()
     {
         var child = new Layout.Node.Leaf(new Layout.Content.Box(0, 0))

@@ -1,4 +1,5 @@
 ﻿using System;
+using System;
 using System.Collections.Generic;
 
 namespace DIR.Lib;
@@ -225,8 +226,43 @@ public sealed class InputRouter(WindowUiSettings ui, BackgroundTaskTracker track
         InputEvent.Scroll scroll => HandleScroll(scroll),
         InputEvent.KeyDown key => HandleKeyDown(key),
         InputEvent.TextInput text => HandleTextInput(text),
+        InputEvent.PointerLeft left => HandlePointerLeft(left),
         _ => Unhandled?.Invoke(evt) ?? false,
     };
+
+    /// <summary>
+    /// The pointer left the window: forget it. A drag capture in flight is left alone, because the platform
+    /// keeps delivering moves and the release while a button is held. Otherwise the router's pointer and every
+    /// widget's go, a lit node goes out and a pending or shown tooltip is dropped, with one redraw if any of
+    /// those was showing. The host's own routing (a palette's idle fade) hears it through <see cref="Unhandled"/>.
+    /// </summary>
+    private bool HandlePointerLeft(InputEvent.PointerLeft left)
+    {
+        if (_capture is null)
+        {
+            var changed = _tooltip is not null
+                || (_pointer is { } at && ResolveHoverNode(at.X, at.Y) is not null);
+
+            _pointer = null;
+            var widgets = Widgets();
+            for (var i = 0; i < widgets.Count; i++)
+            {
+                widgets[i].Pointer = null;
+            }
+
+            if (_tooltip is not null)
+            {
+                SetTooltip(null);
+            }
+
+            if (changed)
+            {
+                requestRedraw();
+            }
+        }
+
+        return Unhandled?.Invoke(left) ?? false;
+    }
 
     /// <summary>
     /// Call once the whole frame is painted, before the next event is routed.
@@ -235,7 +271,8 @@ public sealed class InputRouter(WindowUiSettings ui, BackgroundTaskTracker track
     /// Three rules live here because all three need the same fact, and it is a fact only a finished frame
     /// has: what was actually on screen. A focused field that is no longer painted loses the keyboard
     /// (<see cref="TextInputFocus.BlurIfUnpainted"/>); a field that asked for the keyboard as it appeared
-    /// gets it, once; and a tooltip whose region has gone expires. Called before the paint, or with one
+    /// gets it, once; and a tooltip whose region has gone expires. Once per finished frame: a second call with no paint
+    /// between leaves the carried surfaces alone. Called before the paint, or with one
     /// surface's widgets when the frame draws several, each of them does the opposite of what it is for.
     /// </remarks>
     public void AfterPaint()
@@ -257,11 +294,171 @@ public sealed class InputRouter(WindowUiSettings ui, BackgroundTaskTracker track
         ExpireTooltip();
 
         // A popover opened, moved or closed during the paint, so what was painted before it was confined to the
-        // claim it no longer makes (WindowUiSettings.PointerClaim): the next frame carries the new one.
-        if (!ui.PointerClaimSettled)
+        // claim it no longer makes (WindowUiSettings.PointerClaim): the next frame carries the new one. Asked of every
+        // widget's settings, since a toast in a widget of its own is its own settings' surface.
+        // A listed widget that did not paint this cycle is skipped: it is not on screen, and its settings (whose cycle
+        // only turns over when one of its widgets begins) still hold the last surfaces it painted, which would ask for
+        // redraws for ever and keep a row beneath them dark. "Painted" is decided per settings object, by whether any
+        // widget noted a frame on it since the last call, so a wrapper that forwards Ui counts as its inner widget does.
+        _painted.Clear();
+        var anyPainted = false;
+        for (var i = 0; i < widgets.Count; i++)
+        {
+            var count = widgets[i].Ui.FrameBeginCount;
+            var painted = !_seenBegins.TryGetValue(widgets[i].Ui, out var seen) || seen != count;
+            _painted.Add(painted);
+            anyPainted |= painted;
+        }
+
+        for (var i = 0; i < widgets.Count; i++)
+        {
+            _seenBegins[widgets[i].Ui] = widgets[i].Ui.FrameBeginCount;
+        }
+
+        // Forget settings no longer listed, so a host that swaps widgets does not grow this for the router's lifetime,
+        // and a settings object listed again later counts as new (painted) rather than as one that did not paint.
+        _stale.Clear();
+        foreach (var key in _seenBegins.Keys)
+        {
+            var listed = false;
+            for (var i = 0; i < widgets.Count && !listed; i++)
+            {
+                listed = ReferenceEquals(widgets[i].Ui, key);
+            }
+
+            if (!listed)
+            {
+                _stale.Add(key);
+            }
+        }
+
+        foreach (var key in _stale)
+        {
+            _seenBegins.Remove(key);
+        }
+
+        var settled = ui.PointerClaimSettled;
+        for (var i = 0; i < widgets.Count && settled; i++)
+        {
+            settled = !_painted[i] || widgets[i].Ui.PointerClaimSettled;
+        }
+
+        if (!settled | (anyPainted && CarrySurfacesAcrossSettings(widgets)))
         {
             requestRedraw();
         }
+    }
+
+    private readonly List<WindowUiSettings.PaintedSurface> _crossSurfaces = [];
+    private readonly List<bool> _painted = [];
+    private readonly List<WindowUiSettings> _stale = [];
+    private readonly Dictionary<WindowUiSettings, int> _seenBegins = new(ReferenceEqualityComparer.Instance);
+
+    /// <summary>
+    /// Lays the surfaces each widget painted over the widgets painted before it that do NOT share its settings, so the
+    /// painter's hover rule (<see cref="WindowUiSettings.IsCoveredBySurface"/>) holds across them as it does within one
+    /// settings object (<see cref="Layout.Node.IsSurface"/>). Returns whether any widget's carried set changed.
+    /// </summary>
+    /// <remarks>
+    /// The list is the one thing that knows the paint order of every widget in the window, so this is the router's: a host
+    /// that paints its toasts in a widget of its own, with settings of its own, needs to share nothing for a row under a
+    /// toast to stay dark. Each surface reaches the earlier widget's settings with that widget's END as its order (the order
+    /// at which the next widget sharing those settings began), so a widget painted after the surface (a panel over the
+    /// toasts) still lights. A widget that did not paint this cycle (<c>_painted</c>) contributes no surface: it is
+    /// not on screen, and its settings still hold what it last painted. Only the surfaces the later widget itself painted go
+    /// across, read off its own range of its settings' paint order, for the same reason.
+    /// </remarks>
+    private bool CarrySurfacesAcrossSettings(IReadOnlyList<IPixelWidget> widgets)
+    {
+        var changed = false;
+        for (var a = 0; a < widgets.Count; a++)
+        {
+            var settings = widgets[a].Ui;
+            if (FirstWith(widgets, settings) != a)
+            {
+                continue;   // these settings were handled at the first widget that uses them
+            }
+
+            _crossSurfaces.Clear();
+            for (var w = a; w < widgets.Count; w++)
+            {
+                if (!_painted[w] || !ReferenceEquals(widgets[w].Ui, settings))
+                {
+                    continue;
+                }
+
+                var below = PaintRange(widgets, w).End;
+                for (var k = w + 1; k < widgets.Count; k++)
+                {
+                    var other = widgets[k].Ui;
+                    if (!_painted[k] || ReferenceEquals(other, settings))
+                    {
+                        continue;
+                    }
+
+                    var (start, end) = PaintRange(widgets, k);
+                    foreach (var s in other.PaintedSurfaces)
+                    {
+                        if (s.Order >= start && s.Order < end)
+                        {
+                            _crossSurfaces.Add(new WindowUiSettings.PaintedSurface(s.Rect, below));
+                        }
+                    }
+                }
+            }
+
+            changed |= settings.CarrySurfacesFromOtherSettings(_crossSurfaces);
+        }
+
+        return changed;
+
+        static int FirstWith(IReadOnlyList<IPixelWidget> widgets, WindowUiSettings settings)
+        {
+            for (var i = 0; i < widgets.Count; i++)
+            {
+                if (ReferenceEquals(widgets[i].Ui, settings))
+                {
+                    return i;
+                }
+            }
+
+            return -1;
+        }
+    }
+
+    /// <summary>
+    /// The paint orders of its settings that widget <paramref name="w"/> painted this cycle: from where it began to where
+    /// the next widget of the list sharing its settings began, or to the end. A widget whose start is not known (one that
+    /// noted its frame under another object, so it has no order of its own) is taken to start at 0 when nothing before
+    /// it shares its settings, and to have painted nothing otherwise.
+    /// </summary>
+    private static (int Start, int End) PaintRange(IReadOnlyList<IPixelWidget> widgets, int w)
+    {
+        var settings = widgets[w].Ui;
+        var end = int.MaxValue;
+        for (var j = w + 1; j < widgets.Count; j++)
+        {
+            if (ReferenceEquals(widgets[j].Ui, settings) && settings.FrameStartOrder(widgets[j]) is { } next)
+            {
+                end = next;
+                break;
+            }
+        }
+
+        if (settings.FrameStartOrder(widgets[w]) is { } start)
+        {
+            return (start, end);
+        }
+
+        for (var j = 0; j < w; j++)
+        {
+            if (ReferenceEquals(widgets[j].Ui, settings))
+            {
+                return (0, 0);
+            }
+        }
+
+        return (0, end);
     }
 
     /// <summary>
@@ -293,6 +490,22 @@ public sealed class InputRouter(WindowUiSettings ui, BackgroundTaskTracker track
 
         for (var i = widgets.Count - 1; i >= 0; i--)
         {
+            // Under a surface, only what was registered from the surface up has a say, and the surface's silence is
+            // the host's default rather than the cursor of a row beneath it (Layout.Node.IsSurface). Read off the
+            // regions, so a composite whose surface is one child's and whose row is another's agrees.
+            if (SurfaceIndexAt(widgets, i, x, y) is var top and >= 0)
+            {
+                for (var j = _regions.Count - 1; j >= top; j--)
+                {
+                    if (_regions[j].Cursor is { } stated && Contains(_regions[j], x, y))
+                    {
+                        return stated;
+                    }
+                }
+
+                return null;
+            }
+
             if (widgets[i].HitTestCursor(x, y) is { } cursor)
             {
                 return cursor;
@@ -319,6 +532,101 @@ public sealed class InputRouter(WindowUiSettings ui, BackgroundTaskTracker track
     private static bool IsSideButton(MouseButton button)
         => button is MouseButton.Back or MouseButton.Forward;
 
+    // ---- declared modal ---------------------------------------------------------------------
+
+    // THE modal rule, in one place. While a Node.Overlay declared Modal is painted (ui.PaintedModal), what the
+    // router can see is only what its Top painted: the widgets painted BEFORE the modal's widget contribute
+    // nothing, and the modal's own widget contributes only what it registered after Top began (the claim's
+    // RegionStart / NodeStart). Every region, node, shortcut, declared list, scroll target and drag the router
+    // reaches comes through CollectRegions / CollectNodes, so none of them can see Base, and a press outside
+    // Top's card (DispatchModalOutside) is consumed and runs the declared dismiss. A widget painted AFTER the
+    // modal is above it and unaffected. The claim is matched by reference in Widgets(); a claim whose widget is
+    // not in that list is ignored rather than blanking the window. A composite whose children paint onto their
+    // own trackers is a single widget here, so its claim counts are those of the widget that painted Top.
+    private int ModalIndex(IReadOnlyList<IPixelWidget> widgets)
+    {
+        if (ui.PaintedModal is not { } modal) return -1;
+        for (var i = widgets.Count - 1; i >= 0; i--)
+        {
+            if (ReferenceEquals(widgets[i], modal.Widget)) return i;
+        }
+
+        return -1;
+    }
+
+    private bool ModalActive(IReadOnlyList<IPixelWidget> widgets) => ModalIndex(widgets) >= 0;
+
+    private void CollectRegions(IReadOnlyList<IPixelWidget> widgets, int w, List<ClickableRegion> into)
+    {
+        var modal = ModalIndex(widgets);
+        if (modal < 0)
+        {
+            widgets[w].CollectPaintedRegions(into);
+            return;
+        }
+
+        if (w < modal) return;
+        var before = into.Count;
+        widgets[w].CollectPaintedRegions(into);
+        if (w == modal)
+        {
+            into.RemoveRange(before, Math.Min(ui.PaintedModal!.RegionStart, into.Count - before));
+        }
+    }
+
+    private void CollectNodes(IReadOnlyList<IPixelWidget> widgets, int w, List<Layout.ArrangedNode<float>> into)
+    {
+        var modal = ModalIndex(widgets);
+        if (modal < 0)
+        {
+            widgets[w].CollectPaintedNodes(into);
+            return;
+        }
+
+        if (w < modal) return;
+        var before = into.Count;
+        widgets[w].CollectPaintedNodes(into);
+        if (w == modal)
+        {
+            into.RemoveRange(before, Math.Min(ui.PaintedModal!.NodeStart, into.Count - before));
+        }
+    }
+
+    /// <summary>Whether a point is inside the painted modal's card.</summary>
+    private bool WithinModalCard(float x, float y)
+    {
+        var card = ui.PaintedModal!.Card;
+        return x >= card.X && x < card.X + card.Width && y >= card.Y && y < card.Y + card.Height;
+    }
+
+    /// <summary>
+    /// Records (or clears) the held press on the router's settings and on every listed widget's own settings, as the
+    /// pointer is pushed to each: a widget with unshared <see cref="WindowUiSettings"/> paints its pressed fill too.
+    /// </summary>
+    private void SetPressOrigin(IReadOnlyList<IPixelWidget> widgets, (float X, float Y)? origin)
+    {
+        ui.PressOrigin = origin;
+        for (var i = 0; i < widgets.Count; i++)
+        {
+            widgets[i].Ui.PressOrigin = origin;
+        }
+    }
+
+    /// <summary>A press nothing in Top took, while a modal is painted: consumed, and outside the card it closes the modal.</summary>
+    private bool ConsumeModalPress(IReadOnlyList<IPixelWidget> widgets, float x, float y)
+    {
+        if (ModalIndex(widgets) < 0) return false;
+        var modal = ui.PaintedModal!;
+        if (!WithinModalCard(x, y))
+        {
+            modal.Dismiss?.Invoke();
+        }
+
+        BlurFocusedField();
+        requestRedraw();
+        return true;
+    }
+
     private bool HandleMouseDown(InputEvent.MouseDown down)
     {
         _pointer = (down.X, down.Y);
@@ -332,8 +640,15 @@ public sealed class InputRouter(WindowUiSettings ui, BackgroundTaskTracker track
 
         var press = new PointerPress(down.X, down.Y, down.Button, down.Modifiers, down.ClickCount);
         var widgets = Widgets();
+        NoteListPress(widgets, down.X, down.Y);
 
-        if (SelectionPress(widgets, down, press))
+        // A new left press replaces whatever press was recorded (a release the window never saw).
+        if (down.Button == MouseButton.Left)
+        {
+            SetPressOrigin(widgets, null);
+        }
+
+        if (!ModalActive(widgets) && SelectionPress(widgets, down, press))
         {
             return true;
         }
@@ -342,7 +657,7 @@ public sealed class InputRouter(WindowUiSettings ui, BackgroundTaskTracker track
         {
             var widget = widgets[w];
             _regions.Clear();
-            widget.CollectPaintedRegions(_regions);
+            CollectRegions(widgets, w, _regions);
 
             for (var i = _regions.Count - 1; i >= 0; i--)
             {
@@ -362,11 +677,25 @@ public sealed class InputRouter(WindowUiSettings ui, BackgroundTaskTracker track
 
                 // A right press over a part with no menu of its own (a twirl caret, a cell button) belongs to
                 // the row's menu beneath it: the reader right-clicked the row. See Node.OnContextMenu.
+                // Not from a surface itself: nothing beneath one hears the press (Layout.Node.IsSurface).
                 if (down.Button == MouseButton.Right && region.OnContextMenu is null && region.Dismisses is null
-                    && ContextMenuBeneath(i, down.X, down.Y) is { } owning)
+                    && !region.IsSurface && ContextMenuBeneath(i, down.X, down.Y) is { } owning)
                 {
                     region = owning;
                 }
+
+                // Record the held press for Node.PressedBackground. Not when a surface or a popover backdrop took
+                // it, and under a declared modal only inside its card: a press such a layer took lights nothing beneath.
+                if (down.Button == MouseButton.Left && !region.IsSurface && region.Dismisses is null
+                    && (!ModalActive(widgets) || WithinModalCard(down.X, down.Y)))
+                {
+                    SetPressOrigin(widgets, (down.X, down.Y));
+                    requestRedraw();
+                }
+
+                // A container that declared OnPressWithin (a floating window) hears the press first, then the topmost
+                // region acts as ever.
+                var preActed = NotePressWithin(i, press);
 
                 bool acted;
                 var hadKeyboard = ui.Focus.Current;
@@ -407,13 +736,18 @@ public sealed class InputRouter(WindowUiSettings ui, BackgroundTaskTracker track
                     acted |= BlurFocusedField();
                 }
 
-                if (acted)
+                if (acted || preActed)
                 {
                     requestRedraw();
                 }
 
                 return true;
             }
+        }
+
+        if (ConsumeModalPress(widgets, down.X, down.Y))
+        {
+            return true;
         }
 
         // Nothing under the pointer. The press is still a press somewhere other than a field.
@@ -423,6 +757,31 @@ public sealed class InputRouter(WindowUiSettings ui, BackgroundTaskTracker track
         }
 
         return Unhandled?.Invoke(down) ?? false;
+    }
+
+    /// <summary>
+    /// Runs <see cref="ClickableRegion.OnPressWithin"/> of the topmost region at or below <paramref name="top"/> in
+    /// the widget whose regions are in <c>_regions</c> that contains the press, for a left press. A popover backdrop
+    /// ends the search. Returns whether one ran.
+    /// </summary>
+    private bool NotePressWithin(int top, in PointerPress press)
+    {
+        if (press.Button != MouseButton.Left) return false;
+        for (var j = top; j >= 0; j--)
+        {
+            var r = _regions[j];
+            if (!Contains(r, press.X, press.Y)) continue;
+            if (r.Dismisses is not null) return false;
+            if (r.OnPressWithin is { } within)
+            {
+                within(press);
+                return true;
+            }
+
+            // A window beneath a toast is not raised by a press on the toast (Layout.Node.IsSurface).
+            if (r.IsSurface) return false;
+        }
+        return false;
     }
 
     /// <summary>
@@ -447,7 +806,7 @@ public sealed class InputRouter(WindowUiSettings ui, BackgroundTaskTracker track
         for (var v = w - 1; v >= 0; v--)
         {
             _beneath.Clear();
-            widgets[v].CollectPaintedRegions(_beneath);
+            CollectRegions(widgets, v, _beneath);
             for (var i = _beneath.Count - 1; i >= 0; i--)
             {
                 if (Contains(_beneath[i], x, y))
@@ -477,6 +836,7 @@ public sealed class InputRouter(WindowUiSettings ui, BackgroundTaskTracker track
             if (!Contains(r, x, y)) continue;
             if (r.Dismisses is not null) return null;
             if (r.OnContextMenu is not null) return r;
+            if (r.IsSurface) return null;    // nothing beneath a surface hears the press
         }
         return null;
     }
@@ -656,6 +1016,13 @@ public sealed class InputRouter(WindowUiSettings ui, BackgroundTaskTracker track
     {
         _pointer = (up.X, up.Y);
 
+        // The held press ends with the release, whatever else the release does; the pressed fill goes with it.
+        if (up.Button == MouseButton.Left && ui.PressOrigin is not null)
+        {
+            SetPressOrigin(Widgets(), null);
+            requestRedraw();
+        }
+
         // The release of a side button belongs to the app, like its press, and is not the end of a drag
         // another button began: a gesture only ends when its own button comes up.
         if (IsSideButton(up.Button))
@@ -702,7 +1069,7 @@ public sealed class InputRouter(WindowUiSettings ui, BackgroundTaskTracker track
         for (var w = widgets.Count - 1; w >= 0; w--)
         {
             _regions.Clear();
-            widgets[w].CollectPaintedRegions(_regions);
+            CollectRegions(widgets, w, _regions);
             var any = false;
             for (var i = _regions.Count - 1; i >= 0; i--)
             {
@@ -772,7 +1139,7 @@ public sealed class InputRouter(WindowUiSettings ui, BackgroundTaskTracker track
         for (var w = widgets.Count - 1; w >= 0; w--)
         {
             _regions.Clear();
-            widgets[w].CollectPaintedRegions(_regions);
+            CollectRegions(widgets, w, _regions);
             for (var i = _regions.Count - 1; i >= 0; i--)
             {
                 var r = _regions[i];
@@ -780,9 +1147,10 @@ public sealed class InputRouter(WindowUiSettings ui, BackgroundTaskTracker track
                 {
                     // Not IsInertChrome: this asks whether the press is the text selection's, so a disabled region (its handlers
                     // stripped) and one with only a click or a menu still let the selection take it, and a field that focuses on open does not.
+                    // Nor a surface: a press on a toast's body is the toast's, never the start of a selection in the text beneath it.
                     return r is { Result: HitResult.ChromeHit }
                         and not ({ OnPress: not null } or { OnActivate: not null } or { OnDoubleClick: not null } or { Opens: not null }
-                            or { Dismisses: not null } or { FocusOnOpen: true });
+                            or { Dismisses: not null } or { FocusOnOpen: true } or { IsSurface: true });
                 }
             }
         }
@@ -792,8 +1160,9 @@ public sealed class InputRouter(WindowUiSettings ui, BackgroundTaskTracker track
 
     // Plain chrome: a region that only shows a tooltip or a cursor, with nothing to do on a press and not disabled. The one rule for
     // looking past chrome to the region beneath, at a press (FirstBeneath) and at a click under a selection (ClickableBeneath).
+    // A surface is never plain chrome: the look past it ends there, so the press is the surface's (Layout.Node.IsSurface).
     private static bool IsInertChrome(in ClickableRegion r) =>
-        r is { Result: HitResult.ChromeHit, IsDisabled: false, OnClick: null, OnPress: null, OnActivate: null, OnDoubleClick: null, Opens: null, Dismisses: null, OnContextMenu: null };
+        r is { Result: HitResult.ChromeHit, IsDisabled: false, IsSurface: false, OnClick: null, OnPress: null, OnActivate: null, OnDoubleClick: null, Opens: null, Dismisses: null, OnContextMenu: null };
 
     // In the widget whose regions are in _regions, the first region under the point below index above that is not plain chrome; null
     // when there is none, and the press stays with the chrome (and does nothing), as it did.
@@ -811,17 +1180,28 @@ public sealed class InputRouter(WindowUiSettings ui, BackgroundTaskTracker track
         return null;
     }
 
+    // Top-most first, so a menu beneath a surface does not count: nothing painted before a surface hears the right press.
     private bool AnyRegionOffersMenu(IReadOnlyList<IPixelWidget> widgets, float x, float y)
     {
-        for (var w = 0; w < widgets.Count; w++)
+        for (var w = widgets.Count - 1; w >= 0; w--)
         {
             _regions.Clear();
-            widgets[w].CollectPaintedRegions(_regions);
-            for (var i = 0; i < _regions.Count; i++)
+            CollectRegions(widgets, w, _regions);
+            for (var i = _regions.Count - 1; i >= 0; i--)
             {
-                if (_regions[i].OnContextMenu is not null && Contains(_regions[i], x, y))
+                if (!Contains(_regions[i], x, y))
+                {
+                    continue;
+                }
+
+                if (_regions[i].OnContextMenu is not null)
                 {
                     return true;
+                }
+
+                if (_regions[i].IsSurface)
+                {
+                    return false;
                 }
             }
         }
@@ -916,23 +1296,63 @@ public sealed class InputRouter(WindowUiSettings ui, BackgroundTaskTracker track
         return took;
     }
 
+    private bool ScrollTargetIsTops(IReadOnlyList<IPixelWidget> widgets, int w, ListScrollController controller)
+    {
+        _regions.Clear();
+        CollectRegions(widgets, w, _regions);
+        foreach (var r in _regions)
+        {
+            if (ReferenceEquals(r.Scroll, controller)) return true;
+        }
+
+        return false;
+    }
+
+    // The innermost scroll target among the regions in _regions from index `from` up, under the point.
+    private ListScrollController? ScrollTargetAbove(int from, float x, float y)
+    {
+        for (var j = _regions.Count - 1; j >= from; j--)
+        {
+            if (_regions[j].Scroll is { } scroll && Contains(_regions[j], x, y))
+            {
+                return scroll;
+            }
+        }
+
+        return null;
+    }
+
     private bool HandleScroll(InputEvent.Scroll scroll)
     {
         var widgets = Widgets();
+        var modalAt = ModalIndex(widgets);
         for (var i = widgets.Count - 1; i >= 0; i--)
         {
             // The innermost scrollable under the pointer, which is the one that declared itself last.
             // A controller that declines (nothing to scroll, or the wheel landed outside its viewport)
             // leaves the wheel to whatever is behind it rather than swallowing it, which is what makes a
             // list inside a pane scroll the pane once the list is at its end.
-            if (widgets[i].ScrollTargetAt(scroll.X, scroll.Y) is { } controller && controller.HandleInput(scroll))
+            if (i < modalAt) break;
+
+            // Under a surface, only a list registered from the surface up may take the wheel, and nothing beneath it
+            // does, the host's own routing included (Layout.Node.IsSurface).
+            var top = SurfaceIndexAt(widgets, i, scroll.X, scroll.Y);
+            var target = top >= 0 ? ScrollTargetAbove(top, scroll.X, scroll.Y) : widgets[i].ScrollTargetAt(scroll.X, scroll.Y);
+            if (target is { } controller
+                && (i != modalAt || ScrollTargetIsTops(widgets, i, controller))
+                && controller.HandleInput(scroll))
             {
                 requestRedraw();
                 return true;
             }
+
+            if (top >= 0)
+            {
+                return true;
+            }
         }
 
-        return Unhandled?.Invoke(scroll) ?? false;
+        return modalAt >= 0 || (Unhandled?.Invoke(scroll) ?? false);
     }
 
     // ---- keyboard ---------------------------------------------------------------------------
@@ -953,8 +1373,17 @@ public sealed class InputRouter(WindowUiSettings ui, BackgroundTaskTracker track
             }
         }
 
+        // A painted modal owns the keyboard next: Escape closes it when it declared how.
+        var modalPainted = ModalActive(Widgets());
+        if (modalPainted && key is { Key: InputKey.Escape } && ui.PaintedModal!.Dismiss is { } dismissModal)
+        {
+            dismissModal();
+            requestRedraw();
+            return true;
+        }
+
         // Ctrl+C copies selected text, unless a field has the keyboard (then it is the field's).
-        if (key is { Key: InputKey.C, Modifiers: InputModifier.Ctrl } && ui.Focus.Current is null && SetClipboardText is { } copy)
+        if (key is { Key: InputKey.C, Modifiers: InputModifier.Ctrl } && ui.Focus.Current is null && !modalPainted && SetClipboardText is { } copy)
         {
             var hosts = Widgets();
             for (var i = hosts.Count - 1; i >= 0; i--)
@@ -985,7 +1414,231 @@ public sealed class InputRouter(WindowUiSettings ui, BackgroundTaskTracker track
             return true;
         }
 
-        return Unhandled?.Invoke(key) ?? false;
+        if (key.Key is InputKey.Up or InputKey.Down or InputKey.Left or InputKey.Right or InputKey.Enter && HandleDeclaredListKey(key))
+        {
+            requestRedraw();
+            return true;
+        }
+
+        // Under a modal a key nothing in Top took is still Top's: it does not fall to the host's handler, which
+        // is where the page beneath listens.
+        return modalPainted || (Unhandled?.Invoke(key) ?? false);
+    }
+
+    // ---- declared lists ---------------------------------------------------------------------
+
+    // The list id of the pointer's last press: on one of a declared list's rows, or inside its container's
+    // arranged rect. A press anywhere else clears it. Read by DeclaredList.Active.
+    private string? _pressedListId;
+    private readonly List<DeclaredList> _declaredLists = [];
+    private readonly List<RectF32> _declaredBounds = [];
+    private readonly List<int> _declaredOrders = [];
+    private readonly List<(int Order, RectF32 Bounds)> _surfaceNodes = [];
+    private readonly List<ClickableRegion> _listRegions = [];
+    private readonly List<ListCursor.PaintedRow> _listClipped = [];
+    private readonly List<ListCursor.PaintedRow> _listScratch = [];
+
+    /// <summary>Fills the declared lists of the PAINTED nodes (paint order) and their arranged rects.</summary>
+    private void CollectDeclaredLists(IReadOnlyList<IPixelWidget> widgets)
+    {
+        _declaredLists.Clear();
+        _declaredBounds.Clear();
+        _declaredOrders.Clear();
+        _surfaceNodes.Clear();
+        var order = 0;
+        for (var w = 0; w < widgets.Count; w++)
+        {
+            _nodes.Clear();
+            CollectNodes(widgets, w, _nodes);
+            foreach (var arranged in _nodes)
+            {
+                var bounds = new RectF32(arranged.Bounds.X, arranged.Bounds.Y, arranged.Bounds.Width, arranged.Bounds.Height);
+                if (arranged.Node.DeclaredList is { } list)
+                {
+                    _declaredLists.Add(list);
+                    _declaredBounds.Add(bounds);
+                    _declaredOrders.Add(order);
+                }
+
+                if (arranged.Node.IsSurface)
+                {
+                    _surfaceNodes.Add((order, bounds));
+                }
+
+                order++;
+            }
+        }
+    }
+
+    // The paint order (in CollectDeclaredLists' walk) of the topmost surface node over the point, or -1: a declared list
+    // painted before it lies under it and is not chosen by a press there.
+    private int TopSurfaceOrderAt(float x, float y)
+    {
+        for (var i = _surfaceNodes.Count - 1; i >= 0; i--)
+        {
+            var b = _surfaceNodes[i].Bounds;
+            if (x >= b.X && x < b.X + b.Width && y >= b.Y && y < b.Y + b.Height) return _surfaceNodes[i].Order;
+        }
+
+        return -1;
+    }
+
+    private int InnermostDeclaredAt(float x, float y)
+    {
+        for (var i = _declaredBounds.Count - 1; i >= 0; i--)
+        {
+            var b = _declaredBounds[i];
+            if (x >= b.X && x < b.X + b.Width && y >= b.Y && y < b.Y + b.Height) return i;
+        }
+
+        return -1;
+    }
+
+    private void NoteListPress(IReadOnlyList<IPixelWidget> widgets, float x, float y)
+    {
+        CollectDeclaredLists(widgets);
+        if (_declaredLists.Count == 0) { _pressedListId = null; return; }
+
+        // A press inside a popover's claimed content belongs to the popover: it must not choose the list
+        // underneath it, or a menu click would switch the keyboard to whichever list the menu covers. Only a
+        // list the popover itself declares (its container lies inside the claim) can be chosen by that press.
+        var claimed = WithinPointerOwner(x, y);
+        var previous = _pressedListId;
+        _pressedListId = null;
+
+        // A press on one of a declared list's rows: the cursor follows the click into that list. A surface ends the
+        // walk: a press on a toast does not choose the list beneath it (Layout.Node.IsSurface).
+        var covered = false;
+        for (var w = widgets.Count - 1; w >= 0 && _pressedListId is null && !covered; w--)
+        {
+            _listRegions.Clear();
+            CollectRegions(widgets, w, _listRegions);
+            for (var i = _listRegions.Count - 1; i >= 0; i--)
+            {
+                var region = _listRegions[i];
+                if (!Contains(region, x, y)) continue;
+                if (region.Result is HitResult.ListItemHit item)
+                {
+                    foreach (var list in _declaredLists)
+                    {
+                        if (!string.Equals(list.ListId, item.ListId, StringComparison.Ordinal)) continue;
+                        if (claimed && !DeclaredInsideOwner(list)) break;
+                        _pressedListId = list.ListId;
+                        if (!string.Equals(list.Cursor.ListId, list.ListId, StringComparison.Ordinal))
+                        {
+                            list.Cursor.Open(list.ListId, item.Index);
+                        }
+
+                        break;
+                    }
+                }
+
+                covered = region.IsSurface;
+                break; // only the topmost region under the point
+            }
+        }
+
+        if (_pressedListId is null && InnermostDeclaredAt(x, y) is var at and >= 0
+            && (!claimed || DeclaredInsideOwner(_declaredLists[at]))
+            && _declaredOrders[at] > TopSurfaceOrderAt(x, y))
+        {
+            _pressedListId = _declaredLists[at].ListId;
+        }
+
+        if (claimed && _pressedListId is null)
+        {
+            _pressedListId = previous;
+        }
+    }
+
+    // Whether a declared list's container lies wholly inside the popover's claimed content.
+    private bool DeclaredInsideOwner(DeclaredList list)
+    {
+        if (ui.PointerOwner is not { } owner) return false;
+        var i = _declaredLists.IndexOf(list);
+        if (i < 0) return false;
+        var b = _declaredBounds[i];
+        return b.X >= owner.X && b.Y >= owner.Y && b.X + b.Width <= owner.X + owner.Width && b.Y + b.Height <= owner.Y + owner.Height;
+    }
+
+    /// <summary>The list holding the focused field: the innermost declared container around it.</summary>
+    private string? FocusedListId(IReadOnlyList<IPixelWidget> widgets)
+    {
+        if (ui.Focus.Current is not { } field) return null;
+        for (var w = widgets.Count - 1; w >= 0; w--)
+        {
+            _listRegions.Clear();
+            CollectRegions(widgets, w, _listRegions);
+            foreach (var region in _listRegions)
+            {
+                if (region.Result is HitResult.TextInputHit hit && ReferenceEquals(hit.Input, field)
+                    && InnermostDeclaredAt(region.X + region.Width / 2f, region.Y + region.Height / 2f) is var at and >= 0)
+                {
+                    return _declaredLists[at].ListId;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Up/Down step and Enter activates the cursor of the ACTIVE declared list (<see cref="DeclaredList.Active"/>),
+    /// over the regions every widget painted. False when no list is active or nothing was moved or acted on,
+    /// so the key still reaches <see cref="Unhandled"/>.
+    /// </summary>
+    private bool HandleDeclaredListKey(InputEvent.KeyDown key)
+    {
+        var widgets = Widgets();
+        CollectDeclaredLists(widgets);
+        if (_declaredLists.Count == 0) return false;
+        if (DeclaredList.Active(_declaredLists, FocusedListId(widgets), _pressedListId) is not { } active) return false;
+
+        // Up/Down belong to a vertical list and Left/Right to a horizontal one; the other pair is not this list's key.
+        if (key.Key is InputKey.Left or InputKey.Right && !active.Horizontal) return false;
+        if (key.Key is InputKey.Up or InputKey.Down && active.Horizontal) return false;
+
+        var cursor = active.Cursor;
+        if (!string.Equals(cursor.ListId, active.ListId, StringComparison.Ordinal))
+        {
+            cursor.Open(active.ListId);
+        }
+
+        _listRegions.Clear();
+        _listClipped.Clear();
+        for (var w = 0; w < widgets.Count; w++)
+        {
+            var widget = widgets[w];
+            CollectRegions(widgets, w, _listRegions);
+            widget.CollectClippedListRows(active.ListId, _listClipped);
+        }
+
+        void Reveal()
+        {
+            foreach (var widget in widgets) widget.RevealListRow(cursor);
+        }
+
+        var regions = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(_listRegions);
+        switch (key.Key)
+        {
+            case InputKey.Up or InputKey.Down or InputKey.Left or InputKey.Right:
+                var delta = key.Key is InputKey.Up or InputKey.Left ? -1 : 1;
+                if (!ListKeys.Move(cursor, delta, regions, _listClipped, _listScratch))
+                {
+                    // No row in the frame can take the cursor that way. A scrolled list lays out only the rows near its
+                    // viewport, so that is the end of the list only when no surface can scroll it further towards the
+                    // key (IPixelWidget.RevealListEdge); when one did, the key is taken and the next press continues.
+                    var scrolled = false;
+                    foreach (var widget in widgets) scrolled |= widget.RevealListEdge(cursor, delta);
+                    return scrolled;
+                }
+
+                Reveal();
+                if (active.SelectOnStep) ListKeys.Activate(cursor, key.Modifiers, regions, _listClipped, _listScratch);
+                return true;
+            default:
+                return ListKeys.Activate(cursor, key.Modifiers, regions, _listClipped, _listScratch, Reveal);
+        }
     }
 
     private bool HandleTextInput(InputEvent.TextInput text)
@@ -1031,7 +1684,7 @@ public sealed class InputRouter(WindowUiSettings ui, BackgroundTaskTracker track
         for (var w = widgets.Count - 1; w >= 0; w--)
         {
             _nodes.Clear();
-            widgets[w].CollectPaintedNodes(_nodes);
+            CollectNodes(widgets, w, _nodes);
 
             for (var i = _nodes.Count - 1; i >= 0; i--)
             {
@@ -1130,7 +1783,7 @@ public sealed class InputRouter(WindowUiSettings ui, BackgroundTaskTracker track
         for (var w = 0; w < widgets.Count; w++)
         {
             _regions.Clear();
-            widgets[w].CollectPaintedRegions(_regions);
+            CollectRegions(widgets, w, _regions);
 
             for (var i = 0; i < _regions.Count; i++)
             {
@@ -1242,16 +1895,25 @@ public sealed class InputRouter(WindowUiSettings ui, BackgroundTaskTracker track
         for (var w = widgets.Count - 1; w >= 0; w--)
         {
             _nodes.Clear();
-            widgets[w].CollectPaintedNodes(_nodes);
+            CollectNodes(widgets, w, _nodes);
 
             for (var i = _nodes.Count - 1; i >= 0; i--)
             {
                 var (node, bounds) = _nodes[i];
-                if (node.HoverBackground is not null
-                    && x >= bounds.X && x < bounds.X + bounds.Width
-                    && y >= bounds.Y && y < bounds.Y + bounds.Height)
+                if (!(x >= bounds.X && x < bounds.X + bounds.Width && y >= bounds.Y && y < bounds.Y + bounds.Height))
+                {
+                    continue;
+                }
+
+                if (node.HoverBackground is not null || node.PressedBackground is not null)
                 {
                     return node;
+                }
+
+                // Nothing painted before a surface lights under it, the painter's rule (Layout.Node.IsSurface).
+                if (node.IsSurface)
+                {
+                    return null;
                 }
             }
         }
@@ -1262,7 +1924,7 @@ public sealed class InputRouter(WindowUiSettings ui, BackgroundTaskTracker track
     /// <summary>
     /// The topmost region under the point that states a tooltip. Regions with nothing to say are
     /// transparent to this, the same rule the cursor lookup follows, so a row inside a card with a tooltip
-    /// shows the card's.
+    /// shows the card's. A surface is not (<see cref="ClickableRegion.IsSurface"/>): the walk ends there.
     /// </summary>
     private TooltipRequest? ResolveTooltip(float x, float y)
     {
@@ -1278,17 +1940,28 @@ public sealed class InputRouter(WindowUiSettings ui, BackgroundTaskTracker track
         for (var w = widgets.Count - 1; w >= 0; w--)
         {
             _regions.Clear();
-            widgets[w].CollectPaintedRegions(_regions);
+            CollectRegions(widgets, w, _regions);
 
             for (var i = _regions.Count - 1; i >= 0; i--)
             {
                 var region = _regions[i];
-                if (region.Tooltip is { } text && Contains(region, x, y))
+                if (!Contains(region, x, y))
+                {
+                    continue;
+                }
+
+                if (region.Tooltip is { } text)
                 {
                     return new TooltipRequest(text, new RectF32(region.X, region.Y, region.Width, region.Height))
                     {
                         Side = region.TooltipSide ?? Layout.DockSide.Bottom,
                     };
+                }
+
+                // A surface with nothing to say is not transparent: a toast's body shows no tooltip of the row beneath.
+                if (region.IsSurface)
+                {
+                    return null;
                 }
             }
         }
@@ -1307,6 +1980,26 @@ public sealed class InputRouter(WindowUiSettings ui, BackgroundTaskTracker track
 
         ui.Focus.Blur();
         return true;
+    }
+
+    /// <summary>
+    /// Fills <c>_regions</c> with widget <paramref name="w"/>'s regions and returns the index of the topmost SURFACE
+    /// region over the point (<see cref="ClickableRegion.IsSurface"/>), or -1 when none is. What lies below that index,
+    /// and in every widget painted before this one, does not get the pointer there.
+    /// </summary>
+    private int SurfaceIndexAt(IReadOnlyList<IPixelWidget> widgets, int w, float x, float y)
+    {
+        _regions.Clear();
+        CollectRegions(widgets, w, _regions);
+        for (var j = _regions.Count - 1; j >= 0; j--)
+        {
+            if (_regions[j].IsSurface && Contains(_regions[j], x, y))
+            {
+                return j;
+            }
+        }
+
+        return -1;
     }
 
     /// <summary>Top and left inclusive, bottom and right exclusive, so two regions sharing an edge never

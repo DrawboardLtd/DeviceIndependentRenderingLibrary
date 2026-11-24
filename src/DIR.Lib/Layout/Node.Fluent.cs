@@ -77,16 +77,108 @@ public abstract partial record Node
     /// motion; without one this is inert.</summary>
     public Node BgHover(RGBAColor32 color) => this with { HoverBackground = color };
 
+    /// <summary>
+    /// Paints <paramref name="color"/> instead of the hover, focus and ordinary background while the primary button is
+    /// held down on this node. See <see cref="Node.PressedBackground"/>.
+    /// </summary>
+    public Node BgPressed(RGBAColor32 color) => this with { PressedBackground = color };
+
+    /// <summary>
+    /// Underlines the text of this leaf, in its own colour, while the pointer is within the nearest node with a hit
+    /// that holds it (a link's hover).
+    /// A no-op on a node that is not a text leaf. See <see cref="Content.Text.UnderlineOnHover"/>.
+    /// </summary>
+    public Node UnderlineOnHover() => this is Leaf { Content: Content.Text t } leaf
+        ? leaf with { Content = t with { UnderlineOnHover = true } }
+        : this;
+
     /// <summary>Paint <paramref name="color"/> instead of <see cref="Node.Bg"/> while the keyboard
     /// cursor is on this node. See <see cref="Node.FocusBackground"/> — it resolves against this node's
     /// <see cref="Node.Hit"/>, so a row needs no state of its own to be navigable.</summary>
     public Node BgFocus(RGBAColor32 color) => this with { FocusBackground = color };
+
+    /// <summary>Declares this node the container of the list <paramref name="listId"/>, whose rows
+    /// (<c>ListItemHit(listId, i)</c>) <paramref name="cursor"/> owns. <see cref="InputRouter"/> then steps
+    /// the cursor on Up/Down and activates its row on Enter, for any widget that painted this node.</summary>
+    public Node ListOf(ListCursor cursor, string listId)
+        => this with { DeclaredList = new DIR.Lib.DeclaredList(cursor, listId) };
+
+    /// <summary><see cref="ListOf(ListCursor, string)"/> for a list along the row (<see cref="DIR.Lib.DeclaredList.Horizontal"/>:
+    /// Left/Right step it) that, with <paramref name="selectOnStep"/>, also acts on the row each step lands on.</summary>
+    public Node ListOf(ListCursor cursor, string listId, bool horizontal, bool selectOnStep = false)
+        => this with { DeclaredList = new DIR.Lib.DeclaredList(cursor, listId) { Horizontal = horizontal, SelectOnStep = selectOnStep } };
 
     /// <summary>Round the corners of this node's <see cref="Bg"/> (and a <see cref="Content.Box"/> leaf's
     /// own fill) by <paramref name="designUnits"/>. Chrome only -- arrange is unchanged, so a rounded node
     /// occupies exactly the rect a square one would. See <see cref="CornerRadius"/> for how each surface
     /// approximates it.</summary>
     public Node Radius(float designUnits) => this with { CornerRadius = designUnits };
+
+    /// <summary>A drop shadow under this node: offset, blur and colour in design units. Chrome only (takes no space);
+    /// a cell surface draws none. See <see cref="Node.ShadowStyle"/>.</summary>
+    public Node Shadow(float offsetX, float offsetY, float blur, RGBAColor32 color)
+        => this with { ShadowStyle = new ShadowStyle { OffsetX = offsetX, OffsetY = offsetY, Blur = blur, Color = color } };
+
+    /// <summary>Declares <paramref name="style"/> as this node's shadow (null clears it).</summary>
+    public Node Shadow(ShadowStyle? style) => this with { ShadowStyle = style };
+
+    // A method cannot share the property's name (Node.FocusRing), so the setters are WithFocusRing.
+    /// <summary>Declares a focus ring of <paramref name="color"/> and <paramref name="width"/> design units outside this node's
+    /// edge while the list cursor is on its hit. Chrome only. See <see cref="Node.FocusRing"/>.</summary>
+    public Node WithFocusRing(RGBAColor32 color, float width = 2f, float offset = 0f)
+        => this with { FocusRing = new FocusRingStyle { Color = color, Width = width, Offset = offset } };
+
+    /// <summary>Declares <paramref name="style"/> as this node's focus ring (null clears it).</summary>
+    public Node WithFocusRing(FocusRingStyle? style) => this with { FocusRing = style };
+
+    /// <summary>A shadow from a fixed elevation table, black, in design units (offsetY, blur, alpha):
+    /// 1 = (1, 2, 30%), 2 = (2, 4, 35%), 3 = (4, 8, 40%), 4 = (8, 16, 45%). 0 or less clears the shadow;
+    /// above 4 is 4. Never moves sideways.</summary>
+    public Node Elevated(int level)
+    {
+        if (level <= 0)
+        {
+            return this with { ShadowStyle = null };
+        }
+
+        var (dy, blur, alpha) = Math.Min(level, 4) switch
+        {
+            1 => (1f, 2f, 77),
+            2 => (2f, 4f, 89),
+            3 => (4f, 8f, 102),
+            _ => (8f, 16f, 115),
+        };
+        return Shadow(0f, dy, blur, new RGBAColor32(0, 0, 0, (byte)alpha));
+    }
+
+    /// <summary>A border on all four sides: <paramref name="width"/> design units of <paramref name="color"/> (one cell
+    /// per side on a cell surface), square or rounded by <paramref name="radius"/>. Reserved inside this node's extent,
+    /// outside its padding.</summary>
+    public Node Border(RGBAColor32 color, float width = 1f, float radius = 0f)
+        => this with { BorderStyle = new BorderStyle { Color = color, Width = width, Radius = radius } };
+
+    /// <summary>Declares <paramref name="style"/> as this node's border (null clears it).</summary>
+    public Node Border(BorderStyle? style) => this with { BorderStyle = style };
+
+    /// <summary>Adds the top side to any sides already declared.</summary>
+    public Node BorderTop(RGBAColor32 color, float width = 1f) => WithBorderSide(BorderSides.Top, color, width);
+
+    /// <summary>Adds the bottom side to any sides already declared.</summary>
+    public Node BorderBottom(RGBAColor32 color, float width = 1f) => WithBorderSide(BorderSides.Bottom, color, width);
+
+    /// <summary>Adds the left side to any sides already declared.</summary>
+    public Node BorderLeft(RGBAColor32 color, float width = 1f) => WithBorderSide(BorderSides.Left, color, width);
+
+    /// <summary>Adds the right side to any sides already declared.</summary>
+    public Node BorderRight(RGBAColor32 color, float width = 1f) => WithBorderSide(BorderSides.Right, color, width);
+
+    private Node WithBorderSide(BorderSides side, RGBAColor32 color, float width)
+        => this with
+        {
+            BorderStyle = BorderStyle is { } b
+                ? b with { Sides = b.Sides | side }
+                : new BorderStyle { Color = color, Width = width, Sides = side },
+        };
 
     /// <summary>Inset this node's children by <paramref name="designUnits"/> of inner padding.</summary>
     public Node Pad(float designUnits) => this with { Padding = designUnits };
@@ -135,6 +227,9 @@ public abstract partial record Node
     /// </summary>
     public Node DoubleClickable(Action<InputModifier> onDoubleClick) => this with { OnDoubleClick = onDoubleClick };
 
+    /// <summary>Tells <paramref name="onPress"/> of every left press inside this node before the topmost region acts. See <see cref="Node.OnPressWithin"/>.</summary>
+    public Node WithPressWithin(Action<PointerPress> onPress) => this with { OnPressWithin = onPress };
+
     /// <summary>
     /// State what a right press does on this node -- typically open a menu at the press's position. It
     /// runs in place of the click for that press. Needs a <see cref="Node.Hit"/>, like any press.
@@ -172,6 +267,9 @@ public abstract partial record Node
     /// and slid by the controller's offset, the controller is told what it scrolls over (one surface
     /// unit per atom), and the painter clips the subtree to this rect and registers only what shows.
     /// Cap the stack's extent (<see cref="HClamp"/>) or it measures to its content and never scrolls.
+    /// When the controller draws a bar on the stack's axis the measure includes the bar's column on the
+    /// cross extent (less trailing padding that already covers it), always and not only on overflow, so
+    /// measure and arrange agree on the room the rows get (11.66).
     /// Named With* so it does not shadow the <see cref="Node.Scroll"/> property it sets.
     /// </summary>
     public Node WithScroll(ListScrollController controller) => this with { Scroll = controller };
@@ -210,6 +308,11 @@ public abstract partial record Node
     /// the <see cref="Node.Cursor"/> property it sets, which a same-named method cannot shadow.</summary>
     public Node WithCursor(CursorKind cursor) => this with { Cursor = cursor };
 
+    /// <summary>Make this node a surface: within its rect, nothing painted before it gets the pointer (hover, tooltip,
+    /// cursor, press, release, double click, wheel), while what it contains works as ever. A toast's card, an open side
+    /// bar, a floating window. See <see cref="Node.IsSurface"/>.</summary>
+    public Node AsSurface() => this with { IsSurface = true };
+
     /// <summary>Drop this node from the arrangement entirely when a parent <see cref="Stack"/> would give
     /// it a main-axis extent below <paramref name="designUnits"/> -- the freed space redistributes to the
     /// surviving siblings. See <see cref="CollapseThreshold"/>.</summary>
@@ -240,6 +343,19 @@ public abstract partial record Node
     /// </remarks>
     public Node WithFirstLineReserve(float reserve)
         => this is Wrap wr ? wr with { FirstLineReserve = reserve } : this;
+
+    /// <summary>
+    /// On a <see cref="Wrap"/>, a measured node drawn flush at the main end of the first line while later
+    /// lines use the full extent; a no-op on any other node. See <see cref="Wrap.FirstLineTrailing"/>.
+    /// </summary>
+    public Node WithFirstLineTrailing(Node trailing)
+        => this is Wrap wt ? wt with { FirstLineTrailing = trailing } : this;
+
+    /// <summary>
+    /// Declares the form this node takes when its natural width does not fit the room offered: the node itself is the
+    /// full form and <paramref name="narrow"/> replaces it whole when it is too wide. See <see cref="Node.NarrowForm"/>.
+    /// </summary>
+    public Node OrWhenNarrow(Node narrow) => this with { NarrowForm = narrow };
 
     /// <summary>
     /// Extra main-axis space before this child in a flow, suppressed when it starts a line. See

@@ -22,6 +22,21 @@ namespace DIR.Lib.Tests
         private static readonly RGBAColor32 Lit = new(60, 60, 60, 255);
 
         [Fact]
+        public void TheSignatureCarriesTheFocusRingAndChangingItIsDamage()
+        {
+            var plain = Layout.Builder.Box(80, 40).Bg(Plain);
+            var ringed = plain.WithFocusRing(Lit, 2f);
+            Layout.ArrangedNode<float>[] Frame(Layout.Node n) => [new Layout.ArrangedNode<float>(n, new Rect<float>(50, 50, 80, 40))];
+
+            LayoutDamage.Signature(Frame(ringed)[0], null).FocusRing!.Width.ShouldBe(2f);
+            LayoutDamage.Signature(Frame(plain)[0], null).FocusRing.ShouldBeNull();
+
+            var damage = new List<Rect<float>>();
+            LayoutDamage.Compute(Frame(plain), Frame(ringed), null, null, null, damage);
+            damage.ShouldNotBeEmpty();
+        }
+
+        [Fact]
         public void AnIdenticalFrameHasNoDamage()
         {
             // The case that has to be exactly zero, because it is the steady state: a frame drawn for
@@ -198,6 +213,128 @@ namespace DIR.Lib.Tests
 
             rects.Count.ShouldBe(1);
             rects[0].Width.ShouldBe(220f);
+        }
+
+        [Fact]
+        public void ABorderColourOrWidthChangeDamagesTheNode()
+        {
+            var line = new RGBAColor32(200, 0, 0, 255);
+            var plain = new[] { Arranged(Layout.Builder.Box(50, 50), 0, 0, 50, 50) };
+            var bordered = new[] { Arranged(Layout.Builder.Box(50, 50).Border(line, 1f), 0, 0, 50, 50) };
+            var recoloured = new[] { Arranged(Layout.Builder.Box(50, 50).Border(new RGBAColor32(0, 200, 0, 255), 1f), 0, 0, 50, 50) };
+            var wider = new[] { Arranged(Layout.Builder.Box(50, 50).Border(line, 2f), 0, 0, 50, 50) };
+
+            Damage(plain, bordered).ShouldNotBeEmpty("a border appearing paints");
+            Damage(bordered, recoloured).ShouldNotBeEmpty("a colour change paints");
+            Damage(bordered, wider).ShouldNotBeEmpty("a width change paints");
+            Damage(bordered, bordered).ShouldBeEmpty();
+        }
+
+        [Fact]
+        public void AnUnborderedNodesSignatureCarriesNoBorder()
+        {
+            var sig = LayoutDamage.Signature(Arranged(Layout.Builder.Box(10, 10), 0, 0, 10, 10), null);
+            sig.Border.ShouldBeNull();
+            sig.ShouldBe(sig with { Border = null });
+        }
+
+        // ---- the held press (Node.PressedBackground) and the hover underline ----
+
+        private static readonly RGBAColor32 Down = new(0, 160, 60, 255);
+
+        // A node with a pressed fill and no hover fill, so any damage below is the press's alone.
+        private static Layout.ArrangedNode<float> Pressable()
+            => Arranged(Layout.Builder.Box(50, 20).Bg(Plain).BgPressed(Down), 0, 0, 50, 20);
+
+        private static List<Rect<float>> PressDamage(
+            (float X, float Y)? beforePointer, (float X, float Y)? afterPointer,
+            (float X, float Y)? beforePress, (float X, float Y)? afterPress,
+            params Layout.ArrangedNode<float>[] frame)
+        {
+            var damage = new List<Rect<float>>();
+            LayoutDamage.Compute(frame, frame, beforePointer, afterPointer, beforePress, afterPress, null, damage);
+            return damage;
+        }
+
+        [Fact]
+        public void APressThatStartsOnTheNodeDamagesIt()
+        {
+            var damage = PressDamage((10, 10), (10, 10), null, (10, 10), Pressable());
+            damage.ShouldBe([new Rect<float>(0, 0, 50, 20)]);
+        }
+
+        [Fact]
+        public void APressThatEndsOnTheNodeDamagesIt()
+        {
+            var damage = PressDamage((10, 10), (10, 10), (10, 10), null, Pressable());
+            damage.ShouldBe([new Rect<float>(0, 0, 50, 20)]);
+        }
+
+        [Fact]
+        public void APressDraggedOffTheNodeDamagesIt()
+        {
+            // Still held, the pointer leaves: the pressed fill goes, so the node repaints.
+            var damage = PressDamage((10, 10), (90, 90), (10, 10), (10, 10), Pressable());
+            damage.ShouldBe([new Rect<float>(0, 0, 50, 20)]);
+        }
+
+        [Fact]
+        public void NoPressDamagesNothing()
+        {
+            PressDamage((10, 10), (10, 10), null, null, Pressable()).ShouldBeEmpty();
+            // A press held elsewhere, the pointer over the node: neither pressed nor changed.
+            PressDamage((10, 10), (10, 10), (90, 90), (90, 90), Pressable()).ShouldBeEmpty();
+        }
+
+        [Fact]
+        public void ThePressAwareSignatureSignsAHeldPressDifferently()
+        {
+            var node = Pressable();
+            LayoutDamage.Signature(node, (10, 10), (10, 10)).Background.ShouldBe(Down);
+            LayoutDamage.Signature(node, (10, 10), null).Background.ShouldBe(Plain);
+            LayoutDamage.Signature(node, (10, 10)).ShouldBe(LayoutDamage.Signature(node, (10, 10), null));
+            // A disabled node is never pressed.
+            LayoutDamage.Signature(Arranged(node.Node.Disabled("no"), 0, 0, 50, 20), (10, 10), (10, 10))
+                .Background.ShouldBe(Plain);
+        }
+
+        [Fact]
+        public void TheScopedSignatureShowsTheUnderlineOnlyWhenThePointerIsInTheScope()
+        {
+            var text = Arranged(Layout.Builder.Text("Docs").UnderlineOnHover(), 0, 0, 30, 20);
+            var wide = new Rect<float>(0, 0, 60, 20);
+
+            // Pointer outside the text's own rect but inside the wider scope (the link's region): underlined.
+            var inScope = LayoutDamage.Signature(text, (45, 10), null, wide);
+            var outOfScope = LayoutDamage.Signature(text, (90, 90), null, wide);
+            inScope.ShouldNotBe(outOfScope);
+            inScope.Caret.ShouldBe(1);
+            outOfScope.Caret.ShouldBe(0);
+
+            // The scope, not the node's own bounds, decides: the same pointer against the node's own rect is plain.
+            LayoutDamage.Signature(text, (45, 10), null, text.Bounds).Caret.ShouldBe(0);
+            // Without a scope the node's own bounds are the scope.
+            LayoutDamage.Signature(text, (10, 10), null).ShouldBe(LayoutDamage.Signature(text, (10, 10), null, text.Bounds));
+            // A disabled node is never underlined.
+            LayoutDamage.Signature(Arranged(text.Node.Disabled("no"), 0, 0, 30, 20), (45, 10), null, wide)
+                .Caret.ShouldBe(0);
+        }
+
+        [Fact]
+        public void HoveringALinksArrowDamagesItsUnderlinedText()
+        {
+            // The link's region (depth 0) holds the underlined text and the arrow (depth 1): hovering the arrow shows
+            // the text's underline, as the painter resolves it, so the text's rect is damage.
+            var link = Arranged(Layout.Builder.HStack(Layout.Builder.Text("Docs"), Layout.Builder.Text("↗"))
+                .Clickable(new HitResult.ButtonHit("Docs")), 0, 0, 60, 20);
+            var text = Arranged(Layout.Builder.Text("Docs").UnderlineOnHover(), 0, 0, 30, 20) with { Depth = 1 };
+            var arrow = Arranged(Layout.Builder.Text("↗"), 40, 0, 10, 20) with { Depth = 1 };
+
+            var damage = PressDamage((90, 90), (45, 10), null, null, link, text, arrow);
+            damage.ShouldContain(new Rect<float>(0, 0, 30, 20));
+
+            // Outside the link's region the text does not change.
+            PressDamage((90, 90), (95, 10), null, null, link, text, arrow).ShouldBeEmpty();
         }
 
         // ---- helpers ----
