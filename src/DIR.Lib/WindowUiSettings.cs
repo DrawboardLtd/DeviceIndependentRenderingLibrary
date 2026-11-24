@@ -1,4 +1,5 @@
-﻿using System.Collections.Generic;
+﻿using System;
+using System.Collections.Generic;
 
 namespace DIR.Lib;
 
@@ -92,14 +93,16 @@ public sealed class WindowUiSettings
 
     /// <summary>
     /// Records that <paramref name="popover"/> painted, putting it on top of this cycle's stack. Called by
-    /// the layout painter for every OPEN popover node it draws.
+    /// the layout painter for every OPEN popover node it draws, and by a surface that paints its own
+    /// popovers (a terminal, say) and has no <c>PixelWidgetBase</c> to do it: call it once per painted open
+    /// popover, after <see cref="NoteFrameBegin"/> for the cycle.
     /// </summary>
     /// <remarks>
     /// Re-registering one already in the list MOVES it to the top rather than duplicating it, so a popover
     /// drawn in more than one of a widget's paint passes is ordered by its LAST paint, which is the one
     /// actually on top.
     /// </remarks>
-    internal void NotePopoverPainted(PopoverState popover)
+    public void NotePopoverPainted(PopoverState popover)
     {
         _paintedPopovers.Remove(popover);
         _paintedPopovers.Add(popover);
@@ -134,6 +137,14 @@ public sealed class WindowUiSettings
     public RectF32? PointerOwner { get; set; }
 
     /// <summary>
+    /// Where the primary button went down and is still held, or null. Set by <see cref="InputRouter"/> on a left
+    /// press that a region took (and no surface, popover backdrop or modal scrim took), cleared on the release. The
+    /// painter lights <see cref="Layout.Node.PressedBackground"/> on a node that contains both this point and the
+    /// pointer. Kept here, beside the other per-window pointer state, so widgets that share these settings agree.
+    /// </summary>
+    public (float X, float Y)? PressOrigin { get; set; }
+
+    /// <summary>
     /// The pointer claim in force for whatever is being painted NOW: <see cref="PointerOwner"/> once an open
     /// popover has painted this cycle, and before that, the claim the last cycle ended with, for as long as the
     /// popover that made it is still open. Hover painting confines itself to this.
@@ -160,7 +171,118 @@ public sealed class WindowUiSettings
     /// before the popover was confined to a different rect than the popover then claimed. False the frame a
     /// popover opens, moves or closes; <see cref="InputRouter.AfterPaint"/> asks for another frame then.
     /// </summary>
-    public bool PointerClaimSettled => PointerOwner == _carriedPointerOwner;
+    public bool PointerClaimSettled => PointerOwner == _carriedPointerOwner && SurfacesSettled;
+
+    // ---- surfaces (Layout.Node.IsSurface) -------------------------------------------------------------------------
+    //
+    // The same claim, made by a node painted OVER something rather than by an open popover: within the surface's rect,
+    // nothing painted before it may answer the pointer. It rides the popover claim's machinery whole: made by being
+    // painted, cleared once per paint cycle (NoteFrameBegin), carried into the next cycle so a node painted BEFORE the
+    // surface is confined too, and folded into PointerClaimSettled, so the frame a surface appears, moves or goes asks
+    // the router for one more. Where they differ is only what is confined: a popover confines everything outside its own
+    // content, a surface only what lies under it and was painted before it.
+
+    private int _paintOrder;
+    private readonly List<PaintedSurface> _surfaces = [];
+    private PaintedSurface[] _carriedSurfaces = [];
+
+    /// <summary>A surface painted this cycle: its rect, and the paint order of its node (<see cref="NotePaintedNode"/>).</summary>
+    public readonly record struct PaintedSurface(RectF32 Rect, int Order);
+
+    /// <summary>
+    /// The paint order of the next node: how many nodes every widget sharing these settings has painted this cycle. Hand-
+    /// painted chrome is confined at this order (it lies over what was painted before it and under what follows).
+    /// </summary>
+    public int PaintOrder => _paintOrder;
+
+    /// <summary>Takes the next paint order, for a node being painted. Called by the layout painter once per painted node,
+    /// and by a non-pixel surface that paints declared nodes itself and wants <see cref="IsCoveredBySurface"/> to hold.</summary>
+    public int NotePaintedNode() => _paintOrder++;
+
+    /// <summary>The surfaces painted this cycle so far, in paint order.</summary>
+    public IReadOnlyList<PaintedSurface> PaintedSurfaces => _surfaces;
+
+    /// <summary>
+    /// Records that a surface (<see cref="Layout.Node.IsSurface"/>) painted at <paramref name="rect"/>, as the node of paint
+    /// order <paramref name="order"/>. Called by the layout painter; a non-pixel surface that paints one itself calls it too.
+    /// </summary>
+    public void NoteSurfacePainted(RectF32 rect, int order) => _surfaces.Add(new PaintedSurface(rect, order));
+
+    /// <summary>
+    /// Whether the point lies under a surface painted after the node of paint order <paramref name="order"/>, by what the
+    /// last cycle painted (a surface painted later in THIS cycle is not known yet when an earlier node paints; the carry
+    /// is the popover claim's, and so is the extra frame when it changes). Hover consults it, so a row under a toast stops
+    /// lighting.
+    /// </summary>
+    public bool IsCoveredBySurface(float x, float y, int order) =>
+        Covers(_carriedSurfaces, x, y, order) || Covers(_surfacesFromOtherSettings, x, y, order);
+
+    private static bool Covers(PaintedSurface[] surfaces, float x, float y, int order)
+    {
+        foreach (var s in surfaces)
+        {
+            var r = s.Rect;
+            if (s.Order > order && x >= r.X && x < r.X + r.Width && y >= r.Y && y < r.Y + r.Height)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // Surfaces painted by widgets that do NOT share these settings but are painted after a widget that does, each with
+    // the paint order (of THESE settings) below which it covers: the order at which the next widget sharing these
+    // settings began, since that one is painted over the surface. Set by InputRouter.AfterPaint, which alone knows the
+    // paint order of every widget in the window (its list), so a toast in a widget of its own darkens the page's row
+    // beneath it without the host sharing one settings object between them.
+    private PaintedSurface[] _surfacesFromOtherSettings = [];
+
+    /// <summary>
+    /// Replaces the surfaces that widgets painted with OTHER settings lay over the nodes painted with these, each as the
+    /// paint order below which it covers. Returns whether they changed, so the caller asks for one more frame. Called by
+    /// <see cref="InputRouter.AfterPaint"/>.
+    /// </summary>
+    internal bool CarrySurfacesFromOtherSettings(List<PaintedSurface> surfaces)
+    {
+        if (surfaces.Count == _surfacesFromOtherSettings.Length)
+        {
+            var same = true;
+            for (var i = 0; i < surfaces.Count && same; i++)
+            {
+                same = surfaces[i] == _surfacesFromOtherSettings[i];
+            }
+
+            if (same)
+            {
+                return false;
+            }
+        }
+
+        _surfacesFromOtherSettings = surfaces.Count == 0 ? [] : [.. surfaces];
+        return true;
+    }
+
+    // The paint order at which each widget began this cycle (NoteFrameBegin), so the router can tell which of the nodes
+    // painted with these settings a widget of its list painted.
+    private readonly Dictionary<object, int> _frameStartOrders = new(ReferenceEqualityComparer.Instance);
+
+    /// <summary>The paint order at which <paramref name="widget"/> began this cycle, or null when it has not.</summary>
+    internal int? FrameStartOrder(object widget) => _frameStartOrders.TryGetValue(widget, out var order) ? order : null;
+
+    private bool SurfacesSettled
+    {
+        get
+        {
+            if (_surfaces.Count != _carriedSurfaces.Length) return false;
+            for (var i = 0; i < _surfaces.Count; i++)
+            {
+                if (_surfaces[i] != _carriedSurfaces[i]) return false;
+            }
+
+            return true;
+        }
+    }
 
     // The popover whose content set PointerOwner, so the next cycle can tell whether the claim still stands,
     // and the claim carried into this cycle from the last one.
@@ -168,12 +290,43 @@ public sealed class WindowUiSettings
     private RectF32? _carriedPointerOwner;
 
     /// <summary>Records that <paramref name="popover"/>'s content, at <paramref name="content"/>, claims the
-    /// pointer this cycle. Called by the layout painter.</summary>
-    internal void ClaimPointer(RectF32 content, PopoverState popover)
+    /// pointer this cycle. Called by the layout painter, and by a non-pixel surface that paints a popover
+    /// itself, right after <see cref="NotePopoverPainted"/>, so a press inside the content reaches the
+    /// popover's regions and not the chrome (a declared list's rows) beneath it. The claim is carried to the
+    /// next cycle while <paramref name="popover"/> stays open.</summary>
+    public void ClaimPointer(RectF32 content, PopoverState popover)
     {
         PointerOwner = content;
         _pointerOwnerPopover = popover;
     }
+
+    /// <summary>
+    /// The modal overlay painted this cycle (<see cref="Layout.Node.Overlay.Modal"/>), or null. The topmost one
+    /// wins: a later paint replaces an earlier. <see cref="InputRouter"/> reads it to confine input.
+    /// </summary>
+    /// <remarks>
+    /// Registered by being PAINTED, like <see cref="PaintedPopovers"/>, and cleared on the same cycle boundary, so a
+    /// modal that closed simply stops painting. The layout painter makes the call; a surface that paints a modal
+    /// itself (a terminal) calls <see cref="NoteModalPainted"/> then, once per painted modal.
+    /// </remarks>
+    public ModalClaim? PaintedModal { get; private set; }
+
+    /// <summary>
+    /// Records that a modal's Top began painting in <paramref name="widget"/>. <paramref name="regionStart"/> and
+    /// <paramref name="nodeStart"/> are how many regions and painted nodes the widget held BEFORE Top painted, so
+    /// those at or after them are Top's. <paramref name="card"/> is where Top draws (a press outside it is an
+    /// outside press) and <paramref name="dismiss"/> what closes it.
+    /// </summary>
+    public ModalClaim NoteModalPainted(object widget, int regionStart, int nodeStart, RectF32 card, Action? dismiss)
+        => PaintedModal = new ModalClaim(widget, regionStart, nodeStart, card, dismiss);
+
+    /// <summary>
+    /// How many times <see cref="NoteFrameBegin"/> has been called on these settings. The router compares it with the count
+    /// it saw at the previous <c>AfterPaint</c>: a settings object whose count did not move had no widget paint since, so
+    /// the widgets listed with it are not on screen, whatever object they noted their frame under. Its cycle only turns
+    /// over when a widget begins, so what it still holds (its surfaces) is stale.
+    /// </summary>
+    internal int FrameBeginCount { get; private set; }
 
     private readonly HashSet<object> _begunThisCycle = new(ReferenceEqualityComparer.Instance);
 
@@ -186,11 +339,15 @@ public sealed class WindowUiSettings
     /// twenty, in any paint order, the first repeat is the boundary. Within a cycle the owner survives every
     /// other widget's BeginFrame, which is the property the whole mechanism exists for, since a popover in
     /// one widget must confine hover in the widgets painted after it.
+    /// A non-pixel surface calls it at the start of each of its paint passes, passing itself (or any stable
+    /// object), so the claim and the painted popovers clear once per cycle.
     /// </remarks>
-    internal void NoteFrameBegin(object widget)
+    public void NoteFrameBegin(object widget)
     {
+        FrameBeginCount++;
         if (_begunThisCycle.Add(widget))
         {
+            _frameStartOrders[widget] = _paintOrder;
             return;
         }
 
@@ -200,7 +357,14 @@ public sealed class WindowUiSettings
         _carriedPointerOwner = PointerOwner is { } owner && _pointerOwnerPopover is { IsOpen: true } ? owner : null;
         _pointerOwnerPopover = null;
         PointerOwner = null;
+        // Surfaces are carried whole: one that is no longer painted is simply absent from the next cycle's list.
+        _carriedSurfaces = _surfaces.Count == 0 ? [] : [.. _surfaces];
+        _surfaces.Clear();
+        _paintOrder = 0;
+        _frameStartOrders.Clear();
+        _frameStartOrders[widget] = 0;
         _paintedPopovers.Clear();
+        PaintedModal = null;
     }
 
     /// <summary>
@@ -258,6 +422,14 @@ public sealed class WindowUiSettings
     public RectInt CaretRect { get; set; }
 
     /// <summary>
+    /// The caret's blink phase for the frame being painted. One phase per window, for the same reason there
+    /// is one caret: the loop that owns the frames sets it once per frame from
+    /// <see cref="CaretBlink.PhaseAt(TimeProvider)"/>, and every widget sharing this object draws its text
+    /// inputs in that phase, so no host sets it per widget.
+    /// </summary>
+    public long CaretPhase { get; set; }
+
+    /// <summary>
     /// Which frame the window is on. A host bumps it once per frame, before anything draws; every widget
     /// sharing these settings then agrees on what "this frame" means.
     /// </summary>
@@ -281,4 +453,24 @@ public sealed class WindowUiSettings
     /// </para>
     /// </remarks>
     public long FrameId { get; set; }
+}
+
+/// <summary>A modal painted this cycle, as <see cref="WindowUiSettings.NoteModalPainted"/> recorded it.</summary>
+public sealed class ModalClaim(object widget, int regionStart, int nodeStart, RectF32 card, Action? dismiss)
+{
+    /// <summary>The widget whose paint held the modal; widgets painted before it lie beneath.</summary>
+    public object Widget { get; } = widget;
+
+    /// <summary>Regions the widget held before Top painted.</summary>
+    public int RegionStart { get; } = regionStart;
+
+    /// <summary>Painted nodes the widget held before Top painted.</summary>
+    public int NodeStart { get; } = nodeStart;
+
+    /// <summary>Where Top's card draws, in the surface's own coordinates. Settable because an anchored Top's card is
+    /// the node after the one that begins it.</summary>
+    public RectF32 Card { get; set; } = card;
+
+    /// <summary>What closes the modal, or null.</summary>
+    public Action? Dismiss { get; } = dismiss;
 }

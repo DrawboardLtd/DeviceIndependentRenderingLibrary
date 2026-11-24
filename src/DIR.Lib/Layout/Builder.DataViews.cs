@@ -85,7 +85,9 @@ public static partial class Builder
     /// own gap, padding and column sizing, holds an empty cell per column and a divider in each gap, and sits
     /// over the header, so a divider region is registered after the cells and wins the press over its own few
     /// units. A divider is as wide as <see cref="TableStyle.Gap"/>; a style with no gap has nothing to grab and
-    /// gets no dividers.
+    /// gets no dividers. A column with <see cref="TableColumn.DropBelow"/> drops its title, its gap and its
+    /// divider together (the overlay's gap cells are <see cref="Node.Separator"/>s, so one goes with each dropped
+    /// column), and <see cref="TableColumn.GripAfter"/> false leaves its gap with no grip.
     /// </para>
     /// <para>
     /// The drag is relative to the press and converted to design units by <paramref name="scale"/> (the
@@ -127,7 +129,7 @@ public static partial class Builder
             {
                 face = Text(column.Header, fontSize, style.HeaderText, column.Align, TextAlign.Center).WStar().HStar();
             }
-            face = face.CrossCenter() with { Width = widths?.SizingOf(i, column) ?? column.Width, Height = Sizing.Star() };
+            face = face.CrossCenter() with { Width = widths?.SizingOf(i, column) ?? column.Width, Height = Sizing.Star(), CollapseThreshold = column.DropBelow };
 
             if (onSort is not null)
             {
@@ -152,6 +154,9 @@ public static partial class Builder
         // between two of them a divider the gap's width. A zero-gap stack of [column, gap, column, ...] puts
         // every edge where the header's gapped stack puts it, star columns included, because the fixed total
         // is the same.
+        // A consumer that swaps a grip cell for a node of its own must keep the cell's OnArranged (or call
+        // widths.NoteDrawn itself, which is how a column counts as drawn): a column whose cell never reports is
+        // treated as collapsed for good, and its grips are gone.
         var scaleOrOne = scale.OrOne();
         var copy = columns.ToArray();
         var top = new List<Node>(columns.Length * 2 - 1);
@@ -162,14 +167,15 @@ public static partial class Builder
             {
                 Width = widths.SizingOf(i, columns[i]),
                 Height = Sizing.Star(),
+                CollapseThreshold = columns[i].DropBelow,
                 OnArranged = w => widths.NoteDrawn(column, w),
             });
             if (i + 1 < columns.Length)
             {
                 var divider = i;
                 // A divider that would resize nothing is a gap like any other: no grip, no resize cursor.
-                var gap = Spacer().WFixed(style.Gap).HStar();
-                top.Add(widths.CanDrag(columns, i)
+                var gap = Spacer().WFixed(style.Gap).HStar() with { Separator = true };
+                top.Add(columns[i].GripAfter && widths.CanDrag(columns, i)
                     ? gap.Pressable(
                         new HitResult.ButtonHit($"{hitPrefix}divider:{i}"), DividerPress(copy, widths, i, scaleOrOne),
                         CursorKind.ResizeEW).DoubleClickable(_ => widths.Fit(copy, divider))
@@ -177,7 +183,8 @@ public static partial class Builder
             }
         }
 
-        return Overlay(header, HStack(top.ToArray()).PadX(style.PadX));
+        var count = columns.Length;
+        return Overlay(header, HStack(top.ToArray()).PadX(style.PadX) with { OnArranged = _ => widths.BeginArrange(count) });
     }
 
     private static Func<PointerPress, DragCapture?> DividerPress(TableColumn[] columns, TableColumnWidths widths,
@@ -226,7 +233,13 @@ public static partial class Builder
         for (var i = 0; i < columns.Length; i++)
         {
             var cell = i < cells.Length ? cells[i] : Spacer();
-            laid[i] = cell with { Width = widths?.SizingOf(i, columns[i]) ?? columns[i].Width, Height = Sizing.Star() };
+            // A column's DropBelow wins; without one the cell keeps its own CollapseBelow (pilot's ListTable sets it).
+            laid[i] = cell with
+            {
+                Width = widths?.SizingOf(i, columns[i]) ?? columns[i].Width,
+                Height = Sizing.Star(),
+                CollapseThreshold = columns[i].DropBelow > 0f ? columns[i].DropBelow : cell.CollapseThreshold,
+            };
         }
 
         return HStack(laid).WithGap(style.Gap).PadX(style.PadX);

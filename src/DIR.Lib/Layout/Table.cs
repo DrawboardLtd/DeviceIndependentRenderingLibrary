@@ -32,15 +32,29 @@ public readonly record struct TableColumn(string Header, Sizing Width, TextAlign
     /// primary constructor every compiled caller binds to is unchanged.</summary>
     public float? MinWidth { get; init; }
 
-    /// <summary>The widest this column may be dragged to beside the star that takes the slack, design units, or
-    /// null for no limit. A consumer that drops a column once it cannot have its width states here what the page
-    /// has for it, so a drag never takes the column, and the divider with it, off the page. Two columns that
-    /// trade width leave the table as wide as it was and are not held to it.</summary>
+    /// <summary>The widest this column may be dragged to, design units, or null for no limit. A consumer that
+    /// drops a column once it cannot have its width states here what the page has for it, so a drag never takes
+    /// the column, and the divider with it, off the page. A drag never widens a column past it, whoever takes
+    /// the difference: the star that takes the slack, or the neighbour it trades width with.</summary>
     public float? MaxWidth { get; init; }
 
     /// <summary>Whether a divider may resize this column. False for one whose width is not the reader's to
     /// choose (a column of buttons): a divider that stands on its edge is then no grip.</summary>
     public bool Resizable { get; init; } = true;
+
+    /// <summary>Drop this column below a width, design units (0, the default, never drops): the declarative
+    /// form of <see cref="Node.CollapseBelow"/> for a column. When its resolved width is under this, the title,
+    /// the row cells, the gap beside it and the divider in that gap all leave together, in the header and in
+    /// every <see cref="Builder.TableRow(ReadOnlySpan{TableColumn}, ReadOnlySpan{Node}, in TableStyle)"/>, so the
+    /// remaining dividers stay over the remaining gaps in any measure context. Init-only, so the primary
+    /// constructor is unchanged.</summary>
+    public float DropBelow { get; init; }
+
+    /// <summary>Whether the divider between this column and the next is a grip. False leaves the gap as plain
+    /// space (no <see cref="HitResult.ButtonHit"/>, no resize cursor) while both columns still follow the
+    /// widths; <see cref="Resizable"/> false is the stronger statement that the column's width is not the
+    /// reader's to choose.</summary>
+    public bool GripAfter { get; init; } = true;
 }
 
 /// <summary>
@@ -92,12 +106,12 @@ public sealed class TableColumnWidths
     /// Sizes the fixed column <paramref name="divider"/> to <see cref="FitWidth"/>'s answer, held at or above
     /// its minimum. Only that column moves: its neighbour keeps its width and the star column takes the
     /// difference. Returns whether a width changed; false without a callback, with an unknown answer, or when
-    /// the column is a star.
+    /// the column is a star or has collapsed (the last arrange did not draw it, see <see cref="CanDrag"/>).
     /// </summary>
     public bool Fit(ReadOnlySpan<TableColumn> columns, int divider)
     {
         if (FitWidth is not { } fit || (uint)divider >= (uint)columns.Length || divider + 1 >= columns.Length
-            || !columns[divider].Width.IsFixed || fit(divider) is not { } wanted || float.IsNaN(wanted))
+            || IsCollapsed(divider) || !columns[divider].Width.IsFixed || fit(divider) is not { } wanted || float.IsNaN(wanted))
         {
             return false;
         }
@@ -162,7 +176,27 @@ public sealed class TableColumnWidths
         }
 
         _drawn[index] = width;
+        if (index < _collapsed.Length)
+        {
+            _collapsed[index] = false;
+        }
     }
+
+    private bool[] _collapsed = [];
+
+    /// <summary>The grip row's own arrange, which runs before its cells': marks all <paramref name="count"/>
+    /// columns collapsed, and each cell the arrange then reaches (<see cref="NoteDrawn"/>) drawn again.</summary>
+    internal void BeginArrange(int count)
+    {
+        if (_collapsed.Length != count)
+        {
+            _collapsed = new bool[count];
+        }
+
+        Array.Fill(_collapsed, true);
+    }
+
+    private bool IsCollapsed(int index) => index < _collapsed.Length && _collapsed[index];
 
     // The width a drag starts from: a fixed column's width, a capped star's drawn width (its cap while the table has
     // the room for it, less when the table is narrower than the caps), null for the star that takes the slack.
@@ -189,7 +223,9 @@ public sealed class TableColumnWidths
     /// <summary>
     /// Whether a drag of the divider after column <paramref name="divider"/> resizes anything: false between two
     /// stars that take the slack, and where one side cannot be resized (<see cref="TableColumn.Resizable"/>) and is
-    /// no slack star either. The header gives such a divider no grip and no resize cursor.
+    /// no slack star either. The header gives such a divider no grip and no resize cursor. It is also false beside a
+    /// collapsed column: one the last arrange did not draw (a Stack dropped its grip cell, as a CollapseBelow does), so
+    /// a drag cannot bring a hidden column back. Before any arrange no column counts as collapsed.
     /// </summary>
     public bool CanDrag(ReadOnlySpan<TableColumn> columns, int divider)
     {
@@ -200,7 +236,7 @@ public sealed class TableColumnWidths
     // The width each side of the divider is dragged from; null for a side the drag leaves alone.
     private (float? Left, float? Right) Sides(ReadOnlySpan<TableColumn> columns, int divider)
     {
-        if (divider < 0 || divider + 1 >= columns.Length)
+        if (divider < 0 || divider + 1 >= columns.Length || IsCollapsed(divider) || IsCollapsed(divider + 1))
         {
             return (null, null);
         }
@@ -260,7 +296,7 @@ public sealed class TableColumnWidths
     /// </summary>
     public ResizeGesture? Begin(ReadOnlySpan<TableColumn> columns, int divider)
     {
-        if (divider < 0 || divider + 1 >= columns.Length)
+        if (divider < 0 || divider + 1 >= columns.Length || IsCollapsed(divider) || IsCollapsed(divider + 1))
         {
             return null;
         }
@@ -311,14 +347,14 @@ public sealed class TableColumnWidths
         /// <summary>Sets the two widths to what <paramref name="delta"/> design units from the press makes of them.</summary>
         public void Apply(float delta)
         {
-            // A side resized alone, beside the slack star, grows no further than the widest it states. Two sides that
-            // trade keep the table as wide as it was, so neither needs the limit.
-            if (_leftStart is { } l && _rightStart is null && _leftMax is { } leftMax)
+            // A drag never widens a column past its MaxWidth, whoever takes the difference (the slack star, or the
+            // neighbour it trades with). A side already at or past its MaxWidth is not widened.
+            if (_leftStart is { } l && _leftMax is { } leftMax)
             {
                 delta = Math.Min(delta, Math.Max(0f, leftMax - l));
             }
 
-            if (_rightStart is { } r && _leftStart is null && _rightMax is { } rightMax)
+            if (_rightStart is { } r && _rightMax is { } rightMax)
             {
                 delta = Math.Max(delta, -Math.Max(0f, rightMax - r));
             }

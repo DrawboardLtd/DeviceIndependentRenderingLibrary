@@ -68,6 +68,59 @@ public class CaretBlinkTests
         Pixel(off, x, y).ShouldNotBe(TextInputRenderer.Colors.Cursor, "an OFF phase does not");
     }
 
+    private sealed class FakeClock(long milliseconds) : TimeProvider
+    {
+        public long Milliseconds { get; set; } = milliseconds;
+        public override long TimestampFrequency => 1000;
+        public override long GetTimestamp() => Milliseconds;
+    }
+
+    private sealed class FieldWidget(Renderer<RgbaImage> renderer) : PixelWidgetBase<RgbaImage>(renderer)
+    {
+        public void ShareWith(FieldWidget child) => ShareUiContext(child);
+
+        public void Paint(TextInputState state)
+        {
+            BeginFrame();
+            RenderLayout(Layout.Builder.TextInput(state, 14f).Stretch(), new RectF32(0f, 0f, 120f, 30f),
+                fontPath: "font.ttf", scale: DesignScale.One);
+        }
+    }
+
+    [Fact]
+    public void TheWindowsPhaseDecidesTheCaret_ForEveryWidgetSharingItsUi()
+    {
+        var clock = new FakeClock(0);
+        var state = new TextInputState { Text = "abc", IsActive = true, CursorPos = 1 };
+        var parentSurface = new MetricsRenderer(120, 30);
+        var parent = new FieldWidget(parentSurface);
+        var childSurface = new MetricsRenderer(120, 30);
+        var child = new FieldWidget(childSurface);
+        parent.ShareWith(child);
+
+        // Only the window's phase is set, never a widget's.
+        parent.Ui.CaretPhase = CaretBlink.PhaseAt(clock);
+        parent.Paint(state);
+        var caret = parent.Ui.CaretRect;
+        var x = caret.UpperLeft.X;
+        var y = (caret.UpperLeft.Y + caret.LowerRight.Y) / 2;
+        Pixel(parentSurface, x, y).ShouldBe(TextInputRenderer.Colors.Cursor, "an ON phase draws the caret");
+        child.Paint(state);
+        Pixel(childSurface, x, y).ShouldBe(TextInputRenderer.Colors.Cursor, "a widget sharing the Ui sees the same phase");
+
+        // Flip the window's phase and repaint the SAME widgets over cleared surfaces.
+        clock.Milliseconds = CaretBlink.PhaseMilliseconds;
+        parent.Ui.CaretPhase = CaretBlink.PhaseAt(clock);
+        var clear = new RectInt(new PointInt(120, 30), new PointInt(0, 0));
+        parentSurface.FillRectangle(clear, new RGBAColor32(0, 0, 0, 255));
+        childSurface.FillRectangle(clear, new RGBAColor32(0, 0, 0, 255));
+        parent.Paint(state);
+        child.Paint(state);
+        Pixel(parentSurface, x, y).ShouldNotBe(TextInputRenderer.Colors.Cursor, "the next phase draws no caret");
+        Pixel(childSurface, x, y).ShouldNotBe(TextInputRenderer.Colors.Cursor, "nor in the sharing widget");
+        child.CaretPhase.ShouldBe(1L, "the widget property forwards to the window");
+    }
+
     private static RGBAColor32 Pixel(RgbaImageRenderer r, int x, int y)
     {
         var i = ((y * r.Surface.Width) + x) * 4;

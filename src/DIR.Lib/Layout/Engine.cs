@@ -44,6 +44,39 @@ public interface IMeasureContext<T> where T : INumber<T>
     T ToSurfaceY(float designUnits) => ToSurface(designUnits);
 
     /// <summary>
+    /// Map one authored Fixed extent or padding to surface units, with the node it belongs to in view.
+    /// <para>
+    /// The engine calls this, in measure and in arrange alike, for every <see cref="SizeKind.Fixed"/> extent
+    /// (a node's width and height, the narrowing its children are measured in, a stack's Fixed main and cross,
+    /// a Fixed grid column, a wrap child's main and cross, a dock strip) and every padding
+    /// (<see cref="Node.Padding"/>, <see cref="Node.PadDown"/>). Gaps, margins, Box and Icon content, split
+    /// dividers, Min/Max clamps and anchored offsets still go through <see cref="ToSurfaceX"/> /
+    /// <see cref="ToSurfaceY"/> directly, because they belong to no single node's content.
+    /// </para>
+    /// <para>
+    /// <see cref="ExtentRequest"/> says which it is (<see cref="ExtentRequest.Kind"/>), along which axis, and what
+    /// the node holds (<see cref="ExtentRequest.HasContent"/>, <see cref="ExtentRequest.ContentLines"/>,
+    /// <see cref="ExtentRequest.HasFill"/>). A cell surface uses that to keep a one-line row one row tall whatever
+    /// pixel height it was authored at, round padding down, collapse an empty spacer to nothing, and keep a
+    /// filled bar thinner than a cell as one row.
+    /// </para>
+    /// <para>
+    /// The default is today's mapping, <see cref="ToSurfaceX"/> or <see cref="ToSurfaceY"/> of
+    /// <see cref="ExtentRequest.Value"/> by axis, so an existing context arranges byte-identically. An override's
+    /// answer must depend only on the request and on what <see cref="MeasureKey"/> names, since a measure is kept
+    /// across calls under that key.
+    /// </para>
+    /// </summary>
+    T MapExtent(in ExtentRequest request)
+    {
+        var mapped = request.Axis == Axis.Horizontal ? ToSurfaceX(request.Value) : ToSurfaceY(request.Value);
+
+        // A border never rounds away: one surface unit at least. A cell context answers one cell per side;
+        // Console.Lib's overrides this in its own flight.
+        return request.Kind == ExtentKind.Border && request.Value > 0f && mapped < T.One ? T.One : mapped;
+    }
+
+    /// <summary>
     /// A value that names everything this context's measures depend on: the metrics behind
     /// <see cref="MeasureText"/> and the <see cref="ToSurface"/> family (scale, font, fallback). Two contexts whose keys
     /// are <see cref="object.Equals(object?)"/> must measure every node identically. The engine keeps a pure subtree's
@@ -66,6 +99,13 @@ public interface IMeasureContext<T> where T : INumber<T>
 public static class Engine
 {
     /// <summary>
+    /// How far in atoms a scrolled stack's content may exceed its viewport and still count as held by it: float
+    /// sums of fractional rows land a hair either side of the viewport they were sized to. The controller's own
+    /// <c>AtomFitEpsilon</c>, so the two ends of the count agree.
+    /// </summary>
+    private const float ScrollFitEpsilon = 1e-3f;
+
+    /// <summary>
     /// Measures a node's intrinsic (content-driven) size against <paramref name="available"/>. Exposed for
     /// tests and Auto-sizing callers; <see cref="Arrange{T}"/> uses it internally for <c>Auto</c> children.
     /// </summary>
@@ -77,7 +117,8 @@ public static class Engine
         {
             // A leaf other than a text editor measures from its content alone, so the room it is offered is not part of
             // its identity: the same text in nested stacks is offered a different room at each level.
-            var at = node is Node.Leaf { Content: not Content.TextEditor } ? default : available;
+            // (Unless it declares a narrow form: which form it takes depends on the room.)
+            var at = node is Node.Leaf { Content: not Content.TextEditor, NarrowForm: null } ? default : available;
             if (MeasureMemo<T>.TryGet(node, at, ctx, out var known, out var key))
             {
                 return known;
@@ -93,7 +134,50 @@ public static class Engine
         }
     }
 
+    /// <summary>True when the controller draws a bar on the stack's own axis, the case that reserves a column.</summary>
+    private static bool ScrollBarMeasured(ListScrollController scroll, Axis axis)
+        => scroll.Mode != ScrollBarMode.None && (scroll.Axis == ScrollAxis.Vertical) == (axis == Axis.Vertical);
+
+    /// <summary>The bar's width in surface units on the cross axis, from the same DesignScale ArrangeStack hands the controller (the controller's bar width is the X scale on either axis).</summary>
+    private static float ScrollBarColumn<T>(IMeasureContext<T> ctx)
+        where T : INumber<T>
+    {
+        var scale = new DesignScale(float.CreateChecked(ctx.ToSurfaceX(1f)), float.CreateChecked(ctx.ToSurfaceY(1f)));
+        return scale.ToSurface(ListScrollController.ScrollBarBaseWidthPx);
+    }
+
+    /// <summary>
+    /// The one place <see cref="Node.NarrowForm"/> is decided, for Measure and Arrange alike: true (and the narrow
+    /// node) when the node's full form, measured with no limit on the width, is wider than <paramref name="width"/>.
+    /// Note: the full form is measured on every Measure and Arrange of such a node (cached by the measure memo, so
+    /// about twice per pass); fine at today's sizes, worth revisiting if segmented controls grow large.
+    /// </summary>
+    private static bool TryNarrow<T>(Node node, T width, T height, IMeasureContext<T> ctx, out Node narrow)
+        where T : INumber<T>
+    {
+        narrow = node;
+        if (node.NarrowForm is not { } form)
+        {
+            return false;
+        }
+
+        var natural = MeasureBody(node, new Size<T>(T.CreateSaturating(1_000_000), height), ctx).Width;
+        if (natural <= width)
+        {
+            return false;
+        }
+
+        narrow = form;
+        return true;
+    }
+
     private static Size<T> MeasureUncached<T>(Node node, Size<T> available, IMeasureContext<T> ctx)
+        where T : INumber<T>
+        => TryNarrow(node, available.Width, available.Height, ctx, out var narrow)
+            ? MeasureBody(narrow, available, ctx)
+            : MeasureBody(node, available, ctx);
+
+    private static Size<T> MeasureBody<T>(Node node, Size<T> available, IMeasureContext<T> ctx)
         where T : INumber<T>
     {
         // Inner padding is measured as arrange lays it out: the children get the room inside it. They were measured
@@ -101,11 +185,19 @@ public static class Engine
         // was arranged in, came out a line short, and ran out of its box (pilot's flight page cut its last report).
         // Children are measured at the extent this node will have: a Fixed extent, or the room up to a Max. Measured at the
         // whole available extent and only then overridden, a wrapping child counted the lines it would take at window width.
-        available = new Size<T>(NarrowTo(available.Width, node.Width, ctx, Axis.Horizontal), NarrowTo(available.Height, node.Height, ctx, Axis.Vertical));
+        available = new Size<T>(NarrowTo(available.Width, node, node.Width, ctx, Axis.Horizontal), NarrowTo(available.Height, node, node.Height, ctx, Axis.Vertical));
+
+        // The border is reserved outside the padding, per side, for every node kind (a Dock or Split too: it
+        // fills what is left inside). Arrange insets by the same Extent calls, so the two agree.
+        var border = BorderInsets(ctx, node);
+        if (border.Any)
+        {
+            available = new Size<T>(T.Max(T.Zero, available.Width - border.Left - border.Right), T.Max(T.Zero, available.Height - border.Top - border.Bottom));
+        }
 
         var padded = node is not Node.Dock and not Node.Split && (node.Padding != 0f || node.PadDown != 0f);
-        var padX = padded ? ctx.ToSurfaceX(node.Padding) : T.Zero;
-        var padY = padded ? ctx.ToSurfaceY(node.PadDown) : T.Zero;
+        var padX = padded ? Extent(ctx, node, node.Padding, Axis.Horizontal, ExtentKind.Padding) : T.Zero;
+        var padY = padded ? Extent(ctx, node, node.PadDown, Axis.Vertical, ExtentKind.Padding) : T.Zero;
         if (padded)
         {
             available = new Size<T>(T.Max(T.Zero, available.Width - padX - padX), T.Max(T.Zero, available.Height - padY - padY));
@@ -139,10 +231,29 @@ public static class Engine
             intrinsic = new Size<T>(intrinsic.Width + padX + padX, intrinsic.Height + padY + padY);
         }
 
+        if (border.Any)
+        {
+            intrinsic = new Size<T>(intrinsic.Width + border.Left + border.Right, intrinsic.Height + border.Top + border.Bottom);
+        }
+
+        // A scrolled stack whose controller draws a bar on the stack's axis measures the bar column too, less
+        // the trailing padding that already covers it: ArrangeStack reserves exactly that column from the
+        // rows' cross extent, so a measure without it arranged the widest row narrower than it measured.
+        // Always, not only on overflow: the measure cannot know the viewport's height.
+        if (node is Node.Stack { Scroll: { } barScroll } barStack && ScrollBarMeasured(barScroll, barStack.Axis))
+        {
+            var bar = T.CreateChecked(ScrollBarColumn(ctx));
+            var trailing = barStack.Axis == Axis.Vertical ? padX : padY;
+            var extra = T.Max(T.Zero, bar - trailing);
+            intrinsic = barStack.Axis == Axis.Vertical
+                ? new Size<T>(intrinsic.Width + extra, intrinsic.Height)
+                : new Size<T>(intrinsic.Width, intrinsic.Height + extra);
+        }
+
         // Explicit Fixed sizing on the node overrides the intrinsic extent on that axis;
         // Auto/Star intrinsics honour the Sizing's Min/Max clamps.
-        var w = node.Width.IsFixed ? ctx.ToSurfaceX(node.Width.Value) : Clamp(intrinsic.Width, node.Width, ctx, Axis.Horizontal);
-        var h = node.Height.IsFixed ? ctx.ToSurfaceY(node.Height.Value) : Clamp(intrinsic.Height, node.Height, ctx, Axis.Vertical);
+        var w = node.Width.IsFixed ? Extent(ctx, node, node.Width.Value, Axis.Horizontal, ExtentKind.Fixed) : Clamp(intrinsic.Width, node.Width, ctx, Axis.Horizontal);
+        var h = node.Height.IsFixed ? Extent(ctx, node, node.Height.Value, Axis.Vertical, ExtentKind.Fixed) : Clamp(intrinsic.Height, node.Height, ctx, Axis.Vertical);
         return new Size<T>(w, h);
     }
 
@@ -182,6 +293,11 @@ public static class Engine
     private static void ArrangeNode<T>(Node node, Rect<T> rect, IMeasureContext<T> ctx,
         ImmutableArray<ArrangedNode<T>>.Builder output, int depth) where T : INumber<T>
     {
+        if (TryNarrow(node, rect.Width, rect.Height, ctx, out var narrowForm))
+        {
+            node = narrowForm;
+        }
+
         output.Add(new ArrangedNode<T>(node, rect) { Depth = depth });
 
         if (node.OnArranged is { } arranged)
@@ -196,7 +312,21 @@ public static class Engine
             }
         }
 
-        var inner = Inset(rect, ctx.ToSurfaceX(node.Padding), ctx.ToSurfaceY(node.PadDown));
+        var arrangePadded = node.Padding != 0f || node.PadDown != 0f;
+        var inner = rect;
+        var arrangeBorder = BorderInsets(ctx, node);
+        if (arrangeBorder.Any)
+        {
+            inner = new Rect<T>(inner.X + arrangeBorder.Left, inner.Y + arrangeBorder.Top,
+                Max(T.Zero, inner.Width - arrangeBorder.Left - arrangeBorder.Right),
+                Max(T.Zero, inner.Height - arrangeBorder.Top - arrangeBorder.Bottom));
+        }
+
+        if (arrangePadded)
+        {
+            inner = Inset(inner, Extent(ctx, node, node.Padding, Axis.Horizontal, ExtentKind.Padding), Extent(ctx, node, node.PadDown, Axis.Vertical, ExtentKind.Padding));
+        }
+
         var childDepth = depth + 1;
         switch (node)
         {
@@ -275,8 +405,12 @@ public static class Engine
         // Never larger than the space it floats in, less its margins: a menu of long entries on a small window is cut to
         // the window, its text trimmed, rather than laid out past an edge the clamp below could not then bring it back from.
         size = new Size<T>(Min(size.Width, maxWidth), Min(size.Height, Max(T.Zero, inner.Height - two * margin)));
-        var along = ctx.ToSurface(anchored.OffsetAlong);
-        var across = ctx.ToSurface(anchored.OffsetAcross);
+        // With OffsetsPerAxis each offset maps on the axis it runs along, so a free child authored in design units lands
+        // where it should on a surface whose unit is not square (a terminal cell). Without it both stay on the axis-less
+        // ToSurface, as before, so an existing tree arranges unchanged.
+        var alongAxis = anchored.Side is DockSide.Left or DockSide.Right ? Axis.Vertical : Axis.Horizontal;
+        var along = anchored.OffsetsPerAxis ? ToSurfaceOn(ctx, anchored.OffsetAlong, alongAxis) : ctx.ToSurface(anchored.OffsetAlong);
+        var across = anchored.OffsetsPerAxis ? ToSurfaceOn(ctx, anchored.OffsetAcross, Axis.Vertical) : ctx.ToSurface(anchored.OffsetAcross);
 
         // A pinned side fixes one coordinate at the margin and keeps the offset on the other; free keeps
         // both. Left/Right pin X and run the offset down; Top/Bottom pin Y and run it across.
@@ -484,6 +618,19 @@ public static class Engine
         var gap = ToSurfaceOn(ctx, stack.Gap, axis);
         var scroll = stack.Scroll;
 
+        // From here `rect` is the stack's VIEWPORT: the arranged rect inside its border. The stroke is not
+        // scrolled content, so the clip, the scroll extent, the bar column and the rows all stay inside it;
+        // only the padding is counted as scrolled padding. Without a border it is the arranged rect itself.
+        var borderInset = BorderInsets(ctx, stack);
+        if (borderInset.Any)
+        {
+            rect = new Rect<T>(rect.X + borderInset.Left, rect.Y + borderInset.Top,
+                Max(T.Zero, rect.Width - borderInset.Left - borderInset.Right),
+                Max(T.Zero, rect.Height - borderInset.Top - borderInset.Bottom));
+        }
+
+        // The measure of such a stack includes this same bar column (MeasureUncached, 11.66), so the rows
+        // measured at the natural width are arranged at least that wide here.
         // A scrolled stack whose bar shows gives its children the controller's content area: the viewport
         // less the bar column (as the virtual list does), so a Star row or an end-aligned leaf ends left of
         // the bar rather than under it. The rows must be RESOLVED at that narrower cross extent, not only
@@ -536,12 +683,18 @@ public static class Engine
             includedCount = n;
             while (true)
             {
+                includedCount = ApplySeparators(children, included, includedCount);
+                if (includedCount == 0)
+                {
+                    return; // only separators were left
+                }
+
                 ResolveStackMains(children, included, includedCount, axis, layoutMain, gap, availSize, ctx, mains, measured);
 
                 var anyCollapsed = false;
                 for (var i = 0; i < n; i++)
                 {
-                    if (included[i] && children[i].CollapseThreshold > 0f
+                    if (included[i] && !children[i].Separator && children[i].CollapseThreshold > 0f
                         && mains[i] < ToSurfaceOn(ctx, children[i].CollapseThreshold, axis))
                     {
                         included[i] = false;
@@ -588,7 +741,14 @@ public static class Engine
             // end, the arrange slid the rows a padding further down than the clip, and the last half-row
             // of a padded list could never be scrolled into view.
             padStart = axis == Axis.Vertical ? inner.Y - rect.Y : inner.X - rect.X;
-            var total = rows + padStart + padStart;
+            // Unbordered, the end padding is the start padding as it always was (a degenerate stack smaller
+            // than twice its padding clamps `inner`, which would make the end shorter).
+            var padEndMain = !borderInset.Any
+                ? padStart
+                : axis == Axis.Vertical
+                    ? (rect.Y + rect.Height) - (inner.Y + inner.Height)
+                    : (rect.X + rect.Width) - (inner.X + inner.Width);
+            var total = rows + padStart + padEndMain;
 
             // An atom is a row where the list says so (AtomDesignUnits) and one surface unit otherwise.
             atom = scroll.AtomDesignUnits > 0f
@@ -603,11 +763,20 @@ public static class Engine
                 offsetOnEntry = scroll.Offset;
             }
 
+            // Content the viewport holds is counted as the viewport's own atoms. The controller counts what it
+            // shows rounded DOWN and the content rounded UP, so rows that are not whole surface units, given
+            // exactly the room they take, came out an atom over what shows: an offset of one, and a bar drawn
+            // beside a list with nothing to scroll.
+            var contentAtoms = float.CreateChecked(total) / atom;
+            var viewportAtoms = float.CreateChecked(axis == Axis.Vertical ? rect.Height : rect.Width) / atom;
+            var totalAtoms = contentAtoms <= viewportAtoms + ScrollFitEpsilon
+                ? (int)MathF.Floor(viewportAtoms + ScrollFitEpsilon)
+                : (int)MathF.Ceiling(contentAtoms);
             scroll.SetExtent(
                 new RectF32(float.CreateChecked(rect.X), float.CreateChecked(rect.Y),
                     float.CreateChecked(rect.Width), float.CreateChecked(rect.Height)),
                 atomExtentPx: atom,
-                totalAtoms: (int)MathF.Ceiling(float.CreateChecked(total) / atom),
+                totalAtoms: totalAtoms,
                 new DesignScale(float.CreateChecked(ctx.ToSurfaceX(1f)), float.CreateChecked(ctx.ToSurfaceY(1f))));
 
             if (reserve > T.Zero)
@@ -705,7 +874,7 @@ public static class Engine
             var crossSizing = CrossSizing(axis, children[i]);
             var cross = crossSizing.Kind switch
             {
-                SizeKind.Fixed => ToSurfaceOn(ctx, crossSizing.Value, CrossAxis(axis)),
+                SizeKind.Fixed => Extent(ctx, children[i], crossSizing.Value, CrossAxis(axis), ExtentKind.Fixed),
                 SizeKind.Star when !crossSizing.UpToContent => crossAvail,     // stretch to fill cross axis
                 // Auto, and a content-capped Star: its content at the main extent it was given, never more than the
                 // axis holds. Measured at the stack's whole main, a wrapping text asked for fewer lines than it takes.
@@ -739,6 +908,65 @@ public static class Engine
 
             cursor += mains[i] + gap;
         }
+    }
+
+    /// <summary>
+    /// Decides which <see cref="Node.Separator"/> children are drawn, given which of the others survived the
+    /// collapse. A separator is kept only between two surviving non-separators, and only one of a run, so a
+    /// dropped column takes ONE gap with it (and the first or last column's single neighbour gap), as a stack's
+    /// own <c>Gap</c> does. Non-separator flags are untouched. Returns the number of included children.
+    /// </summary>
+    private static int ApplySeparators(ImmutableArray<Node> children, bool[] included, int includedCount)
+    {
+        var any = false;
+        for (var i = 0; i < children.Length; i++)
+        {
+            if (children[i].Separator)
+            {
+                any = true;
+                break;
+            }
+        }
+
+        if (!any)
+        {
+            return includedCount;
+        }
+
+        var lastReal = -1;
+        for (var i = children.Length - 1; i >= 0; i--)
+        {
+            if (!children[i].Separator && included[i])
+            {
+                lastReal = i;
+                break;
+            }
+        }
+
+        var seenReal = false;
+        var previousWasSeparator = false;
+        var count = 0;
+        for (var i = 0; i < children.Length; i++)
+        {
+            if (children[i].Separator)
+            {
+                var keep = seenReal && i < lastReal && !previousWasSeparator;
+                included[i] = keep;
+                previousWasSeparator = keep || previousWasSeparator;
+            }
+            else if (included[i])
+            {
+                seenReal = true;
+                previousWasSeparator = false;
+            }
+
+            if (included[i])
+            {
+                count++;
+            }
+        }
+
+        return count;
     }
 
     /// <summary>
@@ -796,7 +1024,7 @@ public static class Engine
             T size;
             if (sizing.IsFixed)
             {
-                size = ToSurfaceOn(ctx, sizing.Value, axis);
+                size = Extent(ctx, children[i], sizing.Value, axis, ExtentKind.Fixed);
             }
             else
             {
@@ -935,8 +1163,16 @@ public static class Engine
     /// <see cref="DistributeByWeight"/> split; when any star carries a Min/Max clamp, violators freeze at
     /// their bound and the remaining space redistributes among the rest -- so a capped star's surplus flows
     /// to its siblings, and a min-clamped star holds its floor even when that overflows the container
-    /// (visible overflow beats invisible zero-extent content).
+    /// (visible overflow beats invisible zero-extent content). When every star has frozen and space is still
+    /// left, it goes to the stars frozen at their floor, up to their Max: they were frozen in a pass that also
+    /// capped their siblings, and what the caps gave back would otherwise reach no one.
     /// </summary>
+    /// <remarks>
+    /// Not CSS flexbox's rule (freeze only the winning kind per pass), on purpose: that one, in 11.58.6221, let a
+    /// floor freeze first and split what was left among capped stars below their caps, so a table's optional
+    /// columns (stars capped at their width, collapsing below it) dropped where they used to keep their width.
+    /// Freezing every violator keeps a capped star at its cap; only the space nobody was given moves.
+    /// </remarks>
     private static void DistributeStars<T>(T leftover, ImmutableArray<Node> children, Axis axis,
         List<int> starIndices, List<float> starWeights, IMeasureContext<T> ctx, T[] mains) where T : INumber<T>
     {
@@ -965,6 +1201,7 @@ public static class Engine
         // Iterative freeze: distribute over the active subset, pin every clamp violator at its bound,
         // then redistribute what is left among the rest. Each pass freezes >= 1 star, so <= count passes.
         var frozen = new bool[count];
+        var atFloor = new bool[count];
         var remaining = leftover;
         var activeSlots = new List<int>(count);
         var activeWeights = new List<float>(count);
@@ -983,6 +1220,7 @@ public static class Engine
 
             if (activeSlots.Count == 0)
             {
+                GiveLeftoverToFloors(remaining, children, axis, starIndices, starWeights, atFloor, ctx, mains);
                 return;
             }
 
@@ -996,6 +1234,7 @@ public static class Engine
                 {
                     mains[starIndices[s]] = clamped;
                     frozen[s] = true;
+                    atFloor[s] = clamped > shares[a];
                     remaining = Max(T.Zero, remaining - clamped);
                     anyFrozen = true;
                 }
@@ -1013,6 +1252,52 @@ public static class Engine
         }
     }
 
+    // Every star has frozen and space is left: what the caps gave back goes to the stars frozen at their floor, by
+    // weight, each held to its Max (a star at its Max takes no more, and what it leaves goes round the others).
+    private static void GiveLeftoverToFloors<T>(T remaining, ImmutableArray<Node> children, Axis axis,
+        List<int> starIndices, List<float> starWeights, bool[] atFloor, IMeasureContext<T> ctx, T[] mains) where T : INumber<T>
+    {
+        var growing = new List<int>();
+        for (var s = 0; s < atFloor.Length; s++)
+        {
+            if (atFloor[s])
+            {
+                growing.Add(s);
+            }
+        }
+
+        while (remaining > T.Zero && growing.Count > 0)
+        {
+            var weights = new List<float>(growing.Count);
+            foreach (var s in growing)
+            {
+                weights.Add(starWeights[s]);
+            }
+
+            var shares = DistributeByWeight(remaining, weights);
+            var capped = new List<int>();
+            for (var g = 0; g < growing.Count; g++)
+            {
+                var index = starIndices[growing[g]];
+                var grown = mains[index] + shares[g];
+                var held = Clamp(grown, MainSizing(axis, children[index]), ctx, axis);
+                remaining -= held - mains[index];
+                mains[index] = held;
+                if (held < grown)
+                {
+                    capped.Add(growing[g]);
+                }
+            }
+
+            if (capped.Count == 0)
+            {
+                return;
+            }
+
+            growing.RemoveAll(capped.Contains);
+        }
+    }
+
     private static void ArrangeDock<T>(Node.Dock dock, Rect<T> inner, IMeasureContext<T> ctx,
         ImmutableArray<ArrangedNode<T>>.Builder output, int depth) where T : INumber<T>
     {
@@ -1027,7 +1312,7 @@ public static class Engine
             T size;
             if (dc.Size.IsFixed)
             {
-                size = ToSurfaceOn(ctx, dc.Size.Value, stripAxis);
+                size = Extent(ctx, dc.Child, dc.Size.Value, stripAxis, ExtentKind.Fixed);
             }
             else
             {
@@ -1098,7 +1383,8 @@ public static class Engine
     {
         var children = wrap.Children;
         var n = children.Length;
-        if (n == 0)
+        var trailing = wrap.FirstLineTrailing;
+        if (n == 0 && trailing is null)
         {
             return;
         }
@@ -1111,16 +1397,37 @@ public static class Engine
         var availSize = new Size<T>(inner.Width, inner.Height);
         var mainAvail = MainOf(axis, availSize);
         // The first line alone stops short, so a run can flow BENEATH a corner item and still use the
-        // whole extent once it has. Clamped at zero: a reserve wider than the container would otherwise
-        // make the first line's limit negative and push every child onto line two.
-        var firstLineAvail = Max(T.Zero, mainAvail - ToSurfaceOn(ctx, wrap.FirstLineReserve, axis));
+        // whole extent once it has. The measured trailing node takes its main extent and the gap before
+        // it off the first line's item room. That room is clamped at zero: a reserve or trailing node wider
+        // than the container would otherwise make the limit negative and push every child onto line two.
+        var (trailMain, trailCross) = trailing is null
+            ? (T.Zero, T.Zero)
+            : ResolveWrapChild(trailing, axis, availSize, ctx);
+        var firstLineAvail = Max(T.Zero, mainAvail - ToSurfaceOn(ctx, wrap.FirstLineReserve, axis)
+            - (trailing is null ? T.Zero : trailMain + gap));
 
         // Resolve every child's main + natural cross extent up front (see ResolveWrapChild).
         var childMains = new T[n];
         var childCrosses = new T[n];
+        var clamped = new Node?[n];
         for (var i = 0; i < n; i++)
         {
             (childMains[i], childCrosses[i]) = ResolveWrapChild(children[i], axis, availSize, ctx);
+        }
+
+        // Flush at the inner rect's main end, on the line's cross extent (a Star cross stretches like an item).
+        // A node wider than the container starts at the main origin and overflows at the end, never before it.
+        void PlaceTrailing(T lineCrossExtent, T crossPos)
+        {
+            var t = trailing!;
+            var tCrossSizing = CrossSizing(axis, t);
+            var tc = tCrossSizing.IsStar ? Clamp(lineCrossExtent, tCrossSizing, ctx, CrossAxis(axis)) : trailCross;
+            var mainOrigin0 = axis == Axis.Horizontal ? inner.X : inner.Y;
+            var mainPos = Max(mainOrigin0, mainOrigin0 + mainAvail - trailMain);
+            var r = axis == Axis.Horizontal
+                ? new Rect<T>(mainPos, crossPos, trailMain, tc)
+                : new Rect<T>(crossPos, mainPos, tc, trailMain);
+            ArrangeNode(t, r, ctx, output, depth);
         }
 
         // Flow line by line: a child that would overflow a non-empty line starts the next one (a child
@@ -1128,19 +1435,52 @@ public static class Engine
         var lineStart = 0;
         var lineIndex = 0;
         var crossCursor = axis == Axis.Horizontal ? inner.Y : inner.X;
+        // Narrow rule: when the first item does not fit beside the trailing node, line 1 holds only the
+        // trailing node and the items start on line 2. (Without a trailing node the first child always
+        // takes line 1, however wide it is.)
+        if (trailing is not null && (n == 0 || childMains[0] > firstLineAvail))
+        {
+            PlaceTrailing(trailCross, crossCursor);
+            crossCursor += trailCross + lineGap;
+            lineIndex = 1;
+            if (wrap.MaxLines > 0 && lineIndex >= wrap.MaxLines)
+            {
+                if (n > 0)
+                {
+                    output[wrapIndex] = output[wrapIndex] with { Truncated = true };
+                }
+
+                return;
+            }
+        }
+
         while (lineStart < n)
         {
             var lineEnd = lineStart; // exclusive
             var used = T.Zero;
-            var lineCross = T.Zero;
+            var lineCross = lineIndex == 0 ? trailCross : T.Zero;
             var lineAvail = lineIndex == 0 ? firstLineAvail : mainAvail;
-            while (lineEnd < n)
+            // A leaf cut to the line's room ends its line: nothing is drawn after an ellipsis.
+            var lineFull = false;
+            while (lineEnd < n && !lineFull)
             {
                 // A line never opens with separation: neither the container's gap nor the child's own
                 // leading gap applies to the child that starts one.
                 var lead = lineEnd == lineStart
                     ? T.Zero
                     : gap + ToSurfaceOn(ctx, children[lineEnd].LeadingGap, axis);
+                if (lineEnd == lineStart && wrap.Ellipsis && childMains[lineEnd] > lineAvail
+                    && children[lineEnd] is Node.Leaf { Content: Content.Text wide } wideLeaf)
+                {
+                    // A text leaf wider than the whole line it opens ends in an ellipsis at the line's room.
+                    var (wideText, wideMain) = EllipsizeWrapText(wide, childMains[lineEnd], lineAvail, axis, ctx);
+                    clamped[lineEnd] = wideLeaf with { Content = wide with { Value = wideText, WidthSample = null } };
+                    childMains[lineEnd] = wideMain;
+                    // Always full, though MeasureWrap tests cut != main: when the cut changed nothing the leaf is still
+                    // wider than the line, so used + extra > lineAvail already sends the next child to a new line.
+                    lineFull = true;
+                }
+
                 var extra = lead + childMains[lineEnd];
                 if (lineEnd > lineStart && used + extra > lineAvail)
                 {
@@ -1166,9 +1506,9 @@ public static class Engine
                 // A Star cross stretches to the line's extent; everything else keeps its natural cross.
                 var crossSizing = CrossSizing(axis, children[i]);
                 var cross = crossSizing.IsStar ? Clamp(lineCross, crossSizing, ctx, CrossAxis(axis)) : childCrosses[i];
-                var child = children[i];
+                var child = clamped[i] ?? children[i];
                 var childMain = childMains[i];
-                if (cutHere && wrap.Ellipsis && i == lineEnd - 1 && child is Node.Leaf { Content: Content.Text text } leaf)
+                if (clamped[i] is null && cutHere && wrap.Ellipsis && i == lineEnd - 1 && child is Node.Leaf { Content: Content.Text text } leaf)
                 {
                     var room = mainOrigin + lineAvail - mainCursor;
                     var (cutText, cutMain) = EllipsizeWrapText(text, childMain, room, axis, ctx);
@@ -1185,6 +1525,11 @@ public static class Engine
                 {
                     mainCursor += ToSurfaceOn(ctx, children[i + 1].LeadingGap, axis);
                 }
+            }
+
+            if (lineIndex == 0 && trailing is not null)
+            {
+                PlaceTrailing(lineCross, crossCursor);
             }
 
             crossCursor += lineCross + lineGap;
@@ -1291,7 +1636,7 @@ public static class Engine
         // One line is what the context says a line is tall; every line of the box is that tall.
         var line = ctx.MeasureText("Ag".AsSpan(), fontSize).Height;
         var lineHeight = float.CreateChecked(line);
-        var width = node.Width.IsFixed ? ctx.ToSurfaceX(node.Width.Value) : available.Width;
+        var width = node.Width.IsFixed ? Extent(ctx, node, node.Width.Value, Axis.Horizontal, ExtentKind.Fixed) : available.Width;
         var wrapWidth = float.CreateChecked(width - insetX);
 
         var text = state.Text.Length > 0 ? state.Text : state.Placeholder;
@@ -1407,7 +1752,7 @@ public static class Engine
             switch (size.Kind)
             {
                 case SizeKind.Fixed:
-                    widths[col] = Clamp(ToSurfaceOn(ctx, size.Value, Axis.Horizontal), size, ctx, Axis.Horizontal);
+                    widths[col] = Clamp(ColumnExtent(ctx, grid, col, columns, size.Value), size, ctx, Axis.Horizontal);
                     spent += widths[col];
                     break;
                 case SizeKind.Auto:
@@ -1533,21 +1878,31 @@ public static class Engine
         var measured = Measure(child, available, ctx);
         var mainSizing = MainSizing(axis, child);
         var main = mainSizing.IsFixed
-            ? ToSurfaceOn(ctx, mainSizing.Value, axis)
+            ? Extent(ctx, child, mainSizing.Value, axis, ExtentKind.Fixed)
             : Clamp(MainOf(axis, measured), mainSizing, ctx, axis);
         var crossSizing = CrossSizing(axis, child);
         var cross = crossSizing.IsFixed
-            ? ToSurfaceOn(ctx, crossSizing.Value, CrossAxis(axis))
+            ? Extent(ctx, child, crossSizing.Value, CrossAxis(axis), ExtentKind.Fixed)
             : Clamp(CrossOf(axis, measured), crossSizing, ctx, CrossAxis(axis));
         return (main, cross);
     }
+
+    /// <summary>The main extent a wrap child takes when it opens a line of room <paramref name="lineAvail"/>: in
+    /// an Ellipsis wrap a text leaf wider than that is cut to it (see <see cref="Node.Wrap.Ellipsis"/>), the
+    /// same cut <see cref="ArrangeWrap"/> lays out.</summary>
+    private static T ClampWrapMain<T>(Node.Wrap wrap, Node child, T main, T lineAvail, Axis axis,
+        IMeasureContext<T> ctx) where T : INumber<T>
+        => wrap.Ellipsis && main > lineAvail && child is Node.Leaf { Content: Content.Text text }
+            ? EllipsizeWrapText(text, main, lineAvail, axis, ctx).Main
+            : main;
 
     private static Size<T> MeasureWrap<T>(Node.Wrap wrap, Size<T> available, IMeasureContext<T> ctx)
         where T : INumber<T>
     {
         var children = wrap.Children;
         var n = children.Length;
-        if (n == 0)
+        var trailing = wrap.FirstLineTrailing;
+        if (n == 0 && trailing is null)
         {
             return Size<T>.Zero;
         }
@@ -1556,7 +1911,18 @@ public static class Engine
         var gap = ToSurfaceOn(ctx, wrap.Gap, axis);
         var lineGap = ToSurfaceOn(ctx, wrap.LineGap, CrossAxis(axis));
         var mainAvail = MainOf(axis, available);
-        var firstLineAvail = Max(T.Zero, mainAvail - ToSurfaceOn(ctx, wrap.FirstLineReserve, axis));
+        var (trailMain, trailCross) = trailing is null
+            ? (T.Zero, T.Zero)
+            : ResolveWrapChild(trailing, axis, available, ctx);
+        var firstLineAvail = Max(T.Zero, mainAvail - ToSurfaceOn(ctx, wrap.FirstLineReserve, axis)
+            - (trailing is null ? T.Zero : trailMain + gap));
+        if (n == 0)
+        {
+            return Compose(axis, trailMain, trailCross);
+        }
+
+        // Line 1's main: its items, then the gap and the trailing node when there is one.
+        T Line1Main(T items, int count) => trailing is null ? items : items + (count > 0 ? gap : T.Zero) + trailMain;
 
         // Same line flow as ArrangeWrap: intrinsic main = the longest line, intrinsic cross = the sum of
         // line extents -- so an Auto-height wrap grows taller as its container narrows. The first line's
@@ -1568,17 +1934,41 @@ public static class Engine
         var lineCross = T.Zero;
         var itemsInLine = 0;
         var lines = 1;
+        lineCross = trailCross;
+        // Narrow rule, as in ArrangeWrap: line 1 holds only the trailing node, items start on line 2.
+        var skipFirst = trailing is not null
+            && ResolveWrapChild(children[0], axis, available, ctx).Main > firstLineAvail;
+        if (skipFirst)
+        {
+            maxLineMain = trailMain;
+            totalCross = trailCross;
+            lineCross = T.Zero;
+            lines = 2;
+        }
+
+        // A leaf cut to its line's room ends that line, as in ArrangeWrap: the next child starts a new one.
+        var lineFull = false;
         for (var i = 0; i < n; i++)
         {
             var (main, cross) = ResolveWrapChild(children[i], axis, available, ctx);
+            if (itemsInLine == 0)
+            {
+                var cut = ClampWrapMain(wrap, children[i], main, lines == 1 ? firstLineAvail : mainAvail, axis, ctx);
+                lineFull = cut != main;
+                main = cut;
+            }
+
             var extra = itemsInLine == 0
                 ? main
                 : gap + ToSurfaceOn(ctx, children[i].LeadingGap, axis) + main;
-            if (itemsInLine > 0 && used + extra > (lines == 1 ? firstLineAvail : mainAvail))
+            if (itemsInLine > 0 && (lineFull || used + extra > (lines == 1 ? firstLineAvail : mainAvail)))
             {
-                maxLineMain = Max(maxLineMain, used);
+                maxLineMain = Max(maxLineMain, lines == 1 ? Line1Main(used, itemsInLine) : used);
                 totalCross += lineCross;
                 lines++;
+                var cutNext = ClampWrapMain(wrap, children[i], main, mainAvail, axis, ctx);
+                lineFull = cutNext != main;
+                main = cutNext;
                 used = main;
                 lineCross = cross;
                 itemsInLine = 1;
@@ -1590,27 +1980,38 @@ public static class Engine
             itemsInLine++;
         }
 
-        maxLineMain = Max(maxLineMain, used);
+        maxLineMain = Max(maxLineMain, lines == 1 ? Line1Main(used, itemsInLine) : used);
         // A capped flow reports the box it will actually paint, not the one it would need uncapped --
         // otherwise the caller reserves a band for rows the arrange then drops.
         if (wrap.MaxLines > 0 && lines > wrap.MaxLines)
         {
             lines = wrap.MaxLines;
-            totalCross = T.Zero;
-            var counted = 0;
-            var lineTop = T.Zero;
+            totalCross = skipFirst ? trailCross : T.Zero;
+            var counted = skipFirst ? 1 : 0;
+            var lineTop = skipFirst ? T.Zero : trailCross;
             var inLine = 0;
             var usedInLine = T.Zero;
+            var full = false;
             for (var i = 0; i < n && counted < lines; i++)
             {
                 var (main, cross) = ResolveWrapChild(children[i], axis, available, ctx);
+                if (inLine == 0)
+                {
+                    var cut = ClampWrapMain(wrap, children[i], main, counted == 0 ? firstLineAvail : mainAvail, axis, ctx);
+                    full = cut != main;
+                    main = cut;
+                }
+
                 var extra = inLine == 0
                     ? main
                     : gap + ToSurfaceOn(ctx, children[i].LeadingGap, axis) + main;
-                if (inLine > 0 && usedInLine + extra > (counted == 0 ? firstLineAvail : mainAvail))
+                if (inLine > 0 && (full || usedInLine + extra > (counted == 0 ? firstLineAvail : mainAvail)))
                 {
                     totalCross += lineTop;
                     counted++;
+                    var cutNext = ClampWrapMain(wrap, children[i], main, mainAvail, axis, ctx);
+                    full = cutNext != main;
+                    main = cutNext;
                     usedInLine = main;
                     lineTop = cross;
                     inLine = 1;
@@ -1713,6 +2114,31 @@ public static class Engine
     private static Size<T> Union<T>(Size<T> a, Size<T> b) where T : INumber<T>
         => new(Max(a.Width, b.Width), Max(a.Height, b.Height));
 
+    /// <summary>The surface extent reserved on each side by a node's <see cref="Node.BorderStyle"/>, through
+    /// <see cref="IMeasureContext{T}.MapExtent"/> as <see cref="ExtentKind.Border"/>. All zero without a border.</summary>
+    internal readonly record struct BorderInset<T>(T Left, T Right, T Top, T Bottom) where T : INumber<T>
+    {
+        public bool Any => Left != T.Zero || Right != T.Zero || Top != T.Zero || Bottom != T.Zero;
+    }
+
+    internal static BorderInset<T> BorderInsets<T>(IMeasureContext<T> ctx, Node node) where T : INumber<T>
+    {
+        if (node.BorderStyle is not { Width: > 0f } style || style.Sides == BorderSides.None)
+        {
+            return default;
+        }
+
+        var x = style.Sides.HasFlag(BorderSides.Left) || style.Sides.HasFlag(BorderSides.Right)
+            ? Extent(ctx, node, style.Width, Axis.Horizontal, ExtentKind.Border) : T.Zero;
+        var y = style.Sides.HasFlag(BorderSides.Top) || style.Sides.HasFlag(BorderSides.Bottom)
+            ? Extent(ctx, node, style.Width, Axis.Vertical, ExtentKind.Border) : T.Zero;
+        return new BorderInset<T>(
+            style.Sides.HasFlag(BorderSides.Left) ? x : T.Zero,
+            style.Sides.HasFlag(BorderSides.Right) ? x : T.Zero,
+            style.Sides.HasFlag(BorderSides.Top) ? y : T.Zero,
+            style.Sides.HasFlag(BorderSides.Bottom) ? y : T.Zero);
+    }
+
     private static Rect<T> Inset<T>(Rect<T> r, T padX, T padY) where T : INumber<T>
         => padX == T.Zero && padY == T.Zero
             ? r
@@ -1732,14 +2158,61 @@ public static class Engine
 
     /// <summary>The extent a node's children are measured within: its Fixed extent, else <paramref name="available"/>
     /// held to the Max when it has one.</summary>
-    private static T NarrowTo<T>(T available, Sizing sizing, IMeasureContext<T> ctx, Axis axis) where T : INumber<T>
+    private static T NarrowTo<T>(T available, Node node, Sizing sizing, IMeasureContext<T> ctx, Axis axis) where T : INumber<T>
     {
         if (sizing.IsFixed)
         {
-            return ToSurfaceOn(ctx, sizing.Value, axis);
+            return Extent(ctx, node, sizing.Value, axis, ExtentKind.Fixed);
         }
 
         return sizing.Max > 0f ? Min(available, ToSurfaceOn(ctx, sizing.Max, axis)) : available;
+    }
+
+    /// <summary>One Fixed extent or padding of <paramref name="node"/>, through <see cref="IMeasureContext{T}.MapExtent"/>.
+    /// Measure and arrange both come here, so they cannot disagree. The node's facts are cached per node reference,
+    /// except under a text editor, whose line count follows its state (<see cref="ExtentFacts.Of"/>).</summary>
+    private static T Extent<T>(IMeasureContext<T> ctx, Node node, float value, Axis axis, ExtentKind kind)
+        where T : INumber<T>
+    {
+        var facts = ExtentFacts.Of(node);
+        return ctx.MapExtent(new ExtentRequest
+        {
+            Value = value,
+            Axis = axis,
+            Kind = kind,
+            HasContent = facts.HasContent,
+            ContentLines = facts.Lines,
+            HasFill = facts.HasFill,
+        });
+    }
+
+    /// <summary>A Fixed grid column's width: the request describes what the column's cells hold together.</summary>
+    private static T ColumnExtent<T>(IMeasureContext<T> ctx, Node.Grid grid, int col, int columns, float value)
+        where T : INumber<T>
+    {
+        var has = false;
+        var lines = 0;
+        var fill = false;
+        for (var i = col; i < grid.Cells.Length; i += columns)
+        {
+            var f = ExtentFacts.Of(grid.Cells[i]);
+            fill |= f.HasFill;
+            if (f.HasContent)
+            {
+                has = true;
+                lines = Math.Max(lines, f.Lines);
+            }
+        }
+
+        return ctx.MapExtent(new ExtentRequest
+        {
+            Value = value,
+            Axis = Axis.Horizontal,
+            Kind = ExtentKind.Fixed,
+            HasContent = has,
+            ContentLines = lines,
+            HasFill = fill,
+        });
     }
 
     private static Size<T> MeasureAnchored<T>(Node.Anchored anchored, Size<T> available, IMeasureContext<T> ctx)

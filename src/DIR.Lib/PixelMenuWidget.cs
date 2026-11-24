@@ -22,6 +22,18 @@ public class PixelMenuWidget<TSurface>(Renderer<TSurface> renderer, string fontP
     /// <summary>True after the user has confirmed a selection.</summary>
     public bool IsConfirmed => _model.IsConfirmed;
 
+    /// <summary>Host action for the panel's Back control (top-left); null means no control. See <see cref="MenuModel.Back"/>.</summary>
+    public Action? Back { get => _model.Back; set => _model.Back = value; }
+
+    /// <summary>Host action for the panel's close control (top-right); null means no control. See <see cref="MenuModel.Close"/>.</summary>
+    public Action? Close { get => _model.Close; set => _model.Close = value; }
+
+    /// <summary>Whether the card shows the key list (F1). See <see cref="MenuModel.ShowingHelp"/>.</summary>
+    public bool ShowingHelp => _model.ShowingHelp;
+
+    /// <summary>Keys the host handles itself, listed in the key list after the menu's own. See <see cref="MenuModel.HostHelp"/>.</summary>
+    public System.Collections.Immutable.ImmutableArray<MenuHelpLine> HostHelp { get => _model.HostHelp; set => _model.HostHelp = value; }
+
     /// <summary>
     /// Resets the menu with new content and clears the confirmed state.
     /// <paramref name="selected"/> is clamped to the valid item range.
@@ -51,6 +63,24 @@ public class PixelMenuWidget<TSurface>(Renderer<TSurface> renderer, string fontP
         RenderLayout(MenuLayout.BuildTree(_model, Colors, fontSize), bounds, fontPath);
     }
 
+    /// <summary>Look and sizing of <see cref="RenderPanel"/>.</summary>
+    public MenuPanelStyle PanelStyle { get; init; } = new();
+
+    /// <summary>
+    /// Renders the menu as a modal panel (<see cref="MenuLayout.BuildPanel"/>): a scrim over the whole surface and a
+    /// content-sized card centred on it. Same model, rows and regions as <see cref="Render"/>, which is unchanged.
+    /// The surface size is passed to the builder in design units, and the card's text is measured through the
+    /// widget's own measure context.
+    /// </summary>
+    public void RenderPanel()
+    {
+        BeginFrame();
+        var ctx = MeasureContext(fontPath);
+        var unit = ctx.ToSurface(1f);
+        var tree = MenuLayout.BuildPanel(_model, Colors, PanelStyle, ctx, Renderer.Width / unit, Renderer.Height / unit);
+        RenderLayout(tree, new RectF32(0, 0, Renderer.Width, Renderer.Height), ctx);
+    }
+
     /// <summary>Widest rendered line at <paramref name="fontSize"/>: the title (1.6x, per
     /// <see cref="MenuLayout"/>), the prompt, and each item prefixed with the selection marker (the
     /// widest case). Text width scales linearly with font size, so the caller scales by a ratio.</summary>
@@ -66,7 +96,11 @@ public class PixelMenuWidget<TSurface>(Renderer<TSurface> renderer, string fontP
 
     /// <inheritdoc/>
     /// <remarks>
-    /// Keys only. A press on a row reaches <see cref="MenuLayout.BuildTree"/>'s own <c>.Clickable</c>
+    /// A host needs no <c>Unhandled</c>: list the widget on <see cref="InputRouter"/> and Up, Down, Enter and
+    /// the digits reach <see cref="MenuModel"/> through the shortcuts <see cref="MenuLayout.BuildTree"/>
+    /// declares (also inside a modal Top). The router consumes the key there, so a host that still wires
+    /// <c>Unhandled = menu.HandleInput</c> steps once per key; this method stays for a host that calls it
+    /// directly with no router. Keys only. A press on a row reaches <see cref="MenuLayout.BuildTree"/>'s own <c>.Clickable</c>
     /// through <see cref="InputRouter"/>, which walks the regions this widget registered while painting --
     /// so a host lists the widget on the router and writes no press arm. Until 10.0 this branch hit-tested
     /// and dispatched for itself, which is a second dispatcher beside the router's for the same rects.
@@ -75,7 +109,8 @@ public class PixelMenuWidget<TSurface>(Renderer<TSurface> renderer, string fontP
     {
         return evt switch
         {
-            InputEvent.KeyDown(var key, _) => _model.HandleKey(key),
+            // The modifiers go through: Shift+Tab moves focus back (MenuModel.Focus).
+            InputEvent.KeyDown(var key, var mods) => _model.HandleKey(key, mods),
             _ => false,
         };
     }

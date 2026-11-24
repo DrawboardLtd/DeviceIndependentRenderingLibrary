@@ -32,6 +32,22 @@ public sealed record UiPalette
     private readonly RGBAColor32? _focus;
     private readonly RGBAColor32? _selectionText;
     private readonly RGBAColor32? _success;
+    private readonly RGBAColor32? _raisedBg;
+    private readonly RGBAColor32? _edge;
+    private readonly RGBAColor32? _controlFill;
+    private readonly RGBAColor32? _controlFillHover;
+    private readonly RGBAColor32? _controlFillPressed;
+    private readonly RGBAColor32? _controlEdge;
+
+    // Steps (fractions towards white on a dark palette, black on a light one) of the neutral control roles.
+    private const float ControlFillStep = 0.06f;
+    private const float ControlHoverStep = 0.06f;
+    private const float ControlEdgeStep = 0.08f;
+    private const float ControlEdgeMinContrast = 3f;
+    private const int ControlEdgeMaxSteps = 12;
+
+    private RGBAColor32 StepFrom(RGBAColor32 from, float fraction)
+        => RGBAColor32.Mix(from, IsDark ? new RGBAColor32(0xff, 0xff, 0xff, 0xff) : new RGBAColor32(0, 0, 0, 0xff), fraction);
 
     // ---- surfaces, back to front -------------------------------------------------------------
 
@@ -44,7 +60,69 @@ public sealed record UiPalette
     /// <summary>A header strip, tab bar or status bar.</summary>
     public required RGBAColor32 HeaderBg { get; init; }
 
+    /// <summary>
+    /// A surface raised above <see cref="PanelBg"/>: a toast, a popover, a menu card. Defaults to
+    /// <see cref="PanelBg"/>, so a palette written before this role existed compiles and looks as it did.
+    /// </summary>
+    public RGBAColor32 RaisedBg
+    {
+        get => _raisedBg ?? PanelBg;
+        init => _raisedBg = value;
+    }
+
+    // ---- neutral controls --------------------------------------------------------------------
+
+    /// <summary>
+    /// Resting fill of a standard button. Defaults to one step off <see cref="PanelBg"/>: lighter when <see cref="IsDark"/>,
+    /// darker when not. Never falls back to <see cref="Accent"/>.
+    /// </summary>
+    public RGBAColor32 ControlFill
+    {
+        get => _controlFill ?? StepFrom(PanelBg, ControlFillStep);
+        init => _controlFill = value;
+    }
+
+    /// <summary>Fill under the pointer. Defaults to one step further from <see cref="ControlFill"/> in the same direction.</summary>
+    public RGBAColor32 ControlFillHover
+    {
+        get => _controlFillHover ?? StepFrom(ControlFill, ControlHoverStep);
+        init => _controlFillHover = value;
+    }
+
+    /// <summary>Fill while pressed. Defaults to one step further from <see cref="ControlFillHover"/> in the same direction.</summary>
+    public RGBAColor32 ControlFillPressed
+    {
+        get => _controlFillPressed ?? StepFrom(ControlFillHover, ControlHoverStep);
+        init => _controlFillPressed = value;
+    }
+
+    /// <summary>
+    /// Edge of a standard button. Defaults to <see cref="ControlFill"/> stepped further in the same direction until it
+    /// reaches 3:1 against <see cref="PanelBg"/> (at most 12 steps, then the last value; no loop waits on anything).
+    /// </summary>
+    public RGBAColor32 ControlEdge
+    {
+        get
+        {
+            if (_controlEdge is { } e) return e;
+            var c = ControlFill;
+            for (int i = 0; i < ControlEdgeMaxSteps && RGBAColor32.ContrastRatio(c, PanelBg) < ControlEdgeMinContrast; i++)
+            {
+                c = StepFrom(c, ControlEdgeStep);
+            }
+            return c;
+        }
+        init => _controlEdge = value;
+    }
+
     // ---- rules -------------------------------------------------------------------------------
+
+    /// <summary>The edge drawn round a raised surface. Defaults to <see cref="Separator"/>.</summary>
+    public RGBAColor32 Edge
+    {
+        get => _edge ?? Separator;
+        init => _edge = value;
+    }
 
     /// <summary>Hairline divider between regions.</summary>
     public required RGBAColor32 Separator { get; init; }
@@ -157,6 +235,15 @@ public sealed record UiPalette
         init => _success = value;
     }
 
+    /// <summary>
+    /// The ink that reads on <paramref name="fill"/>: <see cref="BodyText"/> or <see cref="ContentBg"/>, whichever has the
+    /// higher <see cref="RGBAColor32.ContrastRatio"/> against it. The one rule for the text and icon on an
+    /// <see cref="Accent"/> (or any other solid) fill, so a chosen segment or an on-state toggle reads in every palette
+    /// and no call site picks a colour by eye. Ties go to <see cref="BodyText"/>.
+    /// </summary>
+    public RGBAColor32 InkOn(RGBAColor32 fill)
+        => RGBAColor32.ContrastRatio(ContentBg, fill) > RGBAColor32.ContrastRatio(BodyText, fill) ? ContentBg : BodyText;
+
     // ---- derived -----------------------------------------------------------------------------
 
     /// <summary>
@@ -168,18 +255,130 @@ public sealed record UiPalette
     /// </para>
     /// </summary>
     public bool IsDark => ContentBg.Luminance < 0x80;
+
+    /// <summary>
+    /// The one-hue rule: true when the palette cannot tell severities apart by hue, so a consumer must not tint
+    /// by severity (pilot's night palette, red on black, is the case). A colour counts as chromatic when its
+    /// channel spread is at least 24; the reference hue is <see cref="BodyText"/>'s when that is chromatic, else the
+    /// first chromatic severity's. The rule holds when every chromatic one of <see cref="Info"/>, <see cref="Warn"/>,
+    /// <see cref="Error"/> and <see cref="Success"/> lies within 30 degrees of the reference. A palette with no
+    /// chromatic severity at all is one-hue too. Computed, never stored, so it cannot disagree with the colours.
+    /// </summary>
+    public bool IsOneHue
+    {
+        get
+        {
+            const int MinChroma = 24;
+            const float MaxHueDelta = 30f;
+            Span<RGBAColor32> sev = [Info, Warn, Error, Success];
+            float? reference = HueOf(BodyText, MinChroma);
+            foreach (var c in sev)
+            {
+                var h = HueOf(c, MinChroma);
+                if (h is null) continue;
+                reference ??= h;
+                var d = MathF.Abs(h.Value - reference.Value) % 360f;
+                if (d > 180f) d = 360f - d;
+                if (d > MaxHueDelta) return false;
+            }
+            return true;
+        }
+    }
+
+    private static float? HueOf(RGBAColor32 c, int minChroma)
+    {
+        int max = Math.Max(c.Red, Math.Max(c.Green, c.Blue));
+        int min = Math.Min(c.Red, Math.Min(c.Green, c.Blue));
+        int chroma = max - min;
+        if (chroma < minChroma) return null;
+        float h;
+        if (max == c.Red) h = ((c.Green - c.Blue) / (float)chroma) % 6f;
+        else if (max == c.Green) h = (c.Blue - c.Red) / (float)chroma + 2f;
+        else h = (c.Red - c.Green) / (float)chroma + 4f;
+        h *= 60f;
+        return h < 0 ? h + 360f : h;
+    }
 }
 
 /// <summary>
 /// Base (unscaled, pixel) layout metrics shared across chrome. Callers still multiply
 /// by their own DPI scale; these are the logical base sizes.
 /// </summary>
+/// <remarks>
+/// Positional, so a parameter added to the constructor is a binary break (the 9.1 lesson in CLAUDE.md): the five
+/// parameters stay, and later fields are init-only properties whose default survives <c>default(UiMetrics)</c>
+/// (a nullable backing field with a fallback getter). Pinned by <c>InputEventCompatibilityTests</c>.
+/// </remarks>
 public readonly record struct UiMetrics(
     float BaseFontSize,
     float Padding,
     float HeaderHeight,
     float ItemHeight,
-    float ButtonHeight);
+    float ButtonHeight)
+{
+    private readonly float? _cornerRadius;
+    private readonly float? _controlRadius;
+    private readonly float? _controlEdgeWidth;
+    private readonly float? _focusRingWidth;
+    private readonly float? _focusRingGap;
+    private readonly float? _linkArrowGap;
+    private readonly Layout.ShadowStyle? _shadow;
+
+    /// <summary>The toast's key shadow: no offset across, 1 down, blur 2, black at 55%.</summary>
+    public static Layout.ShadowStyle DefaultShadow { get; } = new() { OffsetX = 0, OffsetY = 1, Blur = 2, Color = new RGBAColor32(0, 0, 0, 140) };
+
+    /// <summary>Corner radius of a raised surface, in design units. Defaults to 6.</summary>
+    public float CornerRadius
+    {
+        get => _cornerRadius ?? 6f;
+        init => _cornerRadius = value;
+    }
+
+    /// <summary>Corner radius of a button or other control, in design units. Defaults to 4.</summary>
+    public float ControlRadius
+    {
+        get => _controlRadius ?? 4f;
+        init => _controlRadius = value;
+    }
+
+    /// <summary>Width of the focus ring a themed control draws outside its edge, in design units (design-language: 2). Defaults to 2.</summary>
+    public float FocusRingWidth
+    {
+        get => _focusRingWidth ?? 2f;
+        init => _focusRingWidth = value;
+    }
+
+    /// <summary>Gap between a themed control's edge and its focus ring, in design units, so the ring shows on a control
+    /// filled with the accent. Defaults to 2.</summary>
+    public float FocusRingGap
+    {
+        get => _focusRingGap ?? 2f;
+        init => _focusRingGap = value;
+    }
+
+    /// <summary>Width of a control's edge ring, in design units. Defaults to 1.</summary>
+    public float ControlEdgeWidth
+    {
+        get => _controlEdgeWidth ?? 1f;
+        init => _controlEdgeWidth = value;
+    }
+
+    /// <summary>Gap between a link's text and its trailing arrow, in design units. Defaults to 2.</summary>
+    public float LinkArrowGap
+    {
+        get => _linkArrowGap ?? 2f;
+        init => _linkArrowGap = value;
+    }
+
+    /// <summary>
+    /// The shadow of a raised surface. Defaults to <see cref="DefaultShadow"/>; a colour with alpha 0 states none.
+    /// </summary>
+    public Layout.ShadowStyle Shadow
+    {
+        get => _shadow ?? DefaultShadow;
+        init => _shadow = value;
+    }
+}
 
 /// <summary>
 /// A complete UI theme: a colour <see cref="Palette"/> plus base <see cref="Metrics"/>.
@@ -193,4 +392,20 @@ public sealed record UiTheme
 
     /// <summary>The base metrics.</summary>
     public required UiMetrics Metrics { get; init; }
+
+    private readonly ControlStyles? _controls;
+
+    // The derived styles are cached outside the record, keyed on the instance: a record field would be copied by
+    // `with` (a stale cache for the new palette or metrics) and compared by Equals.
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<UiTheme, ControlStyles> DerivedControls = new();
+
+    /// <summary>
+    /// The control styles. Defaults to <see cref="ControlStyles.For"/> of <see cref="Palette"/> and <see cref="Metrics"/>,
+    /// derived once per instance (never carried over by <c>with</c>). Override one kind with <c>theme with { Controls = theme.Controls with { Standard = ... } }</c>.
+    /// </summary>
+    public ControlStyles Controls
+    {
+        get => _controls ?? DerivedControls.GetValue(this, static t => ControlStyles.For(t.Palette, t.Metrics));
+        init => _controls = value;
+    }
 }

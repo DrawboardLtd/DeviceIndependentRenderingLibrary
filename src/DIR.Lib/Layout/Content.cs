@@ -71,6 +71,13 @@ public abstract record Content
         /// </para>
         /// </summary>
         public bool Selectable { get; init; }
+
+        /// <summary>
+        /// Draws a 1-unit rule under the measured run, in <see cref="Color"/>, while the pointer is within the
+        /// nearest node with a hit that holds this one (the leaf itself when it is clickable), so the whole of a link's
+        /// region, a trailing arrow included, underlines its text. For a hyperlink. The pixel painter honours it; Console.Lib's cell painter does not yet.
+        /// </summary>
+        public bool UnderlineOnHover { get; init; }
     }
 
     /// <summary>A fixed-size piece (icon, swatch, separator, spacer) -- intrinsic size is <paramref name="Width"/> x <paramref name="Height"/> design units. The painter fills it only when <see cref="Color"/> is non-transparent, so a transparent Box is a pure spacer.</summary>
@@ -324,11 +331,33 @@ public abstract record Content
         /// <summary>The played portion of the track and the handle. Default opaque white, the convention
         /// <see cref="Text.Color"/> and <see cref="Icon.Color"/> use; override per slider, the way every
         /// existing hand-painted track slider already supplies its own accent.</summary>
-        public RGBAColor32 FillColor { get; init; } = new(0xff, 0xff, 0xff, 0xff);
+        public RGBAColor32 FillColor { get; init; } = DefaultFillColor;
+
+        /// <summary>The played portion's colour when a slider states none (opaque white).</summary>
+        public static readonly RGBAColor32 DefaultFillColor = new(0xff, 0xff, 0xff, 0xff);
+
+        /// <summary>The unfilled track's colour when a slider states none (the old square slider's track).</summary>
+        public static readonly RGBAColor32 DefaultTrackColor = new(0x40, 0x40, 0x40, 0xff);
+
+        /// <summary>The handle's colour when a slider states none.</summary>
+        public static readonly RGBAColor32 DefaultHandleColor = new(0xff, 0xff, 0xff, 0xff);
+
+        /// <summary>
+        /// Draws the thumb as a disc of <see cref="TrackSliderChrome.Handle"/> inside a ring of <see cref="ThumbRing"/>, as
+        /// tall as the arranged row, instead of the square handle. Init-only, so the chrome and the hand-painted
+        /// <c>DrawTrackSlider</c> keep their shape; the themed <c>Builder.Slider</c> sets it.
+        /// </summary>
+        public bool RoundThumb { get; init; }
+
+        /// <summary>The round thumb's ring colour (used when <see cref="RoundThumb"/> is set).</summary>
+        public RGBAColor32 ThumbRing { get; init; } = DefaultHandleColor;
+
+        /// <summary>The round thumb's ring width in design units (used when <see cref="RoundThumb"/> is set).</summary>
+        public float ThumbRingWidth { get; init; } = 1f;
 
         /// <summary>The unfilled track and the handle marker's own colours: the two chrome tones the
         /// painter needs beside <see cref="FillColor"/>.</summary>
-        public TrackSliderChrome Chrome { get; init; } = new(new RGBAColor32(0x40, 0x40, 0x40, 0xff), new RGBAColor32(0xff, 0xff, 0xff, 0xff));
+        public TrackSliderChrome Chrome { get; init; } = new(DefaultTrackColor, DefaultHandleColor);
     }
 
     /// <summary>
@@ -347,10 +376,12 @@ public abstract record Content
 }
 
 /// <summary>
-/// The pictograms a <see cref="Content.Icon"/> can name. Deliberately a CLOSED and tiny set: every kind
-/// costs a drawing in the pixel painter AND a glyph choice in every cell painter, so a kind earns its place
-/// by having a consumer on both. A one-off pictogram belongs in a <see cref="Content.Fill"/> the app draws
-/// itself, which is what that escape hatch is for.
+/// The pictograms a <see cref="Content.Icon"/> can name. Deliberately a small set that grows only by
+/// appending: every kind costs a drawing in the pixel painter AND a glyph choice in every cell painter
+/// (<see cref="IconGlyphs.For"/>), so a kind earns its place by having a consumer on both. The older kinds
+/// are drawn from rectangles; the members from <see cref="Info"/> on are drawn from embedded SVG outlines
+/// on one 16-unit grid and one stroke weight, in the ink given, sharp at any scale. A one-off pictogram
+/// belongs in a <see cref="Content.Fill"/> the app draws itself, which is what that escape hatch is for.
 /// </summary>
 public enum IconKind
 {
@@ -490,4 +521,47 @@ public enum IconKind
     /// </para>
     /// </summary>
     Check,
+
+    /// <summary>
+    /// A bell: "notifications". A dome on a flared rim with a clapper beneath, drawn from rectangles so it
+    /// takes the ink it is given. Added last so no existing member changes its value; a cell surface needs
+    /// its own rune for it (U+1F514, with U+2407 as the narrow fallback).
+    /// </summary>
+    Bell,
+
+    /// <summary>"Information": a circle with an i. Drawn from an embedded SVG outline in the ink given.</summary>
+    Info,
+
+    /// <summary>"Warning": a triangle with an exclamation mark. Embedded SVG outline.</summary>
+    Warning,
+
+    /// <summary>"Error": a circle with a cross. Embedded SVG outline.</summary>
+    Error,
+
+    /// <summary>"Success": a circle with a tick. Embedded SVG outline.</summary>
+    Success,
+
+    /// <summary>"Close" or "dismiss": a cross. Embedded SVG outline.</summary>
+    Close,
+
+    /// <summary>"Pin this": an outlined drawing pin. Embedded SVG outline.</summary>
+    Pin,
+
+    /// <summary>"Pinned": <see cref="Pin"/> with a solid head. Embedded SVG outline.</summary>
+    PinFilled,
+
+    /// <summary>"Open in its own page": a box with an arrow leaving it. Embedded SVG outline.</summary>
+    OpenInPage,
+
+    /// <summary>Compare mode "side by side": two panes. Embedded SVG outline.</summary>
+    CompareSideBySide,
+
+    /// <summary>Compare mode "overlay": two panes laid over each other. Embedded SVG outline.</summary>
+    CompareOverlay,
+
+    /// <summary>Compare mode "slider": one pane with a divider and a grip. Embedded SVG outline.</summary>
+    CompareSlider,
+
+    /// <summary>Compare mode "changes": two opposed arrows, before and after. Embedded SVG outline.</summary>
+    CompareChanges,
 }

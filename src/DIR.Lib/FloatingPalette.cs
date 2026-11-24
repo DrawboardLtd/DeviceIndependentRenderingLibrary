@@ -282,6 +282,22 @@ namespace DIR.Lib
                 && y >= PanelRect.Y && y < PanelRect.Y + PanelRect.Size.Y;
         }
 
+        /// <summary>
+        /// Tells the palette the pointer left the window (<see cref="InputEvent.PointerLeft"/>). Hover ends, and
+        /// the idle delay starts at the leave rather than at the last frame drawn while the pointer was over
+        /// the panel. Nothing changes if the pointer was not over it.
+        /// </summary>
+        public void NotePointerLeft()
+        {
+            if (!_pointerOver)
+            {
+                return;
+            }
+
+            _pointerOver = false;
+            _engagedAt = Stopwatch.GetTimestamp();
+        }
+
         /// <summary>Holds the panel fully present, as any deliberate use of it should.</summary>
         public void NoteEngaged() => _engagedAt = Stopwatch.GetTimestamp();
 
@@ -307,10 +323,31 @@ namespace DIR.Lib
             }
         }
 
-        /// <summary>True while the fade is still moving, so the host knows to keep asking for frames.</summary>
-        public bool IsFading => Fade > (Collapsed
-            ? FloatingPalette.CollapsedIdleAlpha
-            : FloatingPalette.IdleAlpha);
+        /// <summary>
+        /// When the palette next needs a frame: null when nothing will change by itself (hovered, dragged or
+        /// at rest), the time left of the idle delay while it waits, zero while the alpha is moving. A host
+        /// schedules one wake for a positive value and draws every frame only at zero.
+        /// </summary>
+        public TimeSpan? NextFrameIn
+        {
+            get
+            {
+                if (IsEngaged)
+                {
+                    _engagedAt = Stopwatch.GetTimestamp();
+                }
+
+                return FloatingPalette.NextFrameFor(
+                    (float)Stopwatch.GetElapsedTime(_engagedAt).TotalSeconds, IsEngaged, Collapsed);
+            }
+        }
+
+        /// <summary>
+        /// True only while the alpha is moving (the <see cref="FloatingPalette.FadeSeconds"/> ramp), not while
+        /// the palette is hovered or waits out its idle delay. A host that must also wake when the delay ends
+        /// reads <see cref="NextFrameIn"/>.
+        /// </summary>
+        public bool IsFading => NextFrameIn == TimeSpan.Zero;
 
         /// <summary>
         /// A press on the grip: the second of a quick pair COLLAPSES the panel, anything else begins a
@@ -499,6 +536,26 @@ namespace DIR.Lib
             return engaged || idleSeconds <= IdleDelaySeconds ? 1f
                 : idleSeconds >= IdleDelaySeconds + FadeSeconds ? floor
                 : 1f - (1f - floor) * ((idleSeconds - IdleDelaySeconds) / FadeSeconds);
+        }
+
+        /// <summary>
+        /// When a panel last engaged <paramref name="idleSeconds"/> ago next needs a frame: null when nothing
+        /// will change by itself (engaged, or already at the floor), the time left of the idle delay while it
+        /// waits (one wake is enough, not a frame per refresh), and <see cref="TimeSpan.Zero"/> while the
+        /// alpha is moving. A host schedules one wake for a positive value and draws every frame only at zero.
+        /// Pure, like <see cref="FadeFor"/>. <paramref name="collapsed"/> is there for symmetry with
+        /// <see cref="FadeFor"/>: both floors ramp over the same delay and fade, so the timing is the same.
+        /// </summary>
+        public static TimeSpan? NextFrameFor(float idleSeconds, bool engaged, bool collapsed = false)
+        {
+            if (engaged || idleSeconds >= IdleDelaySeconds + FadeSeconds)
+            {
+                return null;
+            }
+
+            return idleSeconds < IdleDelaySeconds
+                ? TimeSpan.FromSeconds(IdleDelaySeconds - idleSeconds)
+                : TimeSpan.Zero;
         }
 
         /// <summary>Whether a grip press this soon after the last one is the second of a pair.</summary>

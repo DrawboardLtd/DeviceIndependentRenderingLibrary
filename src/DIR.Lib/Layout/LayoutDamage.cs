@@ -58,7 +58,53 @@ namespace DIR.Lib
             RGBAColor32 Color,
             int Discriminator,
             int Caret,
-            int SelectionAnchor);
+            int SelectionAnchor)
+        {
+            /// <summary>The node's border, or null. Init-only, set in <see cref="Signature(in Layout.ArrangedNode{float}, ValueTuple{float, float}?, ValueTuple{float, float}?)"/>, so the positional
+            /// constructor keeps its arity (a new positional parameter would be a binary break). An unbordered
+            /// node leaves it null, so its signature is what it was before borders existed.</summary>
+            public Layout.BorderStyle? Border { get; init; }
+
+            /// <summary>The node's shadow, or null. Init-only for the same reason as <see cref="Border"/>.
+            /// <see cref="Bounds"/> stays the node's rect; the damage a signature reports grows by this shadow's
+            /// extent (see <see cref="LayoutDamage.DamageRect"/>).</summary>
+            public Layout.ShadowStyle? Shadow { get; init; }
+
+            /// <summary>The node's focus ring, or null. Init-only for the same reason as <see cref="Border"/>. Signatures hold
+            /// no cursor, so focus is not resolved here (as with FocusBackground): the ring is signed as declared and the
+            /// damage rect covers it WHEN the node is damaged. Moving the cursor produces no damage by itself, so a host must
+            /// repaint when the cursor moves.</summary>
+            public Layout.FocusRingStyle? FocusRing { get; init; }
+        }
+
+        /// <summary>
+        /// The rect a signature repaints: its bounds, grown on every side by its shadow's extent. The unit is the bounds':
+        /// the shadow's extent is in design units, so the bounds must be in design units too (a surface at a
+        /// <c>DesignScale</c> other than 1 must pass bounds it has divided by that scale, or grow the result itself).
+        /// </summary>
+        public static Rect<float> DamageRect(in PaintSignature sig)
+        {
+            var g = 0f;
+            if (sig.Shadow is { Color.Alpha: > 0 } s)
+            {
+                // One pixel more than the extent: the default shadow reaches n + 1 pixels out, and rounding of the offset.
+                g = MathF.Ceiling(s.Extent) + 1f;
+            }
+
+            if (sig.FocusRing is { Color.Alpha: > 0, Width: > 0f } ring)
+            {
+                // Like the shadow's extent, in design units: at a DesignScale above 1 the pixel ring is wider than this.
+                g = MathF.Max(g, MathF.Ceiling(ring.Width + MathF.Max(0f, ring.Offset)) + 1f);
+            }
+
+            if (g <= 0f)
+            {
+                return sig.Bounds;
+            }
+
+            var b = sig.Bounds;
+            return new Rect<float>(b.X - g, b.Y - g, b.Width + 2f * g, b.Height + 2f * g);
+        }
 
         /// <summary>Which kind of content a signature describes.</summary>
         public enum ContentShape
@@ -73,7 +119,7 @@ namespace DIR.Lib
             /// <summary>
             /// A painter callback owns these pixels, so the tree cannot see them change. Compared like
             /// any other node (its rect and background still matter), but its CONTENT is invisible here,
-            /// which is why <see cref="Compute"/> takes a <c>fillChanged</c> predicate: the only thing
+            /// which is why <see cref="Compute(IReadOnlyList{Layout.ArrangedNode{float}}, IReadOnlyList{Layout.ArrangedNode{float}}, ValueTuple{float, float}?, ValueTuple{float, float}?, Func{string, bool}, List{Rect{float}})"/> takes a <c>fillChanged</c> predicate: the only thing
             /// that knows whether an image pane or a histogram moved is whatever draws it.
             /// </summary>
             Fill,
@@ -89,18 +135,53 @@ namespace DIR.Lib
 
         /// <summary>The signature of one arranged node, resolving hover against <paramref name="pointer"/>.</summary>
         public static PaintSignature Signature(in Layout.ArrangedNode<float> node, (float X, float Y)? pointer)
+            => Signature(node, pointer, null);
+
+        /// <summary>The signature of one arranged node, resolving hover against <paramref name="pointer"/> and
+        /// <see cref="Layout.Node.PressedBackground"/> against <paramref name="pressOrigin"/> (where the primary
+        /// button is held down, or null). A hovered underlined text run signs differently from a resting one. A single node
+        /// cannot see its ancestors, so the underline here is resolved against the node's own rect only; <c>Compute</c>
+        /// and the painter use the enclosing hit region, which a caller holding the tree passes through the overload
+        /// that takes an <c>underlineScope</c>.</summary>
+        public static PaintSignature Signature(in Layout.ArrangedNode<float> node, (float X, float Y)? pointer,
+            (float X, float Y)? pressOrigin)
+            => Signature(node, pointer, pressOrigin, node.Bounds);
+
+        /// <summary>As the overload without a scope, with the hover underline resolved against <paramref name="underlineScope"/>:
+        /// the rect of the nearest node with a hit that holds this one (itself included), as the painter resolves it.</summary>
+        public static PaintSignature Signature(in Layout.ArrangedNode<float> node, (float X, float Y)? pointer,
+            (float X, float Y)? pressOrigin, in Rect<float> underlineScope)
         {
             var n = node.Node;
             var bounds = node.Bounds;
 
-            var background = n.HoverBackground is { } hover && Contains(bounds, pointer)
-                ? hover
+            var background = n.PressedBackground is { } pressed && !n.IsDisabled
+                    && Contains(bounds, pointer) && Contains(bounds, pressOrigin) ? pressed
+                : n.HoverBackground is { } hover && !n.IsDisabled && Contains(bounds, pointer) ? hover
                 : n.Background;
 
-            return n is Layout.Node.Leaf { Content: { } content }
+            var signature = n is Layout.Node.Leaf { Content: { } content }
                 ? SignatureOfContent(content, bounds, background, n.CornerRadius)
                 : new PaintSignature(bounds, background, n.CornerRadius, ContentShape.Container,
                     null, null, 0f, default, 0, 0, 0);
+            if (n is Layout.Node.Leaf { Content: Layout.Content.Text { UnderlineOnHover: true } }
+                && !n.IsDisabled && Contains(underlineScope, pointer))
+            {
+                // Caret is unused by a text run: it carries "underline showing".
+                signature = signature with { Caret = 1 };
+            }
+
+            if (n.BorderStyle is { } border)
+            {
+                signature = signature with { Border = border };
+            }
+
+            if (n.FocusRing is { } ring)
+            {
+                signature = signature with { FocusRing = ring };
+            }
+
+            return n.ShadowStyle is { } shadow ? signature with { Shadow = shadow } : signature;
         }
 
         private static PaintSignature SignatureOfContent(Layout.Content content, in Rect<float> bounds,
@@ -171,22 +252,54 @@ namespace DIR.Lib
             (float X, float Y)? currentPointer,
             Func<string?, bool>? fillChanged,
             List<Rect<float>> damage)
+            => Compute(previous, current, previousPointer, currentPointer, null, null, fillChanged, damage);
+
+        /// <summary>
+        /// The signatures of a frame's nodes in paint (pre-)order. A hover underline answers to the nearest enclosing node
+        /// with a hit (a link's whole region, its arrow included), tracked by depth as the painter does.
+        /// </summary>
+        private static HashSet<PaintSignature> SignAll(IReadOnlyList<Layout.ArrangedNode<float>> frame,
+            (float X, float Y)? pointer, (float X, float Y)? press)
+        {
+            var signatures = new HashSet<PaintSignature>(frame.Count);
+            var scopes = new Stack<(int Depth, Rect<float> Bounds)>();
+            for (var i = 0; i < frame.Count; i++)
+            {
+                var node = frame[i];
+                while (scopes.Count > 0 && scopes.Peek().Depth >= node.Depth)
+                {
+                    scopes.Pop();
+                }
+
+                if (node.Node.Hit is not null)
+                {
+                    scopes.Push((node.Depth, node.Bounds));
+                }
+
+                signatures.Add(Signature(node, pointer, press, scopes.Count > 0 ? scopes.Peek().Bounds : node.Bounds));
+            }
+
+            return signatures;
+        }
+
+        /// <summary>As the shorter overload, also resolving the pressed fill against where the button was held
+        /// down before and now (<see cref="WindowUiSettings.PressOrigin"/>).</summary>
+        public static void Compute(
+            IReadOnlyList<Layout.ArrangedNode<float>> previous,
+            IReadOnlyList<Layout.ArrangedNode<float>> current,
+            (float X, float Y)? previousPointer,
+            (float X, float Y)? currentPointer,
+            (float X, float Y)? previousPress,
+            (float X, float Y)? currentPress,
+            Func<string?, bool>? fillChanged,
+            List<Rect<float>> damage)
         {
             ArgumentNullException.ThrowIfNull(previous);
             ArgumentNullException.ThrowIfNull(current);
             ArgumentNullException.ThrowIfNull(damage);
 
-            var before = new HashSet<PaintSignature>(previous.Count);
-            for (var i = 0; i < previous.Count; i++)
-            {
-                before.Add(Signature(previous[i], previousPointer));
-            }
-
-            var after = new HashSet<PaintSignature>(current.Count);
-            for (var i = 0; i < current.Count; i++)
-            {
-                after.Add(Signature(current[i], currentPointer));
-            }
+            var before = SignAll(previous, previousPointer, previousPress);
+            var after = SignAll(current, currentPointer, currentPress);
 
             // Deduplicated by RECT, because a node that changed in place appears in both halves of
             // the symmetric difference -- once as the old signature vanishing and once as the new one
@@ -198,18 +311,18 @@ namespace DIR.Lib
             // Present now but not before: appeared, moved here, or repainted differently.
             foreach (var sig in after)
             {
-                if (!before.Contains(sig) && seen.Add(sig.Bounds))
+                if (!before.Contains(sig) && DamageRect(sig) is var rect && seen.Add(rect))
                 {
-                    damage.Add(sig.Bounds);
+                    damage.Add(rect);
                 }
             }
 
             // Present before but not now: vanished, or moved away. The tooltip case.
             foreach (var sig in before)
             {
-                if (!after.Contains(sig) && seen.Add(sig.Bounds))
+                if (!after.Contains(sig) && DamageRect(sig) is var rect && seen.Add(rect))
                 {
-                    damage.Add(sig.Bounds);
+                    damage.Add(rect);
                 }
             }
 
